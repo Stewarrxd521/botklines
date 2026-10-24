@@ -92,7 +92,7 @@ import strategy                                               # noqa: E402
 BASE_URL    = os.getenv("BASE_URL", "https://fapi.binance.com")
 QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDT")
 # Proxy HTTP opcional SOLO para la única consulta REST del arranque (exchangeInfo).
-REST_PROXY_URL = os.getenv("REST_PROXY_URL", "http://fixie:6U5qGtczYcZJRHN@ventoux.usefixie.com:80").strip()
+REST_PROXY_URL = os.getenv("REST_PROXY_URL", "").strip()   # http://usuario:clave@host:puerto (variable de entorno)
 INITIAL_SYMBOLS = [s.strip().upper() for s in os.getenv("INITIAL_SYMBOLS", "").split(",") if s.strip()]
 SYMBOLS_CACHE_FILE = os.getenv(
     "SYMBOLS_CACHE_FILE", os.path.join(tempfile.gettempdir(), "futures_symbols_cache.json"))
@@ -126,7 +126,14 @@ LIVE_TAKE_PROFIT_PCT      = float(os.getenv("LIVE_TAKE_PROFIT_PCT", str(TAKE_PRO
 # Los dos bots de velas 1m quedan apagados por defecto (no se abre el stream de velas).
 KLINE_BOTS_ENABLED  = os.getenv("KLINE_BOTS_ENABLED", "false").lower() in ("1", "true", "yes")
 # Stream de 24 h de TODOS los símbolos (un solo WebSocket). Ajustable si Binance cambia la ruta.
-TICKER_WS_URL       = os.getenv("TICKER_WS_URL", "wss://fstream.binance.com/ws/!ticker@arr")
+# Desde 2026-04-23 Binance retiró las URLs /ws y /stream de futuros: los streams de mercado van por /market.
+# Se prueban en orden; si una no entrega datos en TICKER_SILENCE_S se pasa a la siguiente.
+_t_env = os.getenv("TICKER_WS_URL", "").strip()
+TICKER_WS_URLS      = ([_t_env] if _t_env else []) + [
+    "wss://fstream.binance.com/market/ws/!miniTicker@arr",
+    "wss://fstream.binance.com/market/ws/!ticker@arr",
+]
+TICKER_SILENCE_S    = float(os.getenv("TICKER_SILENCE_S", "20"))
 RATIO_WATCH_MIN_PCT = float(os.getenv("RATIO_WATCH_MIN_PCT", "20"))   # |24 h| mínimo para vigilar
 RATIO_DROP_MIN_PCT  = float(os.getenv("RATIO_DROP_MIN_PCT", "25"))    # caída mínima del ratio (5 m → 5 m)
 RATIO_DROP_MAX_PCT  = float(os.getenv("RATIO_DROP_MAX_PCT", "30"))    # caída máxima (1,18→0,86 = 27 %)
@@ -844,6 +851,7 @@ class KlineBot:
             self._supervised(self._maintenance_loop, "maintenance"),
             self._supervised(self._ticker_loop, "ticker"),
             self._supervised(self._ratio_loop, "ratio"),
+            self._supervised(self._symbols_retry_loop, "symbols"),
         )
 
     async def _supervised(self, factory, name: str) -> None:
@@ -1271,27 +1279,53 @@ class KlineBot:
         return dict(self.ratio_cfg)
 
     async def _ticker_loop(self) -> None:
-        """WebSocket !ticker@arr: variación 24 h y último precio de todos los símbolos."""
-        backoff = 1.0
+        """WebSocket de 24 h de todos los símbolos (!miniTicker@arr / !ticker@arr)."""
+        idx, backoff = 0, 1.0
         while self.running:
+            url = TICKER_WS_URLS[idx % len(TICKER_WS_URLS)]
+            got = False
+            it = None
             try:
-                self.log(f"[ticker] conectando a {TICKER_WS_URL}")
-                async for raw in _ws_messages(TICKER_WS_URL):
-                    if not self.ticker_connected:
-                        self.log("[ticker] conectado")
+                self.log(f"[ticker] conectando a {url}")
+                it = _ws_messages(url).__aiter__()
+                while True:
+                    raw = await asyncio.wait_for(it.__anext__(), timeout=TICKER_SILENCE_S)
+                    if not got:
+                        got = True
+                        self.log("[ticker] recibiendo datos")
                     self.ticker_connected = True
                     self.ticker_error = ""
                     backoff = 1.0
                     self._on_tickers(raw)
+            except StopAsyncIteration:
                 self.ticker_error = "conexión cerrada por el servidor"
+            except asyncio.TimeoutError:
+                self.ticker_error = f"sin datos en {TICKER_SILENCE_S:g}s ({url})"
+                self.log(f"[ticker] {self.ticker_error}")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self.ticker_error = repr(exc)
                 self.log(f"[ticker] error: {exc!r}")
+            finally:
+                if it is not None:
+                    try:
+                        await it.aclose()
+                    except Exception:
+                        pass
             self.ticker_connected = False
+            if not got:
+                idx += 1                                    # esta URL no dio datos: probar la siguiente
             await asyncio.sleep(min(backoff, 30.0))
             backoff *= 2
+
+    async def _symbols_retry_loop(self) -> None:
+        """Si exchangeInfo falló al arrancar (proxy/región), reintenta cada 60 s."""
+        while self.running:
+            await asyncio.sleep(60.0)
+            if not self.filters:
+                self.log("[REST] reintentando exchangeInfo…")
+                await self._init_symbols()
 
     def _on_tickers(self, raw) -> None:
         data = json.loads(raw)
@@ -1305,8 +1339,11 @@ class KlineBot:
         for t in data:
             try:
                 sym = t["s"]
-                if sym not in self.filters:
-                    continue
+                if self.filters:
+                    if sym not in self.filters:
+                        continue
+                elif not sym.endswith(QUOTE_ASSET) or "_" in sym:
+                    continue                    # sin exchangeInfo: solo perpetuos USDT por nombre
                 last = float(t["c"])
                 if t.get("P") is not None:
                     pct = float(t["P"])
@@ -1544,7 +1581,9 @@ class KlineBot:
         price = self._live_price(sym)
         if not price:
             return skip("sin precio en vivo")
-        f = self.filters.get(sym, {})
+        if sym not in self.filters:
+            return skip("saltada: sin filtros del símbolo (exchangeInfo no cargó: revisa el proxy)")
+        f = self.filters[sym]
         qty, eff, why = strategy.size_order(
             NOTIONAL_USDT, price, f.get("stepSize", 0.001), f.get("minQty", 0.0),
             f.get("minNotional", 5.0), MAX_NOTIONAL_OVER)
@@ -1612,6 +1651,7 @@ class KlineBot:
             "next_cycle_in": max(0.0, self.ratio_next_cycle_ts - now) if self.ratio_next_cycle_ts else 0.0,
             "polls": self.ratio_polls, "errors": self.ratio_errors, "last_error": self.ratio_last_error,
             "rest_blocked_s": max(0.0, self._rest_block_until - now),
+            "filters": len(self.filters),
         }
 
     # ── Mantenimiento ─────────────────────────────────────────────────────────
@@ -2767,6 +2807,8 @@ function renderRatio(d) {
     + ` (${r.ticker_symbols} símbolos, último mensaje ${r.ticker_age_s === null ? '—' : 'hace ' + dur(r.ticker_age_s)})`
     + ` · lista actualizada ${esc(r.watch_updated || '—')} · próxima consulta en ${r.next_cycle_in > 0 ? dur(r.next_cycle_in) : '—'}`
     + ` · consultas ${r.polls} · errores ${r.errors}`
+    + (r.filters === 0 ? ` · <span class="neg">sin exchangeInfo (proxy/región): no se puede operar ni consultar el ratio</span>` : '')
+    + (r.ticker_error && !r.ticker_connected ? ` · <span class="warn">ticker: ${esc(r.ticker_error)}</span>` : '')
     + (r.rest_blocked_s > 0 ? ` · <span class="neg">REST en pausa ${dur(r.rest_blocked_s)} (límite de peticiones)</span>` : '')
     + (r.last_error ? ` · <span class="warn">${esc(r.last_error)}</span>` : '');
   for (const [id, dir, on] of [['rtBtnShort', 'SHORT', r.short_enabled], ['rtBtnLong', 'LONG', r.long_enabled]]) {
