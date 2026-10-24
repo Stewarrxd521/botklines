@@ -140,8 +140,9 @@ RATIO_DROP_MAX_PCT  = float(os.getenv("RATIO_DROP_MAX_PCT", "30"))    # caída m
 RATIO_PERIOD        = "5m"
 RATIO_REFRESH_S     = 300          # lista de vigilados y consulta del ratio, cada 5 min
 RATIO_POLL_DELAY_S  = float(os.getenv("RATIO_POLL_DELAY_S", "15"))    # espera tras el minuto :00/:05
-RATIO_RETRIES       = int(os.getenv("RATIO_RETRIES", "2"))            # reintentos si aún no hay dato nuevo
-RATIO_RETRY_GAP_S   = float(os.getenv("RATIO_RETRY_GAP_S", "20"))
+RATIO_RETRIES       = int(os.getenv("RATIO_RETRIES", "9"))            # reintentos de los rezagados dentro del ciclo
+RATIO_RETRY_GAP_S   = float(os.getenv("RATIO_RETRY_GAP_S", "25"))
+RATIO_REQ_BUDGET    = int(os.getenv("RATIO_REQ_BUDGET", "700"))       # máx. peticiones REST por ventana de 5 min (límite Binance: 1000)
 RATIO_MAX_AGE_S     = float(os.getenv("RATIO_MAX_AGE_S", "720"))      # dato de ratio más viejo no dispara
 RATIO_WATCH_MAX     = int(os.getenv("RATIO_WATCH_MAX", "100"))        # tope de símbolos vigilados
 RATIO_CONCURRENCY   = max(1, int(os.getenv("RATIO_CONCURRENCY", "4")))
@@ -545,6 +546,7 @@ class KlineBot:
         self.ratio_next_cycle_ts = 0.0
         self._rest_block_until = 0.0
         self._rest_route = 0
+        self._rest_times: Deque[float] = deque()      # peticiones de los últimos 5 min
         # Ajustes comunes a los dos bots (botón y campos de la web).
         self.inverted = bool(settings.get("inverted", INVERT_SIGNALS))
         self.fee_pct = float(settings["fee_pct"]) if settings.get("fee_pct") is not None else FEE_PCT
@@ -1443,17 +1445,34 @@ class KlineBot:
             first = False
             await self._ratio_cycle()
 
+    def _lagging(self, syms: List[str]) -> List[str]:
+        """Símbolos cuyo último punto de ratio es más viejo que el más nuevo visto."""
+        ts = {s: (self._ratio.get(s) or {}).get("last_ts", 0) for s in syms}
+        ref = max(ts.values(), default=0)
+        return [s for s in syms if ts[s] < ref]
+
     async def _ratio_cycle(self) -> None:
         self._refresh_watchlist()
         self.ratio_last_cycle_ts = time.time()
-        pending = self._ratio_symbols()
-        for attempt in range(RATIO_RETRIES + 1):
+        syms = self._ratio_symbols()
+        deadline = (int(time.time() // RATIO_REFRESH_S) + 1) * RATIO_REFRESH_S - 10   # antes del siguiente ciclo
+        fresh = await self._poll_ratios(syms)
+        for attempt in range(1, RATIO_RETRIES + 1):
+            # Rezagados: Binance publica el punto de 5 m a cada símbolo en un momento distinto.
+            pending = set(self._lagging(syms))
+            if attempt <= 2:
+                pending |= {s for s in syms if not fresh.get(s, False)}     # aún sin dato nuevo
+            pending = [s for s in syms if s in pending]
             if not pending or time.time() < self._rest_block_until:
                 break
-            if attempt:
-                await asyncio.sleep(RATIO_RETRY_GAP_S)       # aún no publicó el punto nuevo de 5 m
-            fresh = await self._poll_ratios(pending)
-            pending = [s for s in pending if s in fresh and not fresh[s]]
+            if time.time() + RATIO_RETRY_GAP_S > deadline:
+                break
+            await asyncio.sleep(RATIO_RETRY_GAP_S)
+            got = await self._poll_ratios(pending)
+            fresh.update(got)
+        late = self._lagging(syms)
+        if late:
+            self.log(f"[ratio] {len(late)} símbolo(s) siguen sin el dato más nuevo de Binance: {', '.join(late[:8])}")
         if time.time() < self._rest_block_until:
             self.log(f"[ratio] ⚠️ REST en pausa {self._rest_block_until - time.time():.0f} s por límite de peticiones")
 
@@ -1464,6 +1483,13 @@ class KlineBot:
         async def one(sym: str) -> None:
             if time.time() < self._rest_block_until:
                 return
+            now_t = time.time()
+            while self._rest_times and now_t - self._rest_times[0] > 300:
+                self._rest_times.popleft()
+            if len(self._rest_times) >= RATIO_REQ_BUDGET:
+                self.ratio_last_error = f"presupuesto de {RATIO_REQ_BUDGET} peticiones/5 min agotado"
+                return
+            self._rest_times.append(now_t)
             async with sem:
                 try:
                     pts = await asyncio.to_thread(self._fetch_ratio, sym)
@@ -1640,6 +1666,9 @@ class KlineBot:
                 "data_time": _utc(st["last_ts"] / 1000, "%H:%M") if st.get("last_ts") else "",
                 "side": side, "in_range": in_range, "has_position": sym in open_syms,
             })
+        newest = max((st.get("last_ts", 0) for st in self._ratio.values()), default=0)
+        for r in rows:
+            r["lag"] = bool(r["data_time"] and (self._ratio.get(r["symbol"]) or {}).get("last_ts", 0) < newest)
         rows.sort(key=lambda r: abs(r["pct24"] or 0), reverse=True)
         return {
             "cfg": cfg, "rows": rows, "watch_count": len(self.watch),
@@ -2820,7 +2849,7 @@ function renderRatio(d) {
   q('tRt').innerHTML = r.rows.map(x => `<tr>
     <td><b>${esc(x.symbol)}</b></td><td>${x.pct24 === null ? '—' : pct(x.pct24)}</td><td>${num(x.price, 8)}</td>
     <td>${num(x.prev, 4)}</td><td>${num(x.last, 4)}</td><td>${x.chg === null ? '<span class="muted">—</span>' : pct(x.chg)}</td>
-    <td class="muted">${esc(x.data_time || '—')}</td><td>${x.side ? tag(x.side) : '<span class="muted">—</span>'}</td>
+    <td class="${x.lag ? 'warn' : 'muted'}" title="${x.lag ? 'Binance aún no publicó el punto más nuevo de este símbolo' : ''}">${esc(x.data_time || '—')}${x.lag ? ' ⏳' : ''}</td><td>${x.side ? tag(x.side) : '<span class="muted">—</span>'}</td>
     <td>${x.has_position ? '<span class="st on">POSICIÓN</span>' : x.in_range ? '<span class="st off">EN RANGO</span>' : '<span class="muted">—</span>'}</td></tr>`).join('')
     || '<tr><td colspan="9" class="muted">Ningún símbolo cumple el % de 24 h todavía</td></tr>';
 }
