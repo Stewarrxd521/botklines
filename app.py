@@ -31,6 +31,19 @@ Los dos bots
   (POST <executor>/signal) con "strategy": "close" | "live". El link del
   Executor se puede cambiar en caliente desde la web o con POST /api/executor.
 
+Bot de ratio de top traders (tercer bot, "ratio")
+  • Vigila SOLO los perpetuos con variación 24 h ≥ +RATIO_WATCH_MIN_PCT (20 %), leída del
+    WebSocket !ticker@arr. La lista se recalcula cada 5 min y se suscribe a precios en vivo.
+  • Cada 5 min consulta el Top Trader Long/Short Ratio (Accounts) de esa lista. (Binance
+    NO ofrece este dato por WebSocket: es REST, 1 petición por símbolo vigilado cada 5 min,
+    por el proxy, con freno automático ante HTTP 429/418.)
+  • Si el ratio cae entre drop_min % y drop_max % de un punto de 5 m al siguiente → SHORT.
+  • TP: cuando el ratio RECUPERA el mismo % que cayó, medido desde el ratio de entrada
+    (cae 27,1 % de 1,18 a 0,86 → TP cuando sube 27,1 % desde 0,86 = 1,093). Sin stop loss.
+  • LONG (apagado por defecto, se activa desde la web): espejo para los PERDEDORES
+    (24 h ≤ -20 %): el ratio SUBE entre drop_min % y drop_max % → LONG; TP cuando el
+    ratio baja ese mismo % desde el ratio de entrada.
+
 Precios para el take profit: WS.py (!markPrice@arr de todos los símbolos +
 bookTicker en tiempo real de los que tienen posición abierta).
 Recuperación tras reinicio: state_store.py, solo con copia en disco local (Upstash
@@ -54,7 +67,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 from collections import deque
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
@@ -108,6 +121,23 @@ MAX_OPEN_POSITIONS   = int(os.getenv("MAX_OPEN_POSITIONS", "0"))
 # Bot en vivo (vela en curso): por defecto los mismos % que el bot al cierre.
 LIVE_SIGNAL_THRESHOLD_PCT = float(os.getenv("LIVE_SIGNAL_THRESHOLD_PCT", str(SIGNAL_THRESHOLD_PCT)))
 LIVE_TAKE_PROFIT_PCT      = float(os.getenv("LIVE_TAKE_PROFIT_PCT", str(TAKE_PROFIT_PCT)))
+
+# ── Bot de ratio de top traders ───────────────────────────────────────────────
+# Los dos bots de velas 1m quedan apagados por defecto (no se abre el stream de velas).
+KLINE_BOTS_ENABLED  = os.getenv("KLINE_BOTS_ENABLED", "false").lower() in ("1", "true", "yes")
+# Stream de 24 h de TODOS los símbolos (un solo WebSocket). Ajustable si Binance cambia la ruta.
+TICKER_WS_URL       = os.getenv("TICKER_WS_URL", "wss://fstream.binance.com/ws/!ticker@arr")
+RATIO_WATCH_MIN_PCT = float(os.getenv("RATIO_WATCH_MIN_PCT", "20"))   # |24 h| mínimo para vigilar
+RATIO_DROP_MIN_PCT  = float(os.getenv("RATIO_DROP_MIN_PCT", "25"))    # caída mínima del ratio (5 m → 5 m)
+RATIO_DROP_MAX_PCT  = float(os.getenv("RATIO_DROP_MAX_PCT", "30"))    # caída máxima (1,18→0,86 = 27 %)
+RATIO_PERIOD        = "5m"
+RATIO_REFRESH_S     = 300          # lista de vigilados y consulta del ratio, cada 5 min
+RATIO_POLL_DELAY_S  = float(os.getenv("RATIO_POLL_DELAY_S", "15"))    # espera tras el minuto :00/:05
+RATIO_RETRIES       = int(os.getenv("RATIO_RETRIES", "2"))            # reintentos si aún no hay dato nuevo
+RATIO_RETRY_GAP_S   = float(os.getenv("RATIO_RETRY_GAP_S", "20"))
+RATIO_MAX_AGE_S     = float(os.getenv("RATIO_MAX_AGE_S", "720"))      # dato de ratio más viejo no dispara
+RATIO_WATCH_MAX     = int(os.getenv("RATIO_WATCH_MAX", "100"))        # tope de símbolos vigilados
+RATIO_CONCURRENCY   = max(1, int(os.getenv("RATIO_CONCURRENCY", "4")))
 
 # ── Velas ─────────────────────────────────────────────────────────────────────
 KLINE_INTERVAL = "1m"
@@ -335,6 +365,12 @@ class Position:
     candle_age_s: float = 0.0   # segundos de vela transcurridos al entrar (bot en vivo)
     inverted:    bool = False   # abierta en modo invertido: tp_price es un STOP LOSS
     sent:        bool = True    # se mandó al executor (False = simulada, envíos pausados)
+    # ── Solo bot de ratio: la salida es por ratio, no por precio ──
+    ratio_trigger: float = 0.0  # ratio ANTES de la caída/subida: al recuperarlo se cierra (TP)
+    ratio_entry:   float = 0.0  # ratio que disparó la entrada
+    ratio_change_pct: float = 0.0
+    ratio_ts:      int = 0      # timestamp (ms) del punto de ratio que disparó
+    ratio_target:  float = 0.0  # ratio de salida (TP): recupera el mismo % que cayó/subió
 
     def update(self, price: float) -> float:
         """Actualiza precio y excursiones. Llamar con el lock del bot tomado."""
@@ -356,8 +392,12 @@ class Position:
 
 ENGINE_CLOSE = "close"
 ENGINE_LIVE  = "live"
-ENGINE_LABELS = {ENGINE_CLOSE: "Bot al cierre", ENGINE_LIVE: "Bot en vivo"}
+ENGINE_RATIO = "ratio"
+ENGINE_LABELS = {ENGINE_CLOSE: "Bot al cierre", ENGINE_LIVE: "Bot en vivo",
+                 ENGINE_RATIO: "Bot ratio top traders"}
 ENGINE_HINTS = {
+    ENGINE_RATIO: "SHORT cuando el ratio de cuentas de los top traders se gira (cae) en un símbolo con 24 h ≥ +20 %; "
+                  "TP cuando el ratio recupera el mismo % que cayó",
     ENGINE_CLOSE: "entra cuando la vela 1m CIERRA con cuerpo ≥ umbral",
     ENGINE_LIVE:  "entra en cuanto la vela 1m EN CURSO supera el umbral, sin esperar al cierre",
 }
@@ -397,6 +437,28 @@ class Engine:
 # ─────────────────────────────────────────────────────────────────────────────
 # BOT
 # ─────────────────────────────────────────────────────────────────────────────
+
+async def _ws_messages(url: str):
+    """Mensajes de un WebSocket (generador asíncrono). Usa `websockets`; si no
+    está instalado, `aiohttp`. Termina cuando el servidor cierra la conexión."""
+    try:
+        import websockets                                   # type: ignore
+    except ImportError:
+        websockets = None
+    if websockets is not None:
+        async with websockets.connect(url, ping_interval=20, ping_timeout=30, max_size=None) as ws:
+            async for msg in ws:
+                yield msg
+        return
+    import aiohttp                                          # type: ignore
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(url, heartbeat=20, max_msg_size=0) as ws:
+            async for m in ws:
+                if m.type == aiohttp.WSMsgType.TEXT:
+                    yield m.data
+                elif m.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    break
+
 
 class KlineBot:
     def __init__(self) -> None:
@@ -444,6 +506,38 @@ class KlineBot:
                                  LIVE_SIGNAL_THRESHOLD_PCT, LIVE_TAKE_PROFIT_PCT),
         }
         self.live = self.engines[ENGINE_LIVE]
+        # Bot de ratio: LONG bloqueado por defecto (se activa desde la web).
+        self.engines[ENGINE_RATIO] = Engine(ENGINE_RATIO, saved.get(ENGINE_RATIO) or {"block_long": True},
+                                            1.0, 1.0)
+        rs = settings.get("ratio") if isinstance(settings.get("ratio"), dict) else {}
+
+        def _pos(v, d):
+            try:
+                v = float(v)
+                return v if v > 0 else d
+            except (TypeError, ValueError):
+                return d
+        self.ratio_cfg = {"watch_min_pct": _pos(rs.get("watch_min_pct"), RATIO_WATCH_MIN_PCT),
+                          "drop_min_pct":  _pos(rs.get("drop_min_pct"), RATIO_DROP_MIN_PCT),
+                          "drop_max_pct":  _pos(rs.get("drop_max_pct"), RATIO_DROP_MAX_PCT)}
+        if self.ratio_cfg["drop_min_pct"] >= self.ratio_cfg["drop_max_pct"]:
+            self.ratio_cfg["drop_min_pct"], self.ratio_cfg["drop_max_pct"] = RATIO_DROP_MIN_PCT, RATIO_DROP_MAX_PCT
+        # Estado del bot de ratio (se toca solo desde el loop del bot).
+        self._tick: Dict[str, Tuple[float, float, float]] = {}     # símbolo → (24 h %, último precio, ts)
+        self.ticker_connected = False
+        self.ticker_last_ts = 0.0
+        self.ticker_error = ""
+        self.watch: List[str] = []
+        self.watch_side: Dict[str, str] = {}
+        self.watch_ts = 0.0
+        self._ratio: Dict[str, dict] = {}                          # símbolo → último estado del ratio
+        self.ratio_polls = 0
+        self.ratio_errors = 0
+        self.ratio_last_error = ""
+        self.ratio_last_cycle_ts = 0.0
+        self.ratio_next_cycle_ts = 0.0
+        self._rest_block_until = 0.0
+        self._rest_route = 0
         # Ajustes comunes a los dos bots (botón y campos de la web).
         self.inverted = bool(settings.get("inverted", INVERT_SIGNALS))
         self.fee_pct = float(settings["fee_pct"]) if settings.get("fee_pct") is not None else FEE_PCT
@@ -524,7 +618,7 @@ class KlineBot:
                 "engines": {n: e.settings() for n, e in self.engines.items()},
                 "inverted": self.inverted, "fee_pct": self.fee_pct,
                 "profit_target_usd": self.profit_target_usd, "max_open": self.max_open,
-                "executor_paused": self.executor_paused}
+                "executor_paused": self.executor_paused, "ratio": self.ratio_cfg}
         tmp = f"{SETTINGS_FILE}.tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as fh:
@@ -706,12 +800,19 @@ class KlineBot:
 
     async def _main(self) -> None:
         for eng in self.engines.values():
+            if eng.name == ENGINE_RATIO:
+                continue
             self.log(f"{eng.label} | {ENGINE_HINTS[eng.name]} | señal ≥ {eng.threshold_pct:g}% | "
                      f"{'SL' if self.inverted else 'TP'} {eng.tp_pct:g}% | {NOTIONAL_USDT:g} USDT")
         self.log(f"Modo {'INVERTIDO (contra la vela, sin TP)' if self.inverted else 'normal (sigue la vela, sin SL)'} | "
                  f"fee {self.fee_pct:g}% por lado | objetivo global "
                  f"{f'+{self.profit_target_usd:g} USD' if self.profit_target_usd > 0 else 'apagado'}")
         self.log(f"Executor → {self.executor.target.url or '(vacío)'}")
+        rc = self.ratio_cfg
+        self.log(f"Bot ratio top traders | vigila 24 h ≥ {rc['watch_min_pct']:g}% | caída del ratio "
+                 f"{rc['drop_min_pct']:g}–{rc['drop_max_pct']:g}% | LONG "
+                 f"{'bloqueado' if self.engines[ENGINE_RATIO].blocked[strategy.LONG] else 'activo'} | "
+                 f"{NOTIONAL_USDT:g} USDT | TP = ratio recupera el mismo % que cayó")
         self.log(f"[estado] Persistencia: {self._store_desc}")
         self.store.start()
         self.executor.warm()
@@ -727,17 +828,22 @@ class KlineBot:
         self.price_cache.set_update_callback(self._on_price_event)
         self.price_cache.start()
 
-        self.kline_stream = KlineWebSocketStream(
-            self.symbols, intervals=(KLINE_INTERVAL,), history=KLINE_HISTORY,
-            dtype=KLINE_DTYPE, on_close=self._on_kline_close, on_update=self._on_kline_live,
-        )
-        self.kline_stream.start()
-        self.log(f"Velas 1m por WebSocket: {len(self.symbols)} símbolos, "
-                 f"{KLINE_HISTORY} velas cerradas por símbolo + vela en curso para el bot en vivo")
+        if KLINE_BOTS_ENABLED:
+            self.kline_stream = KlineWebSocketStream(
+                self.symbols, intervals=(KLINE_INTERVAL,), history=KLINE_HISTORY,
+                dtype=KLINE_DTYPE, on_close=self._on_kline_close, on_update=self._on_kline_live,
+            )
+            self.kline_stream.start()
+            self.log(f"Velas 1m por WebSocket: {len(self.symbols)} símbolos, "
+                     f"{KLINE_HISTORY} velas cerradas por símbolo + vela en curso para el bot en vivo")
+        else:
+            self.log("Velas 1m DESACTIVADAS (KLINE_BOTS_ENABLED=false): solo opera el bot de ratio")
 
         await asyncio.gather(
             self._supervised(self._engine_loop, "engine"),
             self._supervised(self._maintenance_loop, "maintenance"),
+            self._supervised(self._ticker_loop, "ticker"),
+            self._supervised(self._ratio_loop, "ratio"),
         )
 
     async def _supervised(self, factory, name: str) -> None:
@@ -1053,6 +1159,8 @@ class KlineBot:
                     if pos.symbol != symbol:
                         continue
                     pos.update(price)
+                    if pos.strategy == ENGINE_RATIO:
+                        continue                    # su salida es por ratio, no por precio
                     if strategy.exit_hit(price, pos.tp_price, pos.direction, pos.inverted):
                         hits.append((tid, "SL" if pos.inverted else "TP"))
         if hits and self.store.can_act():
@@ -1140,6 +1248,371 @@ class KlineBot:
         if not closed:
             return False, "No se pudo cerrar (ya se estaba cerrando)"
         return True, f"{closed} posición(es) cerrada(s)"
+
+    # ── Bot de ratio de top traders ───────────────────────────────────────────
+
+    def set_ratio_config(self, watch_min_pct: Optional[float] = None, drop_min_pct: Optional[float] = None,
+                         drop_max_pct: Optional[float] = None) -> dict:
+        """Ajusta en caliente el % 24 h para vigilar y el rango de caída del ratio."""
+        new = dict(self.ratio_cfg)
+        for key, v in (("watch_min_pct", watch_min_pct), ("drop_min_pct", drop_min_pct),
+                       ("drop_max_pct", drop_max_pct)):
+            if v is not None:
+                new[key] = float(v)
+        if new["drop_min_pct"] >= new["drop_max_pct"]:
+            raise ValueError("la caída mínima debe ser menor que la máxima")
+        if new != self.ratio_cfg:
+            self.log(f"[config] ratio: 24 h ≥ {self.ratio_cfg['watch_min_pct']:g}% → {new['watch_min_pct']:g}% | "
+                     f"rango {self.ratio_cfg['drop_min_pct']:g}–{self.ratio_cfg['drop_max_pct']:g}% → "
+                     f"{new['drop_min_pct']:g}–{new['drop_max_pct']:g}%")
+            self.ratio_cfg = new
+            self._save_settings()
+            self.store.mark_dirty(True)
+        return dict(self.ratio_cfg)
+
+    async def _ticker_loop(self) -> None:
+        """WebSocket !ticker@arr: variación 24 h y último precio de todos los símbolos."""
+        backoff = 1.0
+        while self.running:
+            try:
+                self.log(f"[ticker] conectando a {TICKER_WS_URL}")
+                async for raw in _ws_messages(TICKER_WS_URL):
+                    if not self.ticker_connected:
+                        self.log("[ticker] conectado")
+                    self.ticker_connected = True
+                    self.ticker_error = ""
+                    backoff = 1.0
+                    self._on_tickers(raw)
+                self.ticker_error = "conexión cerrada por el servidor"
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.ticker_error = repr(exc)
+                self.log(f"[ticker] error: {exc!r}")
+            self.ticker_connected = False
+            await asyncio.sleep(min(backoff, 30.0))
+            backoff *= 2
+
+    def _on_tickers(self, raw) -> None:
+        data = json.loads(raw)
+        if isinstance(data, dict) and "data" in data:
+            data = data["data"]
+        if isinstance(data, dict):
+            data = [data]
+        if not isinstance(data, list):
+            return
+        now = time.time()
+        for t in data:
+            try:
+                sym = t["s"]
+                if sym not in self.filters:
+                    continue
+                last = float(t["c"])
+                if t.get("P") is not None:
+                    pct = float(t["P"])
+                else:
+                    o = float(t["o"])
+                    pct = (last - o) / o * 100.0 if o > 0 else 0.0
+            except (KeyError, TypeError, ValueError):
+                continue
+            self._tick[sym] = (pct, last, now)
+        self.ticker_last_ts = now
+
+    def _refresh_watchlist(self) -> None:
+        """Recalcula la lista de vigilados (24 h ≥ +X %; con LONG activo, también ≤ -X %)
+        y suscribe los nuevos a precios en vivo."""
+        wmin = self.ratio_cfg["watch_min_pct"]
+        eng = self.engines[ENGINE_RATIO]
+        want_short = not eng.blocked[strategy.SHORT]
+        want_long = not eng.blocked[strategy.LONG]
+        picked = []
+        for sym, (pct, _px, _ts) in list(self._tick.items()):
+            if pct >= wmin and want_short:
+                picked.append((abs(pct), sym, strategy.SHORT))
+            elif pct <= -wmin and want_long:
+                picked.append((abs(pct), sym, strategy.LONG))
+        picked.sort(reverse=True)
+        picked = picked[:RATIO_WATCH_MAX]
+        old = set(self.watch)
+        self.watch = [s for _, s, _ in picked]
+        self.watch_side = {s: side for _, s, side in picked}
+        self.watch_ts = time.time()
+        added = sorted(set(self.watch) - old)
+        removed = sorted(old - set(self.watch))
+        if added or removed or not old:
+            self.log(f"[ratio] vigilados (24 h ≥ ±{wmin:g}%): {len(self.watch)} "
+                     f"(+{len(added)} −{len(removed)}) {', '.join(self.watch[:12])}{'…' if len(self.watch) > 12 else ''}")
+        if added and self.price_cache is not None:
+            self.price_cache.ensure_symbols(added)          # bookTicker en vivo
+
+    def _ratio_symbols(self) -> List[str]:
+        eng = self.engines[ENGINE_RATIO]
+        with self.lock:
+            open_syms = {p.symbol for p in eng.positions.values()}
+        return list(dict.fromkeys(list(self.watch) + sorted(open_syms)))
+
+    def _rest_get(self, path: str, params: dict):
+        """GET público a Binance por el proxy (y por IP directa si el proxy falla).
+        Un 429/418 NO se reintenta por otra ruta: se pausa todo el REST."""
+        routes = [REST_PROXY_URL, ""] if REST_PROXY_URL else [""]
+        order = routes[self._rest_route:] + routes[:self._rest_route]
+        url = f"{BASE_URL}{path}?{urlencode(params)}"
+        last_exc: Optional[Exception] = None
+        for proxy in order:
+            try:
+                handlers = [urllib.request.ProxyHandler({"http": proxy, "https": proxy})] if proxy else []
+                opener = urllib.request.build_opener(*handlers)
+                req = urllib.request.Request(url, headers={"User-Agent": "BOTKLINE/1.0"})
+                with opener.open(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                self._rest_route = routes.index(proxy)
+                return data
+            except urllib.error.HTTPError as exc:
+                if exc.code in (418, 429):
+                    try:
+                        wait = float(exc.headers.get("Retry-After") or 60)
+                    except (TypeError, ValueError):
+                        wait = 60.0
+                    self._rest_block_until = time.time() + max(wait, 30.0)
+                raise RuntimeError(f"HTTP {exc.code}")
+            except Exception as exc:
+                last_exc = exc
+        raise RuntimeError(f"sin respuesta: {last_exc}")
+
+    def _fetch_ratio(self, symbol: str) -> List[Tuple[int, float]]:
+        data = self._rest_get("/futures/data/topLongShortAccountRatio",
+                              {"symbol": symbol, "period": RATIO_PERIOD, "limit": 4})
+        pts: List[Tuple[int, float]] = []
+        for r in data if isinstance(data, list) else []:
+            try:
+                pts.append((int(r["timestamp"]), float(r["longShortRatio"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        pts.sort()
+        return pts
+
+    async def _ratio_loop(self) -> None:
+        for _ in range(30):                                  # espera los primeros tickers
+            if self._tick:
+                break
+            await asyncio.sleep(1.0)
+        first = True
+        while self.running:
+            if not first:
+                now = time.time()
+                nxt = (int(now // RATIO_REFRESH_S) + 1) * RATIO_REFRESH_S + RATIO_POLL_DELAY_S
+                self.ratio_next_cycle_ts = nxt
+                await asyncio.sleep(max(1.0, nxt - now))
+            first = False
+            await self._ratio_cycle()
+
+    async def _ratio_cycle(self) -> None:
+        self._refresh_watchlist()
+        self.ratio_last_cycle_ts = time.time()
+        pending = self._ratio_symbols()
+        for attempt in range(RATIO_RETRIES + 1):
+            if not pending or time.time() < self._rest_block_until:
+                break
+            if attempt:
+                await asyncio.sleep(RATIO_RETRY_GAP_S)       # aún no publicó el punto nuevo de 5 m
+            fresh = await self._poll_ratios(pending)
+            pending = [s for s in pending if s in fresh and not fresh[s]]
+        if time.time() < self._rest_block_until:
+            self.log(f"[ratio] ⚠️ REST en pausa {self._rest_block_until - time.time():.0f} s por límite de peticiones")
+
+    async def _poll_ratios(self, symbols: List[str]) -> Dict[str, bool]:
+        sem = asyncio.Semaphore(RATIO_CONCURRENCY)
+        fresh: Dict[str, bool] = {}
+
+        async def one(sym: str) -> None:
+            if time.time() < self._rest_block_until:
+                return
+            async with sem:
+                try:
+                    pts = await asyncio.to_thread(self._fetch_ratio, sym)
+                except Exception as exc:
+                    self.ratio_errors += 1
+                    self.ratio_last_error = f"{sym}: {exc}"
+                    return
+            self.ratio_polls += 1
+            try:
+                fresh[sym] = self._on_ratio_points(sym, pts)
+            except Exception as exc:
+                self.ratio_last_error = f"{sym}: {exc!r}"
+
+        await asyncio.gather(*(one(s) for s in symbols))
+        return fresh
+
+    def _on_ratio_points(self, sym: str, pts: List[Tuple[int, float]]) -> bool:
+        """Guarda el ratio, revisa el TP de las abiertas y evalúa el gatillo.
+        Devuelve True si había un punto nuevo."""
+        if not pts:
+            return False
+        st = self._ratio.setdefault(sym, {})
+        last_ts, last_r = pts[-1]
+        new = last_ts != st.get("last_ts")
+        prev = pts[-2] if len(pts) >= 2 else None
+        st.update(last_ts=last_ts, last=last_r, prev_ts=prev[0] if prev else 0,
+                  prev=prev[1] if prev else None, checked=time.time(),
+                  chg=((last_r - prev[1]) / prev[1] * 100.0) if prev and prev[1] > 0 else None)
+        self._ratio_check_tp(sym, pts)
+        if new and prev and st["chg"] is not None:
+            self._ratio_check_entry(sym, prev, pts[-1], st["chg"])
+        return new
+
+    def _live_price(self, sym: str) -> Optional[float]:
+        px = self._price(sym)
+        if px:
+            return px
+        t = self._tick.get(sym)
+        if t and time.time() - t[2] <= 10.0:
+            return t[1]
+        return None
+
+    def _ratio_check_tp(self, sym: str, pts: List[Tuple[int, float]]) -> None:
+        """TP: el ratio recupera el valor que tenía antes del gatillo."""
+        eng = self.engines[ENGINE_RATIO]
+        with self.lock:
+            targets = [p for p in eng.positions.values()
+                       if p.symbol == sym and (p.ratio_target or p.ratio_trigger) > 0]
+        if not targets or not self.store.can_act():
+            return
+        for p in targets:
+            after = [r for ts, r in pts if ts > p.ratio_ts]
+            if not after:
+                continue
+            goal = p.ratio_target or p.ratio_trigger
+            if p.direction == strategy.SHORT:
+                hit, best = max(after) >= goal, max(after)
+            else:
+                hit, best = min(after) <= goal, min(after)
+            if not hit:
+                continue
+            price = (self._live_price(sym) or (self.price_cache.get_mark_price(sym) if self.price_cache else None)
+                     or p.last_price or p.entry_price)
+            self.log(f"[ratio] TP {p.direction} {sym}: ratio {best:g} alcanzó el objetivo {goal:g} "
+                     f"(entrada {p.ratio_entry:g}, recupera {abs(p.ratio_change_pct):.1f}%)")
+            self._close(p.trade_id, price, "TP_RATIO")
+
+    def _record_ratio_signal(self, eng: Engine, sym: str, direction: str, prev: Tuple[int, float],
+                             last: Tuple[int, float], chg: float, action: str) -> None:
+        now = time.time()
+        with self.lock:
+            eng.signals.appendleft({
+                "ts": now, "time": _utc(now, "%H:%M:%S"), "symbol": sym, "direction": direction,
+                "body_pct": chg, "open": prev[1], "close": last[1],
+                "candle": _utc(last[0] / 1000, "%H:%M"), "candle_age_s": 0.0, "action": action,
+            })
+
+    def _ratio_check_entry(self, sym: str, prev: Tuple[int, float], last: Tuple[int, float], chg: float) -> None:
+        cfg = self.ratio_cfg
+        dmin, dmax, wmin = cfg["drop_min_pct"], cfg["drop_max_pct"], cfg["watch_min_pct"]
+        if -dmax <= chg <= -dmin:
+            side = strategy.SHORT
+        elif dmin <= chg <= dmax:
+            side = strategy.LONG
+        else:
+            return
+        t = self._tick.get(sym)
+        pct24 = t[0] if t else None
+        if pct24 is None or (side == strategy.SHORT and pct24 < wmin) or (side == strategy.LONG and pct24 > -wmin):
+            return                                  # solo se opera lo que está en la lista de vigilados
+        eng = self.engines[ENGINE_RATIO]
+        eng.signal_count += 1
+
+        def skip(action: str) -> None:
+            self._record_ratio_signal(eng, sym, side, prev, last, chg, action)
+
+        age_s = time.time() - last[0] / 1000
+        if age_s > RATIO_MAX_AGE_S:
+            return skip(f"ignorada: dato de ratio de hace {age_s:.0f}s")
+        if eng.paused:
+            return skip("pausado")
+        if eng.blocked.get(side):
+            return skip(f"bloqueada: {side} desactivados")
+        if self.max_open > 0 and self.open_count() >= self.max_open:
+            return skip(f"ignorada: límite de {self.max_open} abiertas")
+        if not self.store.can_open():
+            return skip("ignorada: estado sin confirmar")
+        with self.lock:
+            dup = any(p.symbol == sym and p.direction == side for p in eng.positions.values())
+            until = eng.cooldown.get(sym, 0.0)
+        if dup:
+            return skip("ya hay una abierta en este par y dirección")
+        if until > time.time():
+            return skip("ignorada: en pausa tras cierre")
+        price = self._live_price(sym)
+        if not price:
+            return skip("sin precio en vivo")
+        f = self.filters.get(sym, {})
+        qty, eff, why = strategy.size_order(
+            NOTIONAL_USDT, price, f.get("stepSize", 0.001), f.get("minQty", 0.0),
+            f.get("minNotional", 5.0), MAX_NOTIONAL_OVER)
+        if qty <= 0:
+            self.log(f"[{eng.label}] señal {side} {sym} saltada: {why}")
+            return skip(f"saltada: {why}")
+        # TP: el ratio recupera el mismo % que cayó (SHORT) / subió (LONG), desde el ratio de entrada.
+        target = last[1] * (1 + abs(chg) / 100.0) if side == strategy.SHORT else last[1] * (1 - abs(chg) / 100.0)
+        pos = Position(
+            trade_id=self._next_trade_id(), symbol=sym, direction=side,
+            entry_price=price, qty=qty, notional=eff, tp_price=0.0,
+            signal_pct=chg, candle_open=prev[1], candle_close=last[1], candle_time=last[0],
+            last_price=price, strategy=eng.name, inverted=False, sent=not self.executor_paused,
+            ratio_trigger=prev[1], ratio_entry=last[1], ratio_change_pct=chg, ratio_ts=last[0],
+            ratio_target=target,
+        )
+        with self.lock:
+            eng.positions[pos.trade_id] = pos
+            eng.opened_count += 1
+        self._refresh_pos_syms()
+        if self.price_cache is not None:
+            self.price_cache.ensure_symbols([sym])
+        self.store.mark_dirty(True)
+        skip(f"abierta #{pos.trade_id}")
+        self.log(f"[{eng.label}] ABRE {side} {sym}{'' if pos.sent else ' [SIMULADA: envíos al executor pausados]'} | "
+                 f"ratio {prev[1]:g}→{last[1]:g} ({chg:+.1f}%) | 24 h {pct24:+.1f}% | px={price:g} qty={qty:g} "
+                 f"({eff:.2f} USDT) | TP cuando el ratio {'≥' if side == strategy.SHORT else '≤'} {target:g} | "
+                 f"trade #{pos.trade_id}")
+        if pos.sent:
+            self.executor.send({
+                "action": "open", "trade_id": pos.trade_id, "symbol": sym, "direction": side,
+                "price": price, "quantity": qty, "notional": round(eff, 4),
+                "level": round(chg, 4), "strategy": eng.name,
+            }, time.perf_counter())
+
+    def _ratio_snapshot(self) -> dict:
+        eng = self.engines[ENGINE_RATIO]
+        cfg = dict(self.ratio_cfg)
+        dmin, dmax = cfg["drop_min_pct"], cfg["drop_max_pct"]
+        with self.lock:
+            open_syms = {p.symbol for p in eng.positions.values()}
+        now = time.time()
+        rows = []
+        for sym in list(dict.fromkeys(list(self.watch) + sorted(open_syms))):
+            t = self._tick.get(sym)
+            st = self._ratio.get(sym) or {}
+            side = self.watch_side.get(sym, "")
+            chg = st.get("chg")
+            in_range = bool(chg is not None and ((side == strategy.SHORT and -dmax <= chg <= -dmin)
+                                                 or (side == strategy.LONG and dmin <= chg <= dmax)))
+            rows.append({
+                "symbol": sym, "pct24": t[0] if t else None, "price": t[1] if t else None,
+                "prev": st.get("prev"), "last": st.get("last"), "chg": chg,
+                "data_time": _utc(st["last_ts"] / 1000, "%H:%M") if st.get("last_ts") else "",
+                "side": side, "in_range": in_range, "has_position": sym in open_syms,
+            })
+        rows.sort(key=lambda r: abs(r["pct24"] or 0), reverse=True)
+        return {
+            "cfg": cfg, "rows": rows, "watch_count": len(self.watch),
+            "long_enabled": not eng.blocked[strategy.LONG], "short_enabled": not eng.blocked[strategy.SHORT],
+            "ticker_connected": self.ticker_connected, "ticker_symbols": len(self._tick),
+            "ticker_age_s": (now - self.ticker_last_ts) if self.ticker_last_ts else None,
+            "ticker_error": self.ticker_error,
+            "watch_updated": _utc(self.watch_ts, "%H:%M:%S") if self.watch_ts else "",
+            "next_cycle_in": max(0.0, self.ratio_next_cycle_ts - now) if self.ratio_next_cycle_ts else 0.0,
+            "polls": self.ratio_polls, "errors": self.ratio_errors, "last_error": self.ratio_last_error,
+            "rest_blocked_s": max(0.0, self._rest_block_until - now),
+        }
 
     # ── Mantenimiento ─────────────────────────────────────────────────────────
 
@@ -1305,7 +1778,8 @@ class KlineBot:
             "closed_trades":  closed,
             "signals":        signals,
             "excursions":     self.excursion_stats(eng),
-            "evaluations":    self.evaluations(eng.threshold_pct),
+            "evaluations":    (self.evaluations(eng.threshold_pct) if eng.name != ENGINE_RATIO else
+                               {"total": 0, "minutes": [], "top": [], "top_minute": ""}),
         }
 
     def _global_snapshot(self) -> dict:
@@ -1342,6 +1816,7 @@ class KlineBot:
                 "total_ms": round(self.executor.last_total_ms, 1),
             },
             "klines": {
+                "enabled": KLINE_BOTS_ENABLED,
                 "symbols": k1.get("symbols", 0), "with_data": k1.get("with_data", 0),
                 "closed_candles": k1.get("closed_candles", 0),
                 "live_updates": self.live_updates,
@@ -1350,6 +1825,7 @@ class KlineBot:
             },
             "prices_connected": bool(pc and pc.is_connected()),
             "eval_total":      self.eval_count,
+            "ratio":           self._ratio_snapshot(),
             "global":          self._global_snapshot(),
             "engines":         {n: self._engine_snapshot(e, now) for n, e in self.engines.items()},
             "events":          events,
@@ -1455,6 +1931,8 @@ def api_config_set():
     eng, err = _engine_param(data)
     if err:
         return err
+    if eng.name == ENGINE_RATIO:
+        return jsonify({"ok": False, "error": "El bot de ratio se ajusta en /api/ratio"}), 400
     vals = {}
     for key in ("threshold_pct", "tp_pct"):
         if data.get(key) in (None, ""):
@@ -1511,6 +1989,40 @@ def api_global_set():
     if not vals:
         return jsonify({"ok": False, "error": "Nada que cambiar"}), 400
     return jsonify({"ok": True, **bot.set_global(**vals)})
+
+
+@app.get("/api/ratio")
+def api_ratio_get():
+    return _no_store(jsonify({"ok": True, **bot._ratio_snapshot()}))
+
+
+@app.post("/api/ratio")
+def api_ratio_set():
+    """Ajusta el bot de ratio. Body JSON (todo opcional): {"watch_min_pct": 20,
+    "drop_min_pct": 25, "drop_max_pct": 30}. LONG/SHORT se activan con /api/block
+    ({"engine": "ratio", "direction": "LONG", "blocked": false})."""
+    busy = _guard()
+    if busy:
+        return busy
+    data = request.get_json(silent=True) or {}
+    vals = {}
+    for key, hi in (("watch_min_pct", 1000), ("drop_min_pct", 100), ("drop_max_pct", 100)):
+        if data.get(key) in (None, ""):
+            continue
+        try:
+            v = float(data[key])
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": f"{key} inválido"}), 400
+        if not 0 < v <= hi:
+            return jsonify({"ok": False, "error": f"{key} debe estar entre 0 y {hi:g}"}), 400
+        vals[key] = v
+    if not vals:
+        return jsonify({"ok": False, "error": "Nada que cambiar"}), 400
+    try:
+        cfg = bot.set_ratio_config(**vals)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, **cfg})
 
 
 @app.post("/api/session/reset")
@@ -1624,7 +2136,7 @@ TRADE_CSV_COLS = [
     "strategy", "trade_id", "symbol", "direction", "reason", "opened_ts", "closed_at_ts", "duration_s",
     "inverted", "signal_pct", "candle_age_s", "entry_price", "close_price", "qty", "notional", "tp_price",
     "sent", "move_pct", "pnl", "pnl_gross", "fees", "pnl_pct", "mfe_pct", "mae_pct", "mfe_usd", "mae_usd", "time_to_mfe_s",
-    "time_to_mae_s", "high_price", "low_price",
+    "time_to_mae_s", "high_price", "low_price", "ratio_target", "ratio_trigger", "ratio_entry", "ratio_change_pct",
 ]
 
 
@@ -1768,7 +2280,7 @@ HTML = r"""<!doctype html>
 <body>
 <main>
   <div class="top">
-    <div class="brand">BOTKLINE <small>velas 1m · dos bots en paralelo</small></div>
+    <div class="brand">BOTKLINE <small>ratio top traders · short a los que más suben</small></div>
     <div class="pills" id="pills"></div>
   </div>
   <div class="muted" id="rules"></div>
@@ -1779,7 +2291,7 @@ HTML = r"""<!doctype html>
     <div class="kpi"><div class="label">PnL realizado (total)</div><div class="v" id="sRpnlAll">—</div><small class="muted" id="sWins"></small></div>
     <div class="kpi"><div class="label">PnL abierto (total)</div><div class="v" id="sUpnlAll">—</div></div>
     <div class="kpi"><div class="label">Posiciones abiertas</div><div class="v" id="sOpen">—</div><small class="muted" id="sOpenLim"></small></div>
-    <div class="kpi"><div class="label">Velas 1m</div><div class="v" id="sKl">—</div><small class="muted" id="sEval"></small></div>
+    <div class="kpi"><div class="label" id="kKlLabel">Vigilados (24 h)</div><div class="v" id="sKl">—</div><small class="muted" id="sEval"></small></div>
   </section>
 
   <details class="panel" data-key="control" open>
@@ -1811,6 +2323,31 @@ HTML = r"""<!doctype html>
         <input id="exToken" type="password" placeholder="Token admin (si está configurado)" autocomplete="off" style="display:none;max-width:320px">
       </div>
       <div id="glbMsg" class="muted msg"></div>
+    </div>
+  </details>
+
+  <details class="panel" data-key="ratio" open>
+    <summary>Ratio top traders <span class="hint" id="rtSum"></span> <span class="badge" id="rtN">0</span></summary>
+    <div class="body">
+      <div class="muted" id="rtInfo"></div>
+      <form id="rtForm" style="margin-top:10px">
+        <label class="f">Vigilar símbolos con 24 h ≥ ±% <span id="rtCurW"></span>
+          <input id="rtWatch" type="number" step="0.1" min="0.1" max="1000" placeholder="ej. 20"></label>
+        <label class="f">Caída MÍNIMA del ratio, % <span id="rtCurMin"></span>
+          <input id="rtMin" type="number" step="0.1" min="0.1" max="100" placeholder="ej. 25"></label>
+        <label class="f">Caída MÁXIMA del ratio, % <span id="rtCurMax"></span>
+          <input id="rtMax" type="number" step="0.1" min="0.1" max="100" placeholder="ej. 30"></label>
+        <button type="submit" style="align-self:flex-end">Guardar</button>
+      </form>
+      <div class="row" style="margin-top:8px">
+        <button type="button" id="rtBtnShort">SHORT</button>
+        <button type="button" id="rtBtnLong">LONG</button>
+        <span class="muted">SHORT: ganadores (24 h ≥ +X %), el ratio cae. LONG (espejo): perdedores (24 h ≤ −X %), el ratio sube.</span>
+      </div>
+      <div id="rtMsg" class="muted msg"></div>
+      <div class="scroll"><table>
+        <thead><tr><th>Símbolo</th><th>24 h</th><th>Precio</th><th>Ratio antes</th><th>Ratio ahora</th><th>Cambio</th><th>Dato</th><th>Lado</th><th>Estado</th></tr></thead>
+        <tbody id="tRt"></tbody></table></div>
     </div>
   </details>
 
@@ -1851,7 +2388,7 @@ HTML = r"""<!doctype html>
   <details class="panel" data-key="sig">
     <summary>Señales recientes · <span class="engName"></span> <span class="badge" id="nSig">0</span></summary>
     <div class="body"><div class="scroll"><table>
-      <thead><tr><th>Hora</th><th>Símbolo</th><th>Dir.</th><th>Vela</th><th>Cuerpo</th><th>Segundo</th><th>Acción</th></tr></thead>
+      <thead><tr><th>Hora</th><th>Símbolo</th><th>Dir.</th><th id="thSigC">Vela</th><th id="thSigB">Cuerpo</th><th id="thSigS">Segundo</th><th>Acción</th></tr></thead>
       <tbody id="tSig"></tbody></table></div></div>
   </details>
 
@@ -1913,7 +2450,7 @@ const dur = s => { s = Math.floor(s); const h = Math.floor(s/3600), m = Math.flo
 const tag = d => `<span class="tag ${esc(d)}">${esc(d)}</span>`;
 const store = {get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } },
                set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }};
-let cur = store.get('botkline_engine', 'close'), last = null;
+let cur = store.get('botkline_engine', 'ratio'), last = null;
 q('exToken').value = store.get('botkline_token', '');
 
 // Secciones plegables: se recuerda cuáles están abiertas.
@@ -1952,13 +2489,19 @@ function render(d) {
   q('pills').innerHTML = [
     `<span class="pill ${g.inverted ? 'alert' : 'ok'}">${g.inverted ? 'Modo INVERTIDO' : 'Modo normal'}</span>`,
     ...names.map(n => `<span class="pill ${d.engines[n].config.paused ? 'alert' : 'ok'}">${esc(d.engines[n].label)}: ${d.engines[n].config.paused ? 'pausado' : 'en marcha'}</span>`),
-    `<span class="pill ${k.active ? 'ok' : 'bad'}">Velas ${k.active ? 'conectadas' : 'desconectadas'}</span>`,
+    ...(k.enabled ? [`<span class="pill ${k.active ? 'ok' : 'bad'}">Velas ${k.active ? 'conectadas' : 'desconectadas'}</span>`] : []),
+    ...(d.ratio ? [`<span class="pill ${d.ratio.ticker_connected ? 'ok' : 'bad'}">Ticker 24 h ${d.ratio.ticker_connected ? 'conectado' : 'desconectado'}</span>`,
+                   `<span class="pill ${d.ratio.rest_blocked_s > 0 ? 'bad' : 'ok'}">Ratio REST ${d.ratio.rest_blocked_s > 0 ? 'en pausa' : 'ok'}</span>`] : []),
     `<span class="pill ${!x.url ? 'bad' : g.executor_paused ? 'alert' : (x.errors && x.last_error ? 'alert' : 'ok')}">Executor ${!x.url ? 'sin link' : g.executor_paused ? 'PAUSADO (prueba)' : 'activo'}</span>`,
     `<span class="pill ${p.mode === 'ok' || p.mode === 'local' ? 'ok' : 'alert'}">Estado ${esc(p.mode)}</span>`,
   ].join('');
   q('rules').textContent = g.inverted
     ? `Cuerpo de la vela 1m ≥ umbral → entra CONTRA la vela · el % es stop loss, sin TP · ${c.notional} USDT por entrada · fee ${g.fee_pct}% por lado`
     : `Cuerpo de la vela 1m ≥ umbral → sigue la tendencia · el % es take profit, sin stop loss · ${c.notional} USDT por entrada · fee ${g.fee_pct}% por lado`;
+  if (d.ratio) {
+    const rc = d.ratio.cfg;
+    q('rules').textContent = `Ratio top traders: vigila 24 h ≥ ±${rc.watch_min_pct}% · SHORT si el ratio cae ${rc.drop_min_pct}–${rc.drop_max_pct}% en 5 min · TP cuando el ratio recupera el mismo % que cayó · ${c.notional} USDT por entrada · fee ${g.fee_pct}% por lado`;
+  }
 
   // Cifras
   q('sessPnl').innerHTML = usd(g.session_pnl);
@@ -1970,17 +2513,24 @@ function render(d) {
   q('sUpnlAll').innerHTML = usd(sum(n => n.unrealized_pnl));
   q('sOpen').textContent = g.open_count;
   q('sOpenLim').textContent = g.max_open > 0 ? `límite ${g.max_open}` : 'sin límite';
-  q('sKl').innerHTML = `${k.with_data}/${k.symbols}`;
-  q('sEval').textContent = `${k.active}/${k.connections} conexiones · ${d.eval_total.toLocaleString('es')} velas evaluadas`;
+  if (d.ratio) {
+    q('sKl').innerHTML = `${d.ratio.watch_count}`;
+    q('sEval').textContent = `de ${d.ratio.ticker_symbols} símbolos · lista de ${d.ratio.watch_updated || '—'}`;
+  } else {
+    q('sKl').innerHTML = `${k.with_data}/${k.symbols}`;
+    q('sEval').textContent = `${k.active}/${k.connections} conexiones · ${d.eval_total.toLocaleString('es')} velas evaluadas`;
+  }
 
   // Control
+  const rcfg = (d.ratio || {}).cfg || {};
   q('bots').innerHTML = names.map(n => { const b = d.engines[n], bc = b.config;
     const bl = [bc.block_long && 'LONG', bc.block_short && 'SHORT'].filter(Boolean).join(', ');
     return `<div class="bot ${n === cur ? 'sel' : ''} ${bc.paused ? 'paused' : ''}">
       <h3>${esc(b.label)} <span class="st ${bc.paused ? 'off' : 'on'}">${bc.paused ? 'PAUSADO' : 'EN MARCHA'}</span></h3>
       <div class="muted" style="font-size:12px;margin-top:2px">${esc(b.hint)}</div>
       <div class="rows">
-        <div>Señal<b>±${bc.threshold_pct}%</b></div><div>${xk}<b>${bc.tp_pct}%</b></div>
+        ${n === 'ratio' ? `<div>Caída ratio<b>${rcfg.drop_min_pct}–${rcfg.drop_max_pct}%</b></div><div>TP<b>ratio recupera %</b></div>`
+                        : `<div>Señal<b>±${bc.threshold_pct}%</b></div><div>${xk}<b>${bc.tp_pct}%</b></div>`}
         <div>Abiertas<b>${b.positions.length}</b></div><div>Bloqueados<b class="${bl ? 'neg' : ''}">${bl || '—'}</b></div>
         <div>Señales / abiertas<b>${b.signal_count} / ${b.opened_count}</b></div><div>Cerradas<b>${b.closed_count} (${b.wins} gan.)</b></div>
         <div>PnL abierto<b>${usd(b.unrealized_pnl)}</b></div><div>PnL realizado<b>${usd(b.realized_pnl)}</b></div>
@@ -2017,16 +2567,23 @@ function render(d) {
   // Posiciones
   q('nPos').textContent = e.positions.length;
   q('engPnl').innerHTML = `PnL abierto ${usd(e.unrealized_pnl)} · realizado ${usd(e.realized_pnl)} (${e.wins}/${e.closed_count} ganadas)`;
+  const rn = {}; ((d.ratio || {}).rows || []).forEach(x => rn[x.symbol] = x);
   q('tPos').innerHTML = e.positions.map(r => `<tr>
     <td><b>${esc(r.symbol)}</b> <span class="muted">#${r.trade_id}</span>${r.sent === false ? ' <span class="st off">SIMULADA</span>' : ''}</td><td>${tag(r.direction)}</td>
-    <td>${pct(r.signal_pct)}${cur === 'live' ? ` <span class="muted">${Math.round(r.candle_age_s || 0)}s</span>` : ''}</td><td>${num(r.entry_price, 8)}</td><td>${num(r.price, 8)}</td>
-    <td>${pct(r.move_pct)}</td><td><span class="muted">${r.inverted ? 'SL' : 'TP'}</span> ${num(r.tp_price, 8)}</td><td>${num(r.notional, 2)}</td><td>${usd(r.pnl)}</td>
+    <td>${cur === 'ratio' ? `${num(r.ratio_trigger, 4)}→${num(r.ratio_entry, 4)} ${pct(r.ratio_change_pct || 0)}` : pct(r.signal_pct) + (cur === 'live' ? ` <span class="muted">${Math.round(r.candle_age_s || 0)}s</span>` : '')}</td><td>${num(r.entry_price, 8)}</td><td>${num(r.price, 8)}</td>
+    <td>${pct(r.move_pct)}</td><td>${cur === 'ratio' ? `<span class="muted">TP ratio ${r.direction === 'SHORT' ? '≥' : '≤'}</span> ${num(r.ratio_target || r.ratio_trigger, 4)} <span class="muted">(ahora ${rn[r.symbol] && rn[r.symbol].last != null ? num(rn[r.symbol].last, 4) : '—'})</span>` : `<span class="muted">${r.inverted ? 'SL' : 'TP'}</span> ${num(r.tp_price, 8)}`}</td><td>${num(r.notional, 2)}</td><td>${usd(r.pnl)}</td>
     <td>${pct(r.mfe_pct)} <span class="muted">${usd(r.mfe_usd)}</span></td><td>${pct(r.mae_pct)} <span class="muted">${usd(r.mae_usd)}</span></td>
     <td>${esc(r.opened)} <span class="muted">(${dur(r.age_s)})</span></td>
     <td><button class="small ghost" data-close="${r.trade_id}" data-label="${esc(r.direction)} ${esc(r.symbol)} #${r.trade_id}">Cerrar</button></td></tr>`).join('')
     || '<tr><td colspan="13" class="muted">Sin posiciones abiertas</td></tr>';
 
-  // Parámetros
+  // Parámetros (el bot de ratio se ajusta en su propio panel)
+  const isRatio = cur === 'ratio';
+  document.querySelector('details[data-key="cfg"]').style.display = isRatio ? 'none' : '';
+  document.querySelector('details[data-key="eval"]').style.display = isRatio ? 'none' : '';
+  q('thSigC').textContent = isRatio ? 'Ratio' : 'Vela';
+  q('thSigB').textContent = isRatio ? 'Cambio' : 'Cuerpo';
+  q('thSigS').textContent = isRatio ? '' : 'Segundo';
   q('cfgThr').textContent = `±${ec.threshold_pct}%`;
   q('cfgTp').textContent = `${ec.tp_pct}%`;
   q('cfgTpLbl').textContent = xk;
@@ -2043,9 +2600,9 @@ function render(d) {
   q('nSig').textContent = e.signal_count;
   q('tSig').innerHTML = e.signals.map(s => `<tr><td>${esc(s.time)}</td><td>${esc(s.symbol)}</td><td>${tag(s.direction)}</td>
     <td>${esc(s.candle)} <span class="muted">${num(s.open, 8)}→${num(s.close, 8)}</span></td><td>${pct(s.body_pct)}</td>
-    <td class="muted">${Math.round(s.candle_age_s || 0)}s</td>
+    <td class="muted">${isRatio ? '' : Math.round(s.candle_age_s || 0) + 's'}</td>
     <td class="${s.action.startsWith('abierta') ? 'pos' : 'muted'}">${esc(s.action)}</td></tr>`).join('')
-    || `<tr><td colspan="7" class="muted">Esperando velas con cuerpo ≥ ±${ec.threshold_pct}%</td></tr>`;
+    || `<tr><td colspan="7" class="muted">${isRatio ? 'Esperando una caída del ratio dentro del rango' : 'Esperando velas con cuerpo ≥ ±' + ec.threshold_pct + '%'}</td></tr>`;
   q('nClosed').textContent = e.closed_count;
   q('tClosed').innerHTML = e.closed_trades.map(t => `<tr><td>${esc(t.closed)}</td><td>${esc(t.symbol)}</td><td>${tag(t.direction)}</td>
     <td>${num(t.entry_price, 8)}</td><td>${num(t.close_price, 8)}</td><td>${pct(t.move_pct)}</td><td>${usd(t.pnl)}</td>
@@ -2080,6 +2637,7 @@ function render(d) {
   q('exLat').textContent = x.last_ok
     ? `Última señal (${x.last_ok}): HTTP al executor ${x.http_ms} ms · total desde el mensaje de Binance ${x.total_ms} ms`
     : 'Latencia: aún no hay señales enviadas';
+  renderRatio(d);
   q('events').textContent = d.events.join('\n');
 }
 
@@ -2196,6 +2754,58 @@ document.addEventListener('click', async ev => {
   } catch (e) { alert(e); }
   refresh();
 });
+
+function renderRatio(d) {
+  const r = d.ratio; if (!r) return;
+  const c = r.cfg;
+  q('rtSum').textContent = `24 h ≥ ±${c.watch_min_pct}% · caída del ratio ${c.drop_min_pct}–${c.drop_max_pct}%`;
+  q('rtN').textContent = r.rows.length;
+  q('rtCurW').textContent = `(ahora ${c.watch_min_pct}%)`;
+  q('rtCurMin').textContent = `(ahora ${c.drop_min_pct}%)`;
+  q('rtCurMax').textContent = `(ahora ${c.drop_max_pct}%)`;
+  q('rtInfo').innerHTML = `Ticker 24 h ${r.ticker_connected ? '<span class="pos">conectado</span>' : '<span class="neg">desconectado</span>'}`
+    + ` (${r.ticker_symbols} símbolos, último mensaje ${r.ticker_age_s === null ? '—' : 'hace ' + dur(r.ticker_age_s)})`
+    + ` · lista actualizada ${esc(r.watch_updated || '—')} · próxima consulta en ${r.next_cycle_in > 0 ? dur(r.next_cycle_in) : '—'}`
+    + ` · consultas ${r.polls} · errores ${r.errors}`
+    + (r.rest_blocked_s > 0 ? ` · <span class="neg">REST en pausa ${dur(r.rest_blocked_s)} (límite de peticiones)</span>` : '')
+    + (r.last_error ? ` · <span class="warn">${esc(r.last_error)}</span>` : '');
+  for (const [id, dir, on] of [['rtBtnShort', 'SHORT', r.short_enabled], ['rtBtnLong', 'LONG', r.long_enabled]]) {
+    const b = q(id);
+    b.dataset.on = on ? '1' : '';
+    b.textContent = on ? `${dir} activo · desactivar` : `${dir} desactivado · activar`;
+    b.className = on ? 'ok' : 'danger';
+  }
+  q('tRt').innerHTML = r.rows.map(x => `<tr>
+    <td><b>${esc(x.symbol)}</b></td><td>${x.pct24 === null ? '—' : pct(x.pct24)}</td><td>${num(x.price, 8)}</td>
+    <td>${num(x.prev, 4)}</td><td>${num(x.last, 4)}</td><td>${x.chg === null ? '<span class="muted">—</span>' : pct(x.chg)}</td>
+    <td class="muted">${esc(x.data_time || '—')}</td><td>${x.side ? tag(x.side) : '<span class="muted">—</span>'}</td>
+    <td>${x.has_position ? '<span class="st on">POSICIÓN</span>' : x.in_range ? '<span class="st off">EN RANGO</span>' : '<span class="muted">—</span>'}</td></tr>`).join('')
+    || '<tr><td colspan="9" class="muted">Ningún símbolo cumple el % de 24 h todavía</td></tr>';
+}
+
+q('rtForm').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  q('rtMsg').textContent = 'Guardando…';
+  try {
+    const r = await post('/api/ratio', {watch_min_pct: q('rtWatch').value, drop_min_pct: q('rtMin').value, drop_max_pct: q('rtMax').value});
+    q('rtMsg').innerHTML = r.ok
+      ? `<span class="pos">Guardado.</span> 24 h ≥ ±${r.watch_min_pct}% · caída del ratio ${r.drop_min_pct}–${r.drop_max_pct}% (la lista de vigilados se recalcula en la próxima consulta de 5 min)`
+      : `<span class="neg">${esc(r.error)}</span>`;
+    if (r.ok) { q('rtWatch').value = ''; q('rtMin').value = ''; q('rtMax').value = ''; }
+  } catch (e) { q('rtMsg').innerHTML = `<span class="neg">${esc(e)}</span>`; }
+  refresh();
+});
+
+for (const [id, dir] of [['rtBtnShort', 'SHORT'], ['rtBtnLong', 'LONG']]) {
+  q(id).addEventListener('click', async () => {
+    const on = !!q(id).dataset.on;                       // activo ahora → se va a bloquear
+    const msg = on ? `¿Desactivar ${dir} en el bot de ratio? No abrirá entradas nuevas de ese lado (las abiertas siguen hasta su TP).`
+                   : `¿Activar ${dir} en el bot de ratio?` + (dir === 'LONG' ? ' Pasará a vigilar también los símbolos con 24 h ≤ −X % (perdedores).' : '');
+    if (!confirm(msg)) return;
+    try { const r = await post('/api/block', {engine: 'ratio', direction: dir, blocked: on}); if (!r.ok) alert(r.error); } catch (e) { alert(e); }
+    refresh();
+  });
+}
 
 refresh();
 setInterval(refresh, __POLL_MS__);
