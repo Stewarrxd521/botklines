@@ -46,9 +46,24 @@ El tráfico de red venía casi todo de streams de *todo el mercado* abiertos las
 
 El bloque *Red* de la web (y `GET /health`) muestra los bytes recibidos y enviados desde el arranque y el ritmo por hora.
 
-## Bots de velas 1m (opcionales)
+## Panel web
 
-Se activan con `KLINE_BOTS_ENABLED=true`.
+Menú con seis secciones; cada una tiene paneles desplegables (se recuerda cuáles dejaste abiertos) y tema claro, oscuro o automático:
+
+| Sección | Qué hay |
+| --- | --- |
+| **Resumen** | Cifras de la sesión, una tarjeta por bot (estado, parámetros, pausar), acciones generales (invertir, pausar el executor, poner a cero, cerrar todo) y las operaciones activas en tarjetas. |
+| **Operaciones** | Tarjetas de las posiciones abiertas, filtrables por bot, con PnL, barra SL → TP, MFE/MAE y botón de cierre; vista en tabla y señales recientes. |
+| **Bots** | Ajustes de cada bot: TP/SL y entrada del bot de ratio; umbral, TP, bloqueos y pausa de los bots de velas; encender/apagar las velas y el modo invertido. |
+| **Mercado** | Vigilados del bot de ratio y evaluaciones de velas. |
+| **Historial** | Cierres y MFE/MAE por bot, CSV. |
+| **Sistema** | Objetivo, límite de abiertas, fee, executor, tráfico de red y eventos. |
+
+El panel solo pide al servidor los datos de la sección abierta (`/api/status?view=`).
+
+## Bots de velas 1m
+
+Se encienden y apagan en caliente desde *Bots → Encender velas* (o `POST /api/global` con `{"klines_enabled": true}`); `KLINE_BOTS_ENABLED` es solo el valor inicial. Las velas son el stream con más tráfico (~0,5 MB/s).
 
 ### Dos bots en paralelo
 
