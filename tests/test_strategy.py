@@ -176,3 +176,17 @@ def test_la_venganza_no_se_dispara_al_cerrar_todas(tmp_path, monkeypatch):
     bot._price = lambda sym: 1.05
     bot.close_all(eng)
     assert not eng.positions
+
+
+def test_una_perdedora_simulada_no_dispara_venganza_real(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    bot.executor_paused = False                     # el executor se reanudó después de abrirla
+    eng = bot.engines[st.ENGINE_RATIO_REV]
+    eng.positions[3] = st.Position(trade_id=3, symbol="AUSDT", direction=st.SHORT, entry_price=1.0, qty=5,
+                                   notional=5.0, tp_price=0.9, sl_price=1.05, signal_pct=-27, candle_open=1.18,
+                                   candle_close=0.86, candle_time=0, last_price=1.0, strategy=st.ENGINE_RATIO_REV,
+                                   sent=False)
+    bot._price = lambda sym: 1.05
+    bot._close(3, 1.05, "SL")
+    venganzas = [p for p in eng.positions.values() if p.revenge]
+    assert len(venganzas) == 1 and venganzas[0].sent is False

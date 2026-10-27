@@ -1716,7 +1716,8 @@ class KlineBot:
             trade_id=self._next_trade_id(), symbol=sym, direction=side,
             entry_price=px, qty=qty, notional=eff, tp_price=tp_px, sl_price=sl_px,
             signal_pct=-loss, candle_open=lost.entry_price, candle_close=price, candle_time=int(now * 1000),
-            last_price=px, strategy=eng.name, inverted=False, sent=not self.executor_paused,
+            # Una perdedora simulada nunca dispara una venganza real (aunque se reanude el executor).
+            last_price=px, strategy=eng.name, inverted=False, sent=lost.sent and not self.executor_paused,
             revenge=True, rev_parent=lost.trade_id, rev_tp_usd=tp_usd, rev_sl_usd=sl_usd,
         )
         with self.lock:
