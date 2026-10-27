@@ -16,7 +16,7 @@ Servicio web para Render que vigila los perpetuos USDT que más se mueven en 24 
 
 1. **Exploración por WebSocket**: en cada ciclo de 5 min se abre `!miniTicker@arr` durante 30 s (`TICKER_SCAN_S`) y se lee el 24 h de todo el mercado. La misma exploración descubre los símbolos: una vez al día la lista se rehace (salen los deslistados) y entre medias se añaden los nuevos; se guarda en `KNOWN_SYMBOLS_FILE`.
    **Vigilados**: los perpetuos con variación 24 h ≥ +20 % (`RATIO_WATCH_MIN_PCT`, editable en la web). Con LONG activo, también los ≤ −20 %.
-2. **Entrada**: cada 5 min se consulta el ratio de cuentas de los top traders de cada vigilado. Si cae entre 25 % y 30 % de un punto de 5 min al siguiente → **SHORT** (LONG es el espejo: el ratio sube en un perdedor).
+2. **Entrada**: cada 5 min se consulta el ratio de cuentas de los top traders de cada vigilado. Si **cae** entre 25 % y 30 % de un punto de 5 min al siguiente en un ganador (24 h ≥ +X %) → **SHORT**. Si **sube** entre 25 % y 30 % en un perdedor (24 h ≤ −X %) → **LONG**. Las dos direcciones están activas por defecto (`RATIO_LONG_DEFAULT=false` deja el LONG bloqueado al arrancar) y cada una se bloquea desde la web.
 3. **Salida** (lo que llegue antes):
    - **Take profit por precio**: **+10 %** a favor desde la entrada (`RATIO_TP_PCT`).
    - **Stop loss por precio**: **−5 %** en contra desde la entrada (`RATIO_SL_PCT`).

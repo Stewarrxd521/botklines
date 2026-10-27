@@ -151,6 +151,8 @@ TICKER_SILENCE_S    = float(os.getenv("TICKER_SILENCE_S", "20"))
 RATIO_WATCH_MIN_PCT = float(os.getenv("RATIO_WATCH_MIN_PCT", "20"))   # |24 h| mínimo para vigilar
 RATIO_DROP_MIN_PCT  = float(os.getenv("RATIO_DROP_MIN_PCT", "25"))    # caída mínima del ratio (5 m → 5 m)
 RATIO_DROP_MAX_PCT  = float(os.getenv("RATIO_DROP_MAX_PCT", "30"))    # caída máxima (1,18→0,86 = 27 %)
+# LONG = subida del ratio en perdedores (24 h ≤ -X %). Activo por defecto, igual que el SHORT.
+RATIO_LONG_DEFAULT  = os.getenv("RATIO_LONG_DEFAULT", "true").strip().lower() in ("1", "true", "yes", "on")
 RATIO_PERIOD        = "5m"
 RATIO_REFRESH_S     = 300          # lista de vigilados y consulta del ratio, cada 5 min
 RATIO_POLL_DELAY_S  = float(os.getenv("RATIO_POLL_DELAY_S", "15"))    # espera tras el minuto :00/:05
@@ -595,8 +597,8 @@ ENGINE_RATIO = "ratio"
 ENGINE_LABELS = {ENGINE_CLOSE: "Bot al cierre", ENGINE_LIVE: "Bot en vivo",
                  ENGINE_RATIO: "Bot ratio top traders"}
 ENGINE_HINTS = {
-    ENGINE_RATIO: "SHORT cuando el ratio de cuentas de los top traders se gira (cae) en un símbolo con 24 h ≥ +20 %; "
-                  "sale por TP/SL de precio o cuando el ratio recupera el mismo % que cayó",
+    ENGINE_RATIO: "SHORT cuando el ratio de los top traders CAE en un ganador (24 h ≥ +X %); LONG cuando SUBE en "
+                  "un perdedor (24 h ≤ −X %). Sale por TP/SL de precio o cuando el ratio recupera el % que se movió",
     ENGINE_CLOSE: "entra cuando la vela 1m CIERRA con cuerpo ≥ umbral",
     ENGINE_LIVE:  "entra en cuanto la vela 1m EN CURSO supera el umbral, sin esperar al cierre",
 }
@@ -706,7 +708,7 @@ class KlineBot:
         }
         self.live = self.engines[ENGINE_LIVE]
         # Bot de ratio: LONG bloqueado por defecto (se activa desde la web).
-        self.engines[ENGINE_RATIO] = Engine(ENGINE_RATIO, saved.get(ENGINE_RATIO) or {"block_long": True},
+        self.engines[ENGINE_RATIO] = Engine(ENGINE_RATIO, saved.get(ENGINE_RATIO) or {"block_long": not RATIO_LONG_DEFAULT},
                                             1.0, 1.0)
         rs = settings.get("ratio") if isinstance(settings.get("ratio"), dict) else {}
 
@@ -1080,11 +1082,12 @@ class KlineBot:
                  f"{f'+{self.profit_target_usd:g} USD' if self.profit_target_usd > 0 else 'apagado'}")
         self.log(f"Executor → {self.executor.target.url or '(vacío)'}")
         rc = self.ratio_cfg
-        self.log(f"Bot ratio top traders | vigila 24 h ≥ {rc['watch_min_pct']:g}% | caída del ratio "
-                 f"{rc['drop_min_pct']:g}–{rc['drop_max_pct']:g}% | LONG "
+        self.log(f"Bot ratio top traders | vigila 24 h ≥ ±{rc['watch_min_pct']:g}% | caída (SHORT) o subida (LONG) "
+                 f"del ratio {rc['drop_min_pct']:g}–{rc['drop_max_pct']:g}% | SHORT "
+                 f"{'bloqueado' if self.engines[ENGINE_RATIO].blocked[SHORT] else 'activo'} | LONG "
                  f"{'bloqueado' if self.engines[ENGINE_RATIO].blocked[LONG] else 'activo'} | "
                  f"{NOTIONAL_USDT:g} USDT | TP +{rc['tp_pct']:g}% · SL -{rc['sl_pct']:g}% por precio"
-                 f"{' · TP por ratio (recupera el % que cayó)' if rc['ratio_exit'] else ''}")
+                 f"{' · TP por ratio (recupera el % que se movió)' if rc['ratio_exit'] else ''}")
         self.log(f"Red: 24 h por {f'WebSocket, exploración de {TICKER_SCAN_S:g} s cada 5 min' if TICKER_MODE != 'ws' else 'WebSocket continuo'} · "
                  f"precio en vivo solo de símbolos con posición ({price_stream_for(self.klines_enabled)})")
         self.log(f"[estado] Persistencia: {self._store_desc}")
@@ -1542,14 +1545,14 @@ class KlineBot:
         if ratio_exit is not None:
             new["ratio_exit"] = bool(ratio_exit)
         if new["drop_min_pct"] >= new["drop_max_pct"]:
-            raise ValueError("la caída mínima debe ser menor que la máxima")
+            raise ValueError("el cambio mínimo del ratio debe ser menor que el máximo")
         if new["sl_pct"] >= 100:
             raise ValueError("el stop loss debe ser menor que 100 %")
         if new == old:
             return dict(old)
         changes = []
-        for key, label in (("watch_min_pct", "24 h ≥"), ("drop_min_pct", "caída mín."),
-                           ("drop_max_pct", "caída máx."), ("tp_pct", "TP +"), ("sl_pct", "SL -")):
+        for key, label in (("watch_min_pct", "24 h ≥"), ("drop_min_pct", "cambio mín. del ratio"),
+                           ("drop_max_pct", "cambio máx. del ratio"), ("tp_pct", "TP +"), ("sl_pct", "SL -")):
             if new[key] != old[key]:
                 changes.append(f"{label}{old[key]:g}% → {new[key]:g}%")
         if new["ratio_exit"] != old["ratio_exit"]:
@@ -3068,7 +3071,7 @@ HTML = r"""<!doctype html>
             </form>
             <div class="row c" style="margin-top:10px">
               <button type="button" class="small" data-act="ratioExit" id="rtBtnExit">—</button>
-              <span class="muted" style="font-size:12px">TP por ratio: cierra cuando el ratio recupera el mismo % que cayó.</span>
+              <span class="muted" style="font-size:12px">TP por ratio: cierra cuando el ratio recupera el mismo % que cayó (SHORT) o subió (LONG).</span>
             </div>
           </div>
           <div class="box">
@@ -3076,9 +3079,9 @@ HTML = r"""<!doctype html>
             <form id="rtForm">
               <label class="f">Vigilar 24 h ≥ ±% <span id="rtCurW"></span>
                 <input id="rtWatch" type="number" step="0.1" min="0.1" max="1000" placeholder="ej. 20"></label>
-              <label class="f">Caída mín. del ratio, % <span id="rtCurMin"></span>
+              <label class="f">Cambio mín. del ratio (caída o subida), % <span id="rtCurMin"></span>
                 <input id="rtMin" type="number" step="0.1" min="0.1" max="100" placeholder="ej. 25"></label>
-              <label class="f">Caída máx. del ratio, % <span id="rtCurMax"></span>
+              <label class="f">Cambio máx. del ratio (caída o subida), % <span id="rtCurMax"></span>
                 <input id="rtMax" type="number" step="0.1" min="0.1" max="100" placeholder="ej. 30"></label>
               <button type="submit">Guardar</button>
             </form>
@@ -3087,7 +3090,7 @@ HTML = r"""<!doctype html>
               <button type="button" data-ratio-dir="LONG" id="rtBtnLong">LONG</button>
               <button type="button" class="small" data-pause="ratio" id="rtBtnPause">—</button>
             </div>
-            <div class="note">SHORT: ganadores (24 h ≥ +X %), el ratio cae. LONG (espejo): perdedores (24 h ≤ −X %), el ratio sube.</div>
+            <div class="note"><b>Caída del ratio → SHORT</b> en ganadores (24 h ≥ +X %). <b>Subida del ratio → LONG</b> en perdedores (24 h ≤ −X %). Cada botón activa o bloquea su dirección.</div>
           </div>
         </div>
         <div id="rtMsg" class="muted msg"></div>
@@ -3116,7 +3119,7 @@ HTML = r"""<!doctype html>
       <div class="body">
         <div class="muted" id="rtInfo" style="font-size:13px;margin-bottom:10px"></div>
         <div class="scroll"><table>
-          <thead><tr><th>Símbolo</th><th>24 h</th><th>Precio</th><th>Ratio antes</th><th>Ratio ahora</th><th>Cambio</th><th>Dato</th><th>Lado</th><th>Estado</th></tr></thead>
+          <thead><tr><th>Símbolo</th><th>24 h</th><th>Precio</th><th>Ratio antes</th><th>Ratio ahora</th><th>Cambio</th><th>Dato</th><th>Espera</th><th>Estado</th></tr></thead>
           <tbody id="tRt"></tbody></table></div>
       </div>
     </details>
@@ -3375,7 +3378,7 @@ function render(d) {
       <div class="top"><h3>${esc(b.label)}</h3><span class="st ${state[0]}">${state[1]}</span></div>
       <div class="hint">${esc(b.hint)}</div>
       <div class="kv">
-        ${isR ? `<div>TP / SL<b>${rc.tp_pct > 0 ? '+' + rc.tp_pct + '%' : '—'} / ${rc.sl_pct > 0 ? '−' + rc.sl_pct + '%' : '—'}</b></div><div>Caída ratio<b>${rc.drop_min_pct}–${rc.drop_max_pct}%</b></div>`
+        ${isR ? `<div>TP / SL<b>${rc.tp_pct > 0 ? '+' + rc.tp_pct + '%' : '—'} / ${rc.sl_pct > 0 ? '−' + rc.sl_pct + '%' : '—'}</b></div><div>Ratio ↓ SHORT / ↑ LONG<b>${rc.drop_min_pct}–${rc.drop_max_pct}%</b></div>`
               : `<div>Señal<b>±${bc.threshold_pct}%</b></div><div>${xk}<b>${bc.tp_pct}%</b></div>`}
         <div>Bloqueados<b class="${bl ? 'neg' : ''}">${bl || '—'}</b></div>
         <div>Abiertas<b>${b.positions.length}</b></div><div>Señales / entradas<b>${b.signal_count} / ${b.opened_count}</b></div><div>Cerradas<b>${b.closed_count} (${b.wins} gan.)</b></div>
@@ -3439,10 +3442,10 @@ function render(d) {
     <td>${esc(s.candle)} <span class="muted">${num(s.open, 8)}→${num(s.close, 8)}</span></td><td>${pct(s.body_pct)}</td>
     <td class="muted">${isRatio ? '' : Math.round(s.candle_age_s || 0) + 's'}</td>
     <td class="${s.action.startsWith('abierta') ? 'pos' : 'muted'}">${esc(s.action)}</td></tr>`).join('')
-    || `<tr><td colspan="7" class="muted">${isRatio ? 'Esperando una caída del ratio dentro del rango' : (k.running ? 'Esperando velas con cuerpo ≥ ±' + ec.threshold_pct + '%' : 'Las velas están apagadas (Bots → Encender velas)')}</td></tr>`;
+    || `<tr><td colspan="7" class="muted">${isRatio ? 'Esperando una caída (SHORT) o subida (LONG) del ratio dentro del rango' : (k.running ? 'Esperando velas con cuerpo ≥ ±' + ec.threshold_pct + '%' : 'Las velas están apagadas (Bots → Encender velas)')}</td></tr>`;
 
   // ── Bots ──
-  q('rtSum').textContent = `24 h ≥ ±${rc.watch_min_pct}% · caída ${rc.drop_min_pct}–${rc.drop_max_pct}% · TP ${rc.tp_pct > 0 ? '+' + rc.tp_pct + '%' : 'off'} · SL ${rc.sl_pct > 0 ? '−' + rc.sl_pct + '%' : 'off'}`;
+  q('rtSum').textContent = `24 h ≥ ±${rc.watch_min_pct}% · ratio ↓ SHORT / ↑ LONG ${rc.drop_min_pct}–${rc.drop_max_pct}% · TP ${rc.tp_pct > 0 ? '+' + rc.tp_pct + '%' : 'off'} · SL ${rc.sl_pct > 0 ? '−' + rc.sl_pct + '%' : 'off'}`;
   const rb = E.ratio.config;
   q('rtState').innerHTML = `<span class="st ${rb.paused ? 'off' : 'on'}">${rb.paused ? 'PAUSADO' : 'EN MARCHA'}</span>`;
   q('rtCurW').textContent = `(ahora ${rc.watch_min_pct}%)`;
@@ -3505,7 +3508,7 @@ function render(d) {
     q('tRt').innerHTML = r.rows.map(z => `<tr>
       <td><b>${esc(z.symbol)}</b></td><td>${z.pct24 === null ? '—' : pct(z.pct24)}</td><td>${num(z.price, 8)}</td>
       <td>${num(z.prev, 4)}</td><td>${num(z.last, 4)}</td><td>${z.chg === null ? '<span class="muted">—</span>' : pct(z.chg)}</td>
-      <td class="${z.lag ? 'warn' : 'muted'}" title="${z.lag ? 'Binance aún no publicó el punto más nuevo de este símbolo' : ''}">${esc(z.data_time || '—')}${z.lag ? ' ⏳' : ''}</td><td>${z.side ? tag(z.side) : '<span class="muted">—</span>'}</td>
+      <td class="${z.lag ? 'warn' : 'muted'}" title="${z.lag ? 'Binance aún no publicó el punto más nuevo de este símbolo' : ''}">${esc(z.data_time || '—')}${z.lag ? ' ⏳' : ''}</td><td>${z.side ? `${z.side === 'SHORT' ? 'caída ↓' : 'subida ↑'} ${tag(z.side)}` : '<span class="muted">—</span>'}</td>
       <td>${z.has_position ? '<span class="st on">POSICIÓN</span>' : z.in_range ? '<span class="st off">EN RANGO</span>' : '<span class="muted">—</span>'}</td></tr>`).join('')
       || '<tr><td colspan="9" class="muted">Ningún símbolo cumple el % de 24 h todavía</td></tr>';
     q('evSeg').innerHTML = seg([['close', 'Al cierre'], ['live', 'En vivo']], evEngine, 'ev');
@@ -3679,7 +3682,7 @@ document.addEventListener('submit', async ev => {
 q('rtForm').addEventListener('submit', async ev => {
   ev.preventDefault();
   if (await ratioPost({watch_min_pct: q('rtWatch').value, drop_min_pct: q('rtMin').value, drop_max_pct: q('rtMax').value},
-      r => `24 h ≥ ±${r.watch_min_pct}% · caída del ratio ${r.drop_min_pct}–${r.drop_max_pct}% (la lista se recalcula en la próxima consulta de 5 min)`)) {
+      r => `24 h ≥ ±${r.watch_min_pct}% · caída/subida del ratio ${r.drop_min_pct}–${r.drop_max_pct}% (la lista se recalcula en la próxima consulta de 5 min)`)) {
     q('rtWatch').value = ''; q('rtMin').value = ''; q('rtMax').value = '';
   }
 });
