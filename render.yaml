@@ -43,6 +43,22 @@ services:
       - key: COOLDOWN_SECONDS
         value: "0"            # pausa tras cerrar antes de volver a operar el símbolo
 
+      # ── Bot de ratio: salida por precio (editable en caliente desde la web) ──
+      - key: RATIO_TP_PCT
+        value: "10"           # take profit: +10 % a favor desde la entrada (0 = sin TP)
+      - key: RATIO_SL_PCT
+        value: "5"            # stop loss: -5 % en contra desde la entrada (0 = sin SL)
+      - key: RATIO_EXIT_BY_RATIO
+        value: "true"         # además, TP cuando el ratio recupera el % que cayó
+
+      # ── Ancho de banda ──────────────────────────────────────────────────────
+      - key: TICKER_MODE
+        value: "scan"         # 24 h por WebSocket: exploración de TICKER_SCAN_S cada 5 min (ws = abierto siempre)
+      - key: TICKER_SCAN_S
+        value: "30"
+      - key: STATUS_POLL_MS
+        value: "3000"         # cada cuánto consulta el panel (solo con la pestaña visible)
+
       # ── Executor (las órdenes las abre el executor) ─────────────────────────
       # El link se puede cambiar en caliente desde la web; esto es el valor inicial.
       - key: EXECUTOR_URL
@@ -62,7 +78,7 @@ services:
       - key: REST_PROXY_URL
         sync: false
       - key: SYMBOL_REFRESH_HOURS
-        value: "12"
+        value: "240"          # exchangeInfo (filtros de cantidad) cada 10 días
       - key: BASE_URL
         value: "https://fapi.binance.com"
       - key: QUOTE_ASSET

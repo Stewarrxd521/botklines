@@ -36,9 +36,11 @@ Streams:
                         get_price()/wait_for_price(): se guarda el mid
                         (bid+ask)/2 como último precio.
 
-Con esto, 600 símbolos = 600 streams de bookTicker + 2 streams globales
-= 602, bien por debajo del límite de 1024 (antes, con 2 streams por
-símbolo, 600 símbolos ni siquiera cabían: 1201 > 1024).
+Ancho de banda (v4): los dos streams globales quedan APAGADOS por defecto
+(WS_ALL_MARKET / WS_ALL_TICKER) porque bajan cientos de KB/s aunque no haya
+nada abierto. Cada símbolo seguido usa WS_SYMBOL_STREAM: "markPrice@1s"
+(1 mensaje/s) o "bookTicker" (+ su markPrice@1s para que un libro quieto no
+deje el precio viejo). Solo se siguen los símbolos con posición abierta.
 
 API pública (compatible con la versión anterior):
   start() / stop()
@@ -101,7 +103,9 @@ _BINANCE_MAX_STREAMS = 1024
 # refresca cada 3 s. Es sólo la RED DE SEGURIDAD para un símbolo que aún
 # no tiene su propio bookTicker suscrito — la frescura real de verdad la
 # da <symbol>@bookTicker (tiempo real, ver más abajo).
-_ALL_MARKET_ENABLED  = os.environ.get("WS_ALL_MARKET", "true").lower() == "true"
+# Apagado por defecto: ~90 KB/s de entrada aunque no haya posiciones abiertas.
+# Los símbolos con posición tienen su propio stream (ver _SYMBOL_STREAM).
+_ALL_MARKET_ENABLED  = os.environ.get("WS_ALL_MARKET", "false").lower() == "true"
 _ALL_MARKET_INTERVAL = os.environ.get("WS_ALL_MARKET_INTERVAL", "1s").lower()
 _ALL_MARKET_STREAM   = "!markPrice@arr@1s" if _ALL_MARKET_INTERVAL == "1s" else "!markPrice@arr"
 
@@ -109,6 +113,13 @@ _ALL_MARKET_STREAM   = "!markPrice@arr@1s" if _ALL_MARKET_INTERVAL == "1s" else 
 # pedir <symbol>@ticker uno por uno (eso costaba 1 stream extra POR
 # símbolo). Mismo flag que el de arriba: son las dos redes "globales".
 _ALL_TICKER_STREAM   = "!ticker@arr"
+# El ticker 24 h de todo el mercado (~150 KB/s) solo se pide si se activa a mano:
+# app.py ya lee el 24 h por su cuenta (REST cada 5 min).
+_ALL_TICKER_ENABLED  = os.environ.get("WS_ALL_TICKER", "false").lower() == "true"
+
+# Stream por símbolo seguido: "bookTicker" (tiempo real, decenas de mensajes/s en
+# pares movidos) o "markPrice@1s" (1 mensaje/s, mucho menos tráfico).
+_SYMBOL_STREAM = os.environ.get("WS_SYMBOL_STREAM", "bookTicker")
 
 _WS_BASE_URL = os.environ.get("WS_FSTREAM_URL", "wss://fstream.binance.com/market/stream")
 
@@ -151,13 +162,15 @@ class SymbolWebSocketPriceCache:
     _WS_MAX_SIZE  = 8 * 1024 * 1024   # 8 MB: !markPrice@arr con ~500 símbolos ronda los 90 KB
     _WS_MAX_QUEUE = 256
 
-    def __init__(self, symbols: list[str], symbols_per_connection: int | None = None):
+    def __init__(self, symbols: list[str], symbols_per_connection: int | None = None,
+                 symbol_stream: str | None = None):
         if symbols_per_connection is not None:
             print(
                 f"[WS] ⚠️  symbols_per_connection={symbols_per_connection} ignorado — "
                 f"todos los símbolos van en una sola conexión (límite Binance: 1024)."
             )
 
+        self.symbol_stream = symbol_stream or _SYMBOL_STREAM
         self.symbols = sorted({s.upper() for s in symbols})
         self._check_limit(self.symbols)
 
@@ -185,6 +198,7 @@ class SymbolWebSocketPriceCache:
         # mark_cache: symbol -> (mark, ts). Siempre se actualiza (sirve de
         # respaldo cuando el bookTicker está callado o no suscrito).
         self.mark_cache:   dict[str, tuple[float, float]] = {}
+        self.rx_bytes = 0            # bytes recibidos por el WebSocket (métrica de tráfico)
         self.book_ticks = 0          # contador de mensajes bookTicker (métrica)
         self.mark_ticks = 0
         self.ticker_ticks = 0
@@ -216,13 +230,10 @@ class SymbolWebSocketPriceCache:
     # Utilidades internas
     # ──────────────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _check_limit(symbols: list[str]):
-        # 1 stream por símbolo (bookTicker, tiempo real) + 2 globales
-        # (markPrice@arr + ticker@arr). Antes eran 2 streams POR símbolo
-        # (markPrice@1s + ticker), así que este cambio también DUPLICA
-        # cuántos símbolos caben por debajo del límite de Binance.
-        needed = len(symbols) * 1 + (2 if _ALL_MARKET_ENABLED else 0)
+    def _check_limit(self, symbols: list[str]):
+        # Streams por símbolo (1, o 2 con bookTicker sin mark global) + los globales activos.
+        needed = (len(symbols) * len(self._streams_for("x"))
+                  + int(_ALL_MARKET_ENABLED) + int(_ALL_TICKER_ENABLED))
         if needed > _BINANCE_MAX_STREAMS:
             raise ValueError(
                 f"Binance permite máximo {_BINANCE_MAX_STREAMS} streams por conexión. "
@@ -230,14 +241,18 @@ class SymbolWebSocketPriceCache:
                 f"(dos SymbolWebSocketPriceCache, cada una con su propia conexión)."
             )
 
-    @staticmethod
-    def _streams_for(symbol: str) -> list[str]:
+    def _streams_for(self, symbol: str) -> list[str]:
         # bookTicker individual = tiempo real de verdad (Binance lo manda
         # en el instante en que cambia el mejor bid/ask, sin intervalo
         # mínimo). Es lo que da los "ms" de frescura que markPrice@1s o
         # ticker NUNCA pueden dar, porque esos sí tienen un intervalo
         # mínimo fijo de 1 s en el propio servidor de Binance.
-        return [f"{symbol.lower()}@bookTicker"]
+        streams = [f"{symbol.lower()}@{self.symbol_stream}"]
+        if self.symbol_stream == "bookTicker" and not _ALL_MARKET_ENABLED:
+            # Sin el mark de todo el mercado, un libro quieto dejaría el precio "viejo":
+            # el markPrice@1s del propio símbolo mantiene fresco el timestamp.
+            streams.append(f"{symbol.lower()}@markPrice@1s")
+        return streams
 
     def _desired_streams(self) -> set[str]:
         with self.lock:
@@ -245,6 +260,7 @@ class SymbolWebSocketPriceCache:
         wanted: set[str] = set()
         if _ALL_MARKET_ENABLED:
             wanted.add(_ALL_MARKET_STREAM)
+        if _ALL_TICKER_ENABLED:
             wanted.add(_ALL_TICKER_STREAM)
         for sym in symbols_snapshot:
             wanted.update(self._streams_for(sym))
@@ -470,6 +486,7 @@ class SymbolWebSocketPriceCache:
 
                     while self.running:
                         msg = await ws.recv()
+                        self.rx_bytes += len(msg)
                         try:
                             self._handle_payload(_JSON_LOADS(msg))
                         except Exception:
@@ -519,7 +536,7 @@ class SymbolWebSocketPriceCache:
                     if entry is None or now - entry[1] > 120:
                         stale_price.append(symbol)
                     ticker = self.ticker_cache.get(symbol)
-                    if ticker is None or now - ticker.ts > 120:
+                    if _ALL_TICKER_ENABLED and (ticker is None or now - ticker.ts > 120):
                         stale_ticker.append(symbol)
 
             if stale_price:
@@ -756,6 +773,8 @@ class SymbolWebSocketPriceCache:
             "active_tickers":    active_tickers,
             "subscribed_streams": subscribed,
             "all_market_stream": _ALL_MARKET_STREAM if _ALL_MARKET_ENABLED else None,
+            "symbol_stream":     self.symbol_stream,
+            "rx_bytes":          self.rx_bytes,
             "connected":         self.is_connected(),
             "stale_symbols":     len(self.get_stale_symbols()),
             "book_ticks":        self.book_ticks,
@@ -787,8 +806,9 @@ class SymbolWebSocketPriceCache:
 
         print(
             f"✅ WebSocket cache iniciado — {len(self.symbols)} símbolo(s) seguidos vía "
-            f"bookTicker (tiempo real), 1 conexión"
-            f"{', + ' + _ALL_MARKET_STREAM + ' + ' + _ALL_TICKER_STREAM if _ALL_MARKET_ENABLED else ''}"
+            f"{self.symbol_stream}, 1 conexión"
+            f"{', + ' + _ALL_MARKET_STREAM if _ALL_MARKET_ENABLED else ''}"
+            f"{', + ' + _ALL_TICKER_STREAM if _ALL_TICKER_ENABLED else ''}"
         )
 
     def stop(self):
