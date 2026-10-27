@@ -190,3 +190,50 @@ def test_una_perdedora_simulada_no_dispara_venganza_real(tmp_path, monkeypatch):
     bot._close(3, 1.05, "SL")
     venganzas = [p for p in eng.positions.values() if p.revenge]
     assert len(venganzas) == 1 and venganzas[0].sent is False
+
+
+def test_cerrar_un_bot_no_cierra_en_el_executor_lo_de_los_otros(tmp_path, monkeypatch):
+    # El executor suma en una posición las de todos los bots del mismo par y dirección.
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    bot.executor_paused = False
+    enviados = []
+    bot.executor.send = lambda payload, *a, **k: enviados.append(payload)
+    now = time.time()
+    bot._tick = {"AUSDT": (25.0, 1.0, now)}
+    bot._price = lambda sym: 1.0
+    ts = int(now * 1000)
+    bot._on_ratio_points("AUSDT", [(ts - 300_000, 1.18), (ts, 0.86)])
+    ps = [p for n in st.RATIO_ENGINES for p in bot.engines[n].positions.values()]
+    assert len(ps) == 3 and all(p.sent for p in ps)
+    enviados.clear()
+    for p in ps:
+        bot._close(p.trade_id, 1.0, "MANUAL")
+    cierres = [e for e in enviados if e["action"] == "close"]
+    assert [c["trade_id"] for c in cierres] == [p.trade_id for p in ps]
+    assert [c.get("quantity") for c in cierres[:2]] == [ps[0].qty, ps[1].qty]   # parciales
+    assert "quantity" not in cierres[2]             # la última cierra todo lo que haya en Binance
+
+
+def test_solo_se_consulta_el_ratio_de_las_abiertas_que_esperan_tp_por_ratio(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    bot.watch = ["AUSDT"]
+    bot.ratio_cfg["ratio_exit"] = False
+
+    def pos(tid, sym, name, **kw):
+        bot.engines[name].positions[tid] = st.Position(
+            trade_id=tid, symbol=sym, direction=st.SHORT, entry_price=1.0, qty=5, notional=5.0, tp_price=0,
+            signal_pct=-27, candle_open=1.18, candle_close=0.86, candle_time=0, last_price=1.0, strategy=name,
+            ratio_trigger=1.18, **kw)
+
+    pos(1, "BUSDT", st.ENGINE_RATIO_TP)             # espera el TP por ratio
+    pos(2, "CUSDT", st.ENGINE_RATIO_REV, revenge=True)  # venganza: sale por precio
+    pos(3, "DUSDT", st.ENGINE_RATIO)                # salida por ratio apagada en ese bot
+    assert bot._ratio_symbols() == ["AUSDT", "BUSDT"]
+
+
+@pytest.mark.parametrize("value, expected", [
+    (True, True), (False, False), (1, True), (0, False), (None, False),
+    ("true", True), ("false", False), ("0", False), ("off", False), ("", False),
+])
+def test_flag(value, expected):
+    assert st._flag(value) is expected
