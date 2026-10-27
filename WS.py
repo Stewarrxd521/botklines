@@ -170,6 +170,7 @@ class SymbolWebSocketPriceCache:
                 f"todos los símbolos van en una sola conexión (límite Binance: 1024)."
             )
 
+        self.symbol_stream = symbol_stream or _SYMBOL_STREAM
         self.symbols = sorted({s.upper() for s in symbols})
         self._check_limit(self.symbols)
 
@@ -197,7 +198,6 @@ class SymbolWebSocketPriceCache:
         # mark_cache: symbol -> (mark, ts). Siempre se actualiza (sirve de
         # respaldo cuando el bookTicker está callado o no suscrito).
         self.mark_cache:   dict[str, tuple[float, float]] = {}
-        self.symbol_stream = symbol_stream or _SYMBOL_STREAM
         self.rx_bytes = 0            # bytes recibidos por el WebSocket (métrica de tráfico)
         self.book_ticks = 0          # contador de mensajes bookTicker (métrica)
         self.mark_ticks = 0
@@ -230,13 +230,10 @@ class SymbolWebSocketPriceCache:
     # Utilidades internas
     # ──────────────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _check_limit(symbols: list[str]):
-        # 1 stream por símbolo (bookTicker, tiempo real) + 2 globales
-        # (markPrice@arr + ticker@arr). Antes eran 2 streams POR símbolo
-        # (markPrice@1s + ticker), así que este cambio también DUPLICA
-        # cuántos símbolos caben por debajo del límite de Binance.
-        needed = len(symbols) * 2 + int(_ALL_MARKET_ENABLED) + int(_ALL_TICKER_ENABLED)
+    def _check_limit(self, symbols: list[str]):
+        # Streams por símbolo (1, o 2 con bookTicker sin mark global) + los globales activos.
+        needed = (len(symbols) * len(self._streams_for("x"))
+                  + int(_ALL_MARKET_ENABLED) + int(_ALL_TICKER_ENABLED))
         if needed > _BINANCE_MAX_STREAMS:
             raise ValueError(
                 f"Binance permite máximo {_BINANCE_MAX_STREAMS} streams por conexión. "
