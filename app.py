@@ -1056,7 +1056,7 @@ class KlineBot:
         return {"engine": eng.name, "paused": eng.paused}
 
     def close_all(self, eng: Optional[Engine] = None, reason: str = "CERRAR_TODAS") -> Tuple[int, int]:
-        """Cierra todas las posiciones (de un bot o de los dos). (cerradas, total)."""
+        """Cierra todas las posiciones (de un bot o de todos). (cerradas, total)."""
         engines = [eng] if eng is not None else list(self.engines.values())
         with self.lock:
             targets = [p for e in engines for p in e.positions.values()]
@@ -1465,8 +1465,8 @@ class KlineBot:
         return pc.get_price(symbol, max_age_s=PRICE_MAX_AGE_S)
 
     def _check_take_profit(self, symbol: str) -> None:
-        """Revisa la salida (TP, o SL si se abrió invertida) de TODAS las posiciones
-        abiertas del símbolo, de los dos bots."""
+        """Revisa la salida (TP/SL por precio) de TODAS las posiciones abiertas del
+        símbolo, de todos los bots."""
         price = self._price(symbol)
         if not price:
             return
@@ -1521,6 +1521,10 @@ class KlineBot:
                     "time_to_mfe_s": (pos.mfe_ts - pos.opened_ts) if pos.mfe_ts else 0.0,
                     "time_to_mae_s": (pos.mae_ts - pos.opened_ts) if pos.mae_ts else 0.0,
                 }
+                # El executor suma en UNA posición las de todos los bots en el mismo par y
+                # dirección: si queda otra enviada, se cierra solo la cantidad de esta.
+                shared = pos.sent and any(p.sent and p.symbol == symbol and p.direction == pos.direction
+                                          for e in self.engines.values() for p in e.positions.values())
                 eng.total_realized_pnl += pnl
                 eng.closed_trades.insert(0, rec)
                 del eng.closed_trades[500:]
@@ -1533,7 +1537,7 @@ class KlineBot:
             self.log(f"[{eng.label}] CIERRA {pos.direction} {symbol} ({reason}) | entrada {pos.entry_price:g} → "
                      f"{price:g} ({rec['move_pct']:+.2f}%) | PnL neto {pnl:+.4f} USDT (fees {fees:.4f}) | trade #{pos.trade_id}")
             if pos.sent:                        # simulada: el executor nunca la abrió
-                self.executor.send({
+                payload = {
                     "action":      "close",
                     "trade_id":    pos.trade_id,
                     "symbol":      symbol,
@@ -1542,7 +1546,10 @@ class KlineBot:
                     "close_price": price,
                     "pnl":         round(pnl, 6),
                     "strategy":    eng.name,
-                })
+                }
+                if shared:
+                    payload["quantity"] = pos.qty   # cierre parcial; la última cierra todo lo real
+                self.executor.send(payload)
             if pnl < 0 and eng.name == ENGINE_RATIO_REV and not pos.revenge and reason not in REVENGE_SKIP_REASONS:
                 self._open_revenge(eng, pos, price, -pnl, reason)
             return True
@@ -1602,7 +1609,7 @@ class KlineBot:
             changes.append(f"salida por ratio {'activada' if new['ratio_exit'] else 'desactivada'}")
         self.ratio_cfg = new
         if new["tp_pct"] != old["tp_pct"] or new["sl_pct"] != old["sl_pct"]:
-            self._apply_ratio_exits()
+            self._apply_ratio_exits((ENGINE_RATIO,))
         self._save_settings()
         self.store.mark_dirty(True)
         self.log("[config] ratio: " + " | ".join(changes))
@@ -1939,7 +1946,11 @@ class KlineBot:
             return {p.symbol for n in RATIO_ENGINES for p in self.engines[n].positions.values()}
 
     def _ratio_symbols(self) -> List[str]:
-        open_syms = self._ratio_open_syms()
+        """Vigilados + abiertas que esperan el TP por ratio. Las venganzas y los bots con la
+        salida por ratio apagada cierran por precio: no gastan REST."""
+        names = [n for n in RATIO_ENGINES if self._exit_cfg(n)["ratio_exit"]]
+        with self.lock:
+            open_syms = {p.symbol for n in names for p in self.engines[n].positions.values() if not p.revenge}
         return list(dict.fromkeys(list(self.watch) + sorted(open_syms)))
 
     def _rest_get(self, path: str, params: Optional[dict] = None, timeout: float = 15.0):
@@ -2595,6 +2606,13 @@ def _guard():
     return None
 
 
+def _flag(v) -> bool:
+    """Booleano del JSON: también acepta "false", "0", "no" u "off" como texto (curl a mano)."""
+    if isinstance(v, str):
+        return v.strip().lower() not in ("", "0", "false", "no", "off")
+    return bool(v)
+
+
 def _engine_param(data: Optional[dict] = None, default: Optional[str] = ENGINE_CLOSE):
     """Bot pedido en el body (`engine`) o en la URL (?engine=). (Engine | None, error)."""
     name = (data or {}).get("engine") or request.args.get("engine") or default
@@ -2709,16 +2727,16 @@ def api_global_set():
         return busy
     data = request.get_json(silent=True) or {}
     if "klines_enabled" in data:
-        want = bool(data["klines_enabled"])
+        want = _flag(data["klines_enabled"])
         if bot.set_klines(want) != want:
             return jsonify({"ok": False, "error": "No se pudieron abrir las velas (sin lista de símbolos todavía)"}), 409
         if len(data) == 1 or set(data) <= {"klines_enabled", "token"}:
             return jsonify({"ok": True, **bot.global_settings()})
     vals = {}
     if "inverted" in data:
-        vals["inverted"] = bool(data["inverted"])
+        vals["inverted"] = _flag(data["inverted"])
     if "executor_paused" in data:
-        vals["executor_paused"] = bool(data["executor_paused"])
+        vals["executor_paused"] = _flag(data["executor_paused"])
     if data.get("max_open") not in (None, ""):
         try:
             v = int(float(data["max_open"]))
@@ -2777,7 +2795,7 @@ def api_ratio_set():
             return jsonify({"ok": False, "error": f"{key} debe estar entre 0 y {hi:g}"}), 400
         vals[key] = v
     if "ratio_exit" in data:
-        vals["ratio_exit"] = bool(data["ratio_exit"])
+        vals["ratio_exit"] = _flag(data["ratio_exit"])
     if not vals:
         return jsonify({"ok": False, "error": "Nada que cambiar"}), 400
     try:
@@ -2800,7 +2818,7 @@ def _rev_set(data: dict):
             return jsonify({"ok": False, "error": f"{key} inválido"}), 400
     for key in ("ratio_exit", "revenge"):
         if key in data:
-            vals[key] = bool(data[key])
+            vals[key] = _flag(data[key])
     if data.get("rev_dir"):
         vals["rev_dir"] = str(data["rev_dir"])
     if not vals:
@@ -2824,7 +2842,8 @@ def api_session_reset():
 
 @app.post("/api/pause")
 def api_pause():
-    """Pausa o reanuda un bot. Body JSON: {"engine": "close"|"live", "paused": true|false}."""
+    """Pausa o reanuda un bot. Body JSON: {"engine": "ratio"|"ratio_tp"|"ratio_rev"|"close"|"live",
+    "paused": true|false}."""
     busy = _guard()
     if busy:
         return busy
@@ -2833,8 +2852,8 @@ def api_pause():
     if err:
         return err
     if eng is None:
-        return jsonify({"ok": False, "error": "Falta engine (close o live)"}), 400
-    return jsonify({"ok": True, **bot.set_paused(eng, bool(data.get("paused")))})
+        return jsonify({"ok": False, "error": f"Falta engine ({' o '.join(bot.engines)})"}), 400
+    return jsonify({"ok": True, **bot.set_paused(eng, _flag(data.get("paused")))})
 
 
 @app.post("/api/close-all")
@@ -2863,7 +2882,7 @@ def api_close_all():
 @app.post("/api/block")
 def api_block():
     """Bloquea/desbloquea entradas por dirección en un bot. Body JSON:
-    {"engine": "close"|"live", "direction": "LONG"|"SHORT", "blocked": true|false}."""
+    {"engine": "ratio"|"ratio_tp"|"ratio_rev"|"close"|"live", "direction": "LONG"|"SHORT", "blocked": true|false}."""
     busy = _guard()
     if busy:
         return busy
@@ -2874,7 +2893,7 @@ def api_block():
     direction = str(data.get("direction", "")).upper()
     if direction not in (LONG, SHORT):
         return jsonify({"ok": False, "error": "direction debe ser LONG o SHORT"}), 400
-    return jsonify({"ok": True, **bot.set_block(eng, direction, bool(data.get("blocked")))})
+    return jsonify({"ok": True, **bot.set_block(eng, direction, _flag(data.get("blocked")))})
 
 
 @app.post("/api/close/<symbol>")
@@ -3717,7 +3736,7 @@ function render(d) {
   if (view === 'operaciones') q('tSig').innerHTML = e.signals.map(s => `<tr><td>${esc(s.time)}</td><td>${esc(s.symbol)}</td><td>${tag(s.direction)}</td>
     <td>${esc(s.candle)} <span class="muted">${num(s.open, 8)}→${num(s.close, 8)}</span></td><td>${pct(s.body_pct)}</td>
     <td class="muted">${isRatio ? '' : Math.round(s.candle_age_s || 0) + 's'}</td>
-    <td class="${s.action.startsWith('abierta') ? 'pos' : 'muted'}">${esc(s.action)}</td></tr>`).join('')
+    <td class="${/^(venganza )?abierta/.test(s.action) ? 'pos' : 'muted'}">${esc(s.action)}</td></tr>`).join('')
     || `<tr><td colspan="7" class="muted">${isRatio ? 'Esperando una caída (SHORT) o subida (LONG) del ratio dentro del rango' : (k.running ? 'Esperando velas con cuerpo ≥ ±' + ec.threshold_pct + '%' : 'Las velas están apagadas (Bots → Encender velas)')}</td></tr>`;
 
   // ── Bots ──
@@ -3826,7 +3845,7 @@ function render(d) {
   q('hiSum').innerHTML = `${esc(e.label)} · ${e.closed_count} cerradas · ${e.wins} ganadas · realizado ${usd(e.realized_pnl)}`;
   q('nClosed').textContent = e.closed_count;
   if (view === 'historial') {
-    q('tClosed').innerHTML = e.closed_trades.map(t => `<tr><td>${esc(t.closed)}</td><td>${esc(t.symbol)}</td><td>${tag(t.direction)}</td>
+    q('tClosed').innerHTML = e.closed_trades.map(t => `<tr><td>${esc(t.closed)}</td><td>${esc(t.symbol)}</td><td>${tag(t.direction)}${t.revenge ? ' <span class="tag REV">VENGANZA</span>' : ''}</td>
       <td>${num(t.entry_price, 8)}</td><td>${num(t.close_price, 8)}</td><td>${pct(t.move_pct)}</td><td>${usd(t.pnl)}</td>
       <td class="muted">${num(t.fees || 0, 4)}</td><td>${pct(t.mfe_pct || 0)}</td><td>${pct(t.mae_pct || 0)}</td>
       <td>${dur(t.duration_s || 0)}</td><td>${esc(t.reason)}${t.sent === false ? ' <span class="st off">SIMULADA</span>' : ''}</td></tr>`).join('')

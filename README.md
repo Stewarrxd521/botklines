@@ -174,7 +174,9 @@ Cada apertura y cierre se manda con `POST <EXECUTOR_URL>/signal` y la cabecera `
  "reason": "TP", "close_price": 1.0609, "pnl": 0.1045, "strategy": "live"}
 ```
 
-`direction` puede ser `LONG` o `SHORT`, `level` lleva el % del cuerpo de la vela que disparó la señal y `strategy` dice qué bot la mandó (`close` o `live`). Los `trade_id` son únicos entre los dos bots, así que el executor puede tener a la vez una posición de cada bot en el mismo par.
+`direction` puede ser `LONG` o `SHORT`, `level` lleva el % del cuerpo de la vela (o del cambio del ratio) que disparó la señal y `strategy` dice qué bot la mandó (`ratio`, `ratio_tp`, `ratio_rev`, `close` o `live`). Los `trade_id` son únicos entre todos los bots.
+
+El executor suma en **una** posición de Binance las de todos los bots en el mismo par y dirección (los tres bots de ratio abren con la misma señal). Por eso, mientras otro bot siga con ese par y dirección abierto, el `close` lleva `"quantity"` con la cantidad de esa operación y el executor cierra solo esa parte; el último en cerrar manda el cierre sin `quantity` y cierra todo lo que quede. La venganza en dirección contraria y los bots con posiciones opuestas en el mismo par necesitan la cuenta en **modo cobertura (Hedge Mode)**: en modo unidireccional Binance las netea.
 
 ### Latencia
 
