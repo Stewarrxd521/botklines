@@ -680,6 +680,7 @@ class KlineBot:
         self.started_at = time.time()
 
         self._pos_syms: frozenset = frozenset()     # copia para el hilo del WS (sin lock)
+        self._price_hold: set = set()               # símbolos con precio pedido antes de una entrada
         self._pending: set = set()                  # símbolos con tick de precio pendiente
         self._pending_lock = threading.Lock()
         self._wake_scheduled = False
@@ -707,7 +708,7 @@ class KlineBot:
                                  LIVE_SIGNAL_THRESHOLD_PCT, LIVE_TAKE_PROFIT_PCT),
         }
         self.live = self.engines[ENGINE_LIVE]
-        # Bot de ratio: LONG bloqueado por defecto (se activa desde la web).
+        # Bot de ratio: SHORT y LONG activos por defecto (RATIO_LONG_DEFAULT=false bloquea el LONG).
         self.engines[ENGINE_RATIO] = Engine(ENGINE_RATIO, saved.get(ENGINE_RATIO) or {"block_long": not RATIO_LONG_DEFAULT},
                                             1.0, 1.0)
         rs = settings.get("ratio") if isinstance(settings.get("ratio"), dict) else {}
@@ -812,9 +813,10 @@ class KlineBot:
             syms = frozenset(p.symbol for e in self.engines.values() for p in e.positions.values())
             changed = syms != self._pos_syms
             self._pos_syms = syms
+            wanted = syms | self._price_hold
         pc = self.price_cache
         if (changed or force) and pc is not None:
-            pc.update_symbols(sorted(syms))
+            pc.update_symbols(sorted(wanted))
 
     def _find(self, trade_id: int) -> Tuple[Optional[Engine], Optional[Position]]:
         with self.lock:
@@ -1244,7 +1246,7 @@ class KlineBot:
             return
         arrived, t0 = time.time(), time.perf_counter()
         inv = self.inverted
-        for eng in self.engines.values():
+        for eng in (self.engines[ENGINE_CLOSE], self.live):     # el de ratio no opera por velas
             direction = entry_direction(candle.open, candle.close, eng.threshold_pct, inv)
             if direction is None:
                 continue
@@ -1311,7 +1313,7 @@ class KlineBot:
                        arrived: float, t0: float = 0.0, inverted: bool = False) -> None:
         """Corre en el loop del bot. Decide si `eng` abre y lanza la apertura.
         `direction` ya viene invertida si `inverted` (modo con el que se decidió)."""
-        if eng._last_candle.get(symbol, -1) >= candle.open_time:
+        if eng.name == ENGINE_RATIO or eng._last_candle.get(symbol, -1) >= candle.open_time:
             return                                          # duplicado tras reconexión
         eng._last_candle[symbol] = candle.open_time
         eng.signal_count += 1
@@ -1890,12 +1892,19 @@ class KlineBot:
                     self.ratio_last_error = f"{sym}: {exc}"
                     return
             self.ratio_polls += 1
+            hold = self._entry_candidate(sym, pts)
             try:
-                if self._entry_candidate(sym, pts):
+                if hold:
+                    with self.lock:
+                        self._price_hold.add(sym)
                     await self._prefetch_price(sym)
                 fresh[sym] = self._on_ratio_points(sym, pts)
             except Exception as exc:
                 self.ratio_last_error = f"{sym}: {exc!r}"
+            finally:
+                if hold:
+                    with self.lock:
+                        self._price_hold.discard(sym)
 
         await asyncio.gather(*(one(s) for s in symbols))
         self._refresh_pos_syms(force=True)                  # da de baja los precios pedidos sin entrada
@@ -3017,6 +3026,7 @@ HTML = r"""<!doctype html>
           <button type="button" class="ghost" data-act="reset">Poner a cero el PnL de la sesión</button>
           <button type="button" class="danger" data-act="closeAll">Cerrar TODAS las posiciones</button>
         </div>
+        <div id="actMsg" class="muted msg"></div>
         <div class="note" id="modeHint"></div>
         <div class="note" id="sessHits"></div>
       </div>
@@ -3572,13 +3582,12 @@ function render(d) {
 }
 
 // ── Acciones ──
-async function glb(body, url = '/api/global', box = 'glbMsg') {
+const glbText = r => `objetivo ${r.profit_target_usd > 0 ? '+' + r.profit_target_usd + ' USD' : 'apagado'} · límite ${r.max_open > 0 ? r.max_open + ' abiertas' : 'sin límite'} · fee ${r.fee_pct}% por lado`;
+async function glb(body, url = '/api/global', box = 'glbMsg', okMsg = glbText) {
   q(box).textContent = 'Guardando…';
   try {
     const r = await post(url, body);
-    q(box).innerHTML = r.ok
-      ? `<span class="pos">Guardado.</span> objetivo ${r.profit_target_usd > 0 ? '+' + r.profit_target_usd + ' USD' : 'apagado'} · límite ${r.max_open > 0 ? r.max_open + ' abiertas' : 'sin límite'} · fee ${r.fee_pct}% por lado`
-      : `<span class="neg">${esc(r.error)}</span>`;
+    q(box).innerHTML = r.ok ? `<span class="pos">Guardado.</span> ${okMsg(r)}` : `<span class="neg">${esc(r.error)}</span>`;
     if (!r.ok && box !== 'glbMsg') alert(r.error);
     return r.ok;
   } catch (e) { q(box).innerHTML = `<span class="neg">${esc(e)}</span>`; }
@@ -3605,20 +3614,23 @@ const ACTIONS = {
   invert(b) {
     const inv = !b.dataset.on;
     if (confirm(inv ? '¿Invertir los bots de velas? Las entradas nuevas irán CONTRA la vela y el % será stop loss, sin TP. Las posiciones abiertas siguen con su TP.'
-                    : '¿Volver al modo normal? Las entradas nuevas seguirán la vela con TP. Las abiertas invertidas siguen con su SL.')) glb({inverted: inv});
+                    : '¿Volver al modo normal? Las entradas nuevas seguirán la vela con TP. Las abiertas invertidas siguen con su SL.'))
+      glb({inverted: inv}, '/api/global', b.id === 'btnInvert2' ? 'cfgMsg' : 'actMsg', r => r.inverted ? 'Modo INVERTIDO en los bots de velas.' : 'Modo normal en los bots de velas.');
   },
   exPause(b) {
     const p = !b.dataset.on;
     if (confirm(p ? '¿Pausar las entradas al executor? Los bots siguen operando en simulación (posiciones SIMULADAS) pero no se manda ninguna apertura. Los cierres de lo ya enviado sí se mandan.'
-                  : '¿Reanudar los envíos al executor? Las entradas nuevas volverán a abrirse de verdad.')) glb({executor_paused: p});
+                  : '¿Reanudar los envíos al executor? Las entradas nuevas volverán a abrirse de verdad.'))
+      glb({executor_paused: p}, '/api/global', 'actMsg', r => r.executor_paused ? 'Envíos al executor pausados: las entradas nuevas solo se simulan.' : 'Envíos al executor reanudados.');
   },
-  reset() { if (confirm('¿Poner a cero el PnL de la sesión? El objetivo se contará desde ahora.')) glb({}, '/api/session/reset'); },
+  reset() { if (confirm('¿Poner a cero el PnL de la sesión? El objetivo se contará desde ahora.')) glb({}, '/api/session/reset', 'actMsg', () => 'PnL de la sesión a cero.'); },
   closeAll() { closeAll(null); },
   closeEng() { closeAll(opFilter === 'all' ? null : opFilter); },
   klines(b) {
     const on = !b.dataset.on;
     if (confirm(on ? '¿Encender las velas 1m? Los bots al cierre y en vivo vuelven a recibir señales. Es el stream con más tráfico (~0,5 MB/s).'
-                   : '¿Apagar las velas? Los bots al cierre y en vivo dejan de abrir; sus posiciones abiertas siguen con su TP/SL.')) glb({klines_enabled: on}, '/api/global', 'cfgMsg');
+                   : '¿Apagar las velas? Los bots al cierre y en vivo dejan de abrir; sus posiciones abiertas siguen con su TP/SL.'))
+      glb({klines_enabled: on}, '/api/global', 'cfgMsg', r => r.klines_enabled ? 'Velas encendidas.' : 'Velas apagadas.');
   },
   ratioExit(b) { ratioPost({ratio_exit: !b.dataset.on}, r => `TP por ratio ${r.ratio_exit ? 'activado' : 'desactivado'}`); },
 };
