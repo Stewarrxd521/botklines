@@ -53,7 +53,9 @@ services:
 
       # ── Ancho de banda ──────────────────────────────────────────────────────
       - key: TICKER_MODE
-        value: "rest"         # 24 h con 1 petición gzip cada 5 min (ws = WebSocket continuo, ~80 KB/s)
+        value: "scan"         # 24 h por WebSocket: exploración de TICKER_SCAN_S cada 5 min (ws = abierto siempre)
+      - key: TICKER_SCAN_S
+        value: "30"
       - key: STATUS_POLL_MS
         value: "3000"         # cada cuánto consulta el panel (solo con la pestaña visible)
 

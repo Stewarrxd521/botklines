@@ -33,8 +33,9 @@ Los dos bots
 
 Bot de ratio de top traders (tercer bot, "ratio")
   • Vigila SOLO los perpetuos con variación 24 h ≥ +RATIO_WATCH_MIN_PCT (20 %). El 24 h se
-    lee con UNA petición REST comprimida cada 5 min (TICKER_MODE=rest, por defecto) en vez
-    de un WebSocket de todo el mercado abierto todo el día.
+    lee por WebSocket (!miniTicker@arr) con una exploración de TICKER_SCAN_S (30 s) de todo
+    el mercado en cada ciclo de 5 min, en vez de tener el stream abierto todo el día. Esa
+    misma exploración descubre los símbolos: la lista se rehace a diario y se guarda en disco.
   • Cada 5 min consulta el Top Trader Long/Short Ratio (Accounts) de esa lista. (Binance
     NO ofrece este dato por WebSocket: es REST, 1 petición por símbolo vigilado cada 5 min,
     por el proxy, con freno automático ante HTTP 429/418.)
@@ -81,6 +82,7 @@ from urllib.parse import urlencode, urlsplit
 from collections import deque
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
+from math import ceil
 from typing import Deque, Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, make_response, request
@@ -92,7 +94,6 @@ if _HERE not in sys.path:
 from WS import SymbolWebSocketPriceCache                       # noqa: E402
 from kline_ws import Candle, KlineWebSocketStream              # noqa: E402
 from state_store import StateStore, make_owner_id                    # noqa: E402
-import strategy                                               # noqa: E402
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -160,10 +161,12 @@ RATIO_CONCURRENCY   = max(1, int(os.getenv("RATIO_CONCURRENCY", "4")))
 RATIO_TP_PCT        = float(os.getenv("RATIO_TP_PCT", "10"))           # take profit: +10 % a favor
 RATIO_SL_PCT        = abs(float(os.getenv("RATIO_SL_PCT", "5")))       # stop loss: -5 % en contra
 RATIO_EXIT_BY_RATIO = os.getenv("RATIO_EXIT_BY_RATIO", "true").lower() in ("1", "true", "yes")
-# Fuente del 24 h: "rest" = 1 petición gzip por ciclo de 5 min (~50 KB);
-# "ws" = WebSocket !miniTicker@arr abierto siempre (~80 KB/s, decenas de GB al mes).
-TICKER_MODE         = os.getenv("TICKER_MODE", "rest").strip().lower()
-TICKER_SNAPSHOT_S   = float(os.getenv("TICKER_SNAPSHOT_S", "4"))      # respaldo por WS si falla el REST
+# Fuente del 24 h, siempre por WebSocket: "scan" = exploración de TICKER_SCAN_S por ciclo de
+# 5 min (~10 % del tiempo conectado); "ws" = !miniTicker@arr abierto siempre (~80 KB/s).
+TICKER_MODE         = os.getenv("TICKER_MODE", "scan").strip().lower()
+TICKER_SCAN_S       = float(os.getenv("TICKER_SCAN_S", "30"))         # duración de cada exploración
+SYMBOL_SCAN_HOURS   = float(os.getenv("SYMBOL_SCAN_HOURS", "24"))     # la lista de símbolos se rehace a diario
+KNOWN_SYMBOLS_FILE  = os.getenv("KNOWN_SYMBOLS_FILE", os.path.join(_HERE, "known_symbols.json"))
 
 # ── Velas ─────────────────────────────────────────────────────────────────────
 KLINE_INTERVAL = "1m"
@@ -194,7 +197,6 @@ STATUS_POLL_MS = int(os.getenv("STATUS_POLL_MS", "3000"))
 # Stream de precio por símbolo con posición: el bot de ratio sale a ±5-10 %, le basta
 # markPrice@1s (1 msg/s). Los bots de velas usan bookTicker (tiempo real, mucho más tráfico).
 PRICE_STREAM = os.getenv("WS_SYMBOL_STREAM", "").strip() or ("bookTicker" if KLINE_BOTS_ENABLED else "markPrice@1s")
-WEB_DIR = os.path.join(_HERE, "web")
 
 
 def http_get_json(url: str, proxy: str = "", timeout: float = 15.0) -> Tuple[object, int]:
@@ -216,6 +218,150 @@ def _utc(ts: float, pattern: str = "%Y-%m-%d %H:%M:%S") -> str:
         return datetime.fromtimestamp(float(ts), timezone.utc).strftime(pattern)
     except (TypeError, ValueError, OverflowError, OSError):
         return ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ESTRATEGIA (reglas puras, sin red ni estado: se prueban en tests/test_strategy.py)
+#   Señal   cuerpo de la vela 1m = (cierre - apertura) / apertura: ≥ +umbral → LONG,
+#           ≤ -umbral → SHORT. Modo invertido: al revés y el % pasa a ser stop loss.
+#   Salida  TP en % a favor (bots de velas); TP y SL fijos en % (bot de ratio).
+#   Fees    el PnL neto resta la comisión de entrada y la de salida.
+#   Tamaño  notional fijo, cantidad redondeada HACIA ARRIBA al stepSize.
+# ─────────────────────────────────────────────────────────────────────────────
+
+LONG = "LONG"
+SHORT = "SHORT"
+
+
+def body_change_pct(open_: float, close: float) -> float:
+    """% de cambio del cuerpo de una vela (cierre contra apertura)."""
+    if open_ <= 0:
+        return 0.0
+    return (close - open_) / open_ * 100.0
+
+
+def signal_direction(open_: float, close: float, threshold_pct: float) -> Optional[str]:
+    """LONG si la vela subió ≥ threshold_pct, SHORT si bajó ≥ threshold_pct, si no None."""
+    body = body_change_pct(open_, close)
+    if body >= threshold_pct:
+        return LONG
+    if body <= -threshold_pct:
+        return SHORT
+    return None
+
+
+def entry_direction(open_: float, close: float, threshold_pct: float,
+                    inverted: bool = False) -> Optional[str]:
+    """Dirección de la entrada: la de la vela, o la contraria en modo invertido."""
+    d = signal_direction(open_, close, threshold_pct)
+    if d is None or not inverted:
+        return d
+    return SHORT if d == LONG else LONG
+
+
+def favorable_move_pct(price: float, entry: float, direction: str) -> float:
+    """Cuánto se movió el precio a favor de la posición, en % de la entrada."""
+    if entry <= 0 or price <= 0:
+        return 0.0
+    move = (price - entry) / entry * 100.0
+    return move if direction == LONG else -move
+
+
+def take_profit_price(entry: float, direction: str, tp_pct: float) -> float:
+    factor = 1.0 + tp_pct / 100.0 if direction == LONG else 1.0 - tp_pct / 100.0
+    return entry * factor
+
+
+def stop_loss_price(entry: float, direction: str, sl_pct: float) -> float:
+    factor = 1.0 - sl_pct / 100.0 if direction == LONG else 1.0 + sl_pct / 100.0
+    return entry * factor
+
+
+def exit_price(entry: float, direction: str, pct: float, inverted: bool = False) -> float:
+    """Precio de salida: TP en modo normal, SL en modo invertido."""
+    return stop_loss_price(entry, direction, pct) if inverted else take_profit_price(entry, direction, pct)
+
+
+def exit_hit(price: float, target: float, direction: str, inverted: bool = False) -> bool:
+    """¿El precio tocó la salida? TP (a favor) en normal, SL (en contra) en invertido."""
+    if price <= 0 or target <= 0:
+        return False
+    up = price >= target
+    down = price <= target
+    if inverted:
+        return down if direction == LONG else up
+    return up if direction == LONG else down
+
+
+def tp_sl_prices(entry: float, direction: str, tp_pct: float, sl_pct: float) -> Tuple[float, float]:
+    """(precio de TP, precio de SL) con TP/SL fijos en % de la entrada. 0 % = apagado (precio 0)."""
+    tp = take_profit_price(entry, direction, tp_pct) if tp_pct > 0 and entry > 0 else 0.0
+    sl = stop_loss_price(entry, direction, sl_pct) if 0 < sl_pct < 100 and entry > 0 else 0.0
+    return tp, sl
+
+
+def price_exit(price: float, direction: str, tp_price: float, sl_price: float) -> Optional[str]:
+    """"TP", "SL" o None según el precio haya tocado el take profit o el stop loss."""
+    if exit_hit(price, sl_price, direction, inverted=True):
+        return "SL"
+    if exit_hit(price, tp_price, direction):
+        return "TP"
+    return None
+
+
+def take_profit_hit(price: float, entry: float, direction: str, tp_pct: float) -> bool:
+    if price <= 0 or entry <= 0:
+        return False
+    target = take_profit_price(entry, direction, tp_pct)
+    return price >= target if direction == LONG else price <= target
+
+
+def pnl_usd(price: float, entry: float, qty: float, direction: str) -> float:
+    if price <= 0:
+        return 0.0
+    diff = price - entry
+    return diff * qty if direction == LONG else -diff * qty
+
+
+def fees_usd(entry: float, price: float, qty: float, fee_pct: float) -> float:
+    """Comisión de entrada + salida (fee_pct % de cada notional)."""
+    return (entry * qty + max(price, 0.0) * qty) * fee_pct / 100.0
+
+
+def net_pnl_usd(price: float, entry: float, qty: float, direction: str, fee_pct: float) -> float:
+    """PnL descontando la comisión de entrada y la de salida."""
+    if price <= 0:
+        return 0.0
+    return pnl_usd(price, entry, qty, direction) - fees_usd(entry, price, qty, fee_pct)
+
+
+def _decimals(step: float) -> int:
+    text = f"{step:.12f}".rstrip("0")
+    return len(text.split(".")[1]) if "." in text else 0
+
+
+def size_order(notional: float, price: float, step: float = 0.001, min_qty: float = 0.0,
+               min_notional: float = 5.0, max_over: float = 1.5) -> Tuple[float, float, str]:
+    """(qty, notional_efectivo, "") o (0, 0, motivo) si el par no admite ese tamaño.
+
+    La cantidad se redondea HACIA ARRIBA al stepSize: 5 USDT nunca queda en
+    4,99 (Binance la rechazaría). Si el mínimo del par es mayor que el
+    notional pedido, o el redondeo lo infla por encima de notional × max_over
+    (pares caros con stepSize grueso), se descarta."""
+    if price <= 0:
+        return 0.0, 0.0, "sin precio"
+    if min_notional > notional + 1e-9:
+        return 0.0, 0.0, f"mínimo del par {min_notional:g} USDT > {notional:g} USDT"
+    step = step if step > 0 else 0.001
+    decs = _decimals(step)
+    steps = ceil(notional / price / step - 1e-9)
+    qty = round(max(steps * step, min_qty), decs)
+    if qty * price < min_notional - 1e-9:
+        qty = round(qty + step, decs)
+    eff = qty * price
+    if eff > notional * max_over:
+        return 0.0, 0.0, f"stepSize {step:g} obliga a {eff:.2f} USDT (> {notional * max_over:g})"
+    return qty, eff, ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -421,14 +567,14 @@ class Position:
     def update(self, price: float) -> float:
         """Actualiza precio y excursiones. Llamar con el lock del bot tomado."""
         self.last_price = price
-        move = strategy.favorable_move_pct(price, self.entry_price, self.direction)
+        move = favorable_move_pct(price, self.entry_price, self.direction)
         now = time.time()
         if move > self.mfe_pct:
             self.mfe_pct, self.mfe_ts = move, now
-            self.mfe_usd = strategy.pnl_usd(price, self.entry_price, self.qty, self.direction)
+            self.mfe_usd = pnl_usd(price, self.entry_price, self.qty, self.direction)
         if move < self.mae_pct:
             self.mae_pct, self.mae_ts = move, now
-            self.mae_usd = strategy.pnl_usd(price, self.entry_price, self.qty, self.direction)
+            self.mae_usd = pnl_usd(price, self.entry_price, self.qty, self.direction)
         if price > self.high_price:
             self.high_price = price
         if self.low_price <= 0 or price < self.low_price:
@@ -459,8 +605,8 @@ class Engine:
         self.label = ENGINE_LABELS[name]
         self.threshold_pct = float(cfg.get("threshold_pct") or threshold_default)
         self.tp_pct = float(cfg.get("tp_pct") or tp_default)
-        self.blocked = {strategy.LONG: bool(cfg.get("block_long")),
-                        strategy.SHORT: bool(cfg.get("block_short"))}
+        self.blocked = {LONG: bool(cfg.get("block_long")),
+                        SHORT: bool(cfg.get("block_short"))}
         # Pausado: no abre entradas nuevas; sus posiciones abiertas siguen su curso.
         self.paused = bool(cfg.get("paused"))
         # trade_id → posición. Puede haber varias por símbolo y en ambas direcciones.
@@ -476,7 +622,7 @@ class Engine:
 
     def settings(self) -> dict:
         return {"threshold_pct": self.threshold_pct, "tp_pct": self.tp_pct,
-                "block_long": self.blocked[strategy.LONG], "block_short": self.blocked[strategy.SHORT],
+                "block_long": self.blocked[LONG], "block_short": self.blocked[SHORT],
                 "paused": self.paused}
 
 
@@ -593,6 +739,10 @@ class KlineBot:
         self._rest_block_until = 0.0
         self._rest_route = 0
         self._rest_times: Deque[float] = deque()      # peticiones de los últimos 5 min
+        self._scan_seen: Optional[set] = None         # símbolos vistos en la exploración en curso
+        self._filters_stale = False                   # un símbolo nuevo no tiene filtros todavía
+        self._filters_ts = 0.0
+        self._load_known_symbols()
         # Tráfico de entrada propio (bytes): REST a Binance y snapshots/stream del 24 h.
         self.rx_rest_bytes = 0
         self.rx_ticker_bytes = 0
@@ -646,7 +796,7 @@ class KlineBot:
             self.trade_id_seq = max(self.trade_id_seq + 1, int(time.time()))
             return self.trade_id_seq
 
-    def _refresh_pos_syms(self) -> None:
+    def _refresh_pos_syms(self, force: bool = False) -> None:
         """Actualiza los símbolos con posición y alinea con ellos las suscripciones
         de precio en vivo (se dan de baja al cerrar: nada de streams olvidados)."""
         with self.lock:
@@ -654,7 +804,7 @@ class KlineBot:
             changed = syms != self._pos_syms
             self._pos_syms = syms
         pc = self.price_cache
-        if changed and pc is not None:
+        if (changed or force) and pc is not None:
             pc.update_symbols(sorted(syms))
 
     def _find(self, trade_id: int) -> Tuple[Optional[Engine], Optional[Position]]:
@@ -705,7 +855,7 @@ class KlineBot:
             eng.tp_pct = tp_pct
             with self.lock:
                 for p in eng.positions.values():
-                    p.tp_price = strategy.exit_price(p.entry_price, p.direction, tp_pct, p.inverted)
+                    p.tp_price = exit_price(p.entry_price, p.direction, tp_pct, p.inverted)
                 syms = {p.symbol for p in eng.positions.values()}
             for sym in syms:
                 self._on_price_event(sym, "config")      # revisa ya el TP nuevo
@@ -758,7 +908,7 @@ class KlineBot:
             return sum(e.total_realized_pnl for e in self.engines.values())
 
     def _net_pnl(self, p: Position, price: float) -> float:
-        return strategy.net_pnl_usd(price, p.entry_price, p.qty, p.direction, self.fee_pct)
+        return net_pnl_usd(price, p.entry_price, p.qty, p.direction, self.fee_pct)
 
     def session_pnl(self) -> Tuple[float, float]:
         """(realizado, abierto) desde el último objetivo o reinicio, netos de fees."""
@@ -829,8 +979,8 @@ class KlineBot:
             eng.blocked[direction] = blocked
             self._save_settings()
             self.log(f"[config] {eng.label} · {direction}: {'BLOQUEADOS' if blocked else 'permitidos'}")
-        return {"engine": eng.name, "block_long": eng.blocked[strategy.LONG],
-                "block_short": eng.blocked[strategy.SHORT]}
+        return {"engine": eng.name, "block_long": eng.blocked[LONG],
+                "block_short": eng.blocked[SHORT]}
 
     def set_executor(self, url: str, secret: Optional[str] = None) -> ExecutorTarget:
         """Cambia el destino de las señales en caliente (sin reiniciar)."""
@@ -876,10 +1026,10 @@ class KlineBot:
         rc = self.ratio_cfg
         self.log(f"Bot ratio top traders | vigila 24 h ≥ {rc['watch_min_pct']:g}% | caída del ratio "
                  f"{rc['drop_min_pct']:g}–{rc['drop_max_pct']:g}% | LONG "
-                 f"{'bloqueado' if self.engines[ENGINE_RATIO].blocked[strategy.LONG] else 'activo'} | "
+                 f"{'bloqueado' if self.engines[ENGINE_RATIO].blocked[LONG] else 'activo'} | "
                  f"{NOTIONAL_USDT:g} USDT | TP +{rc['tp_pct']:g}% · SL -{rc['sl_pct']:g}% por precio"
                  f"{' · TP por ratio (recupera el % que cayó)' if rc['ratio_exit'] else ''}")
-        self.log(f"Red: 24 h por {'REST cada 5 min' if TICKER_MODE != 'ws' else 'WebSocket continuo'} · "
+        self.log(f"Red: 24 h por {f'WebSocket, exploración de {TICKER_SCAN_S:g} s cada 5 min' if TICKER_MODE != 'ws' else 'WebSocket continuo'} · "
                  f"precio en vivo solo de símbolos con posición ({PRICE_STREAM})")
         self.log(f"[estado] Persistencia: {self._store_desc}")
         self.store.start()
@@ -968,7 +1118,11 @@ class KlineBot:
             out[s["symbol"]] = row
         return out
 
-    async def _init_symbols(self) -> None:
+    async def _init_symbols(self, force: bool = False) -> None:
+        """Filtros de cantidad (stepSize, mínimos) de exchangeInfo, cacheados en disco
+        SYMBOL_REFRESH_HOURS. Es la única petición REST aparte de la del ratio."""
+        self._filters_ts = time.time()
+        self._filters_stale = False
         cached = None
         try:
             with open(SYMBOLS_CACHE_FILE, "r", encoding="utf-8") as fh:
@@ -976,7 +1130,7 @@ class KlineBot:
         except Exception:
             pass
         age_h = (time.time() - float(cached.get("saved_at", 0))) / 3600 if cached else None
-        if cached and cached.get("filters") and age_h is not None and age_h < SYMBOL_REFRESH_HOURS:
+        if not force and cached and cached.get("filters") and age_h is not None and age_h < SYMBOL_REFRESH_HOURS:
             self.filters = dict(cached["filters"])
             self.log(f"Símbolos desde caché en disco: {len(self.filters)} (hace {age_h:.1f} h)")
         else:
@@ -992,13 +1146,16 @@ class KlineBot:
                 if cached and cached.get("filters"):
                     self.filters = dict(cached["filters"])
                     self.log(f"Usando caché viejo de símbolos ({len(self.filters)})")
+                elif self.known_symbols:
+                    self.log(f"Sin filtros de cantidad: uso los {len(self.known_symbols)} símbolos "
+                             "descubiertos por WebSocket (las entradas esperan a tener filtros)")
                 elif INITIAL_SYMBOLS:
                     self.filters = {s: {"stepSize": 0.001, "minQty": 0.0, "minNotional": 5.0}
                                     for s in INITIAL_SYMBOLS}
                     self.log(f"Usando INITIAL_SYMBOLS ({len(self.filters)}) sin filtros reales")
                 else:
                     self.log("⚠️ Sin lista de símbolos: el bot no puede suscribir velas")
-        self.symbols = sorted(self.filters)
+        self.symbols = sorted(self.filters) or sorted(self.known_symbols)
         self.log(f"{len(self.symbols)} perpetuos {QUOTE_ASSET} operables")
 
     # ── Entradas (hilo del WS de velas: solo filtrar y pasar al loop) ─────────
@@ -1018,7 +1175,7 @@ class KlineBot:
         loop = self.loop
         if loop is not None:
             inv = self.inverted
-            direction = strategy.LONG if (body >= thr) != inv else strategy.SHORT
+            direction = LONG if (body >= thr) != inv else SHORT
             loop.call_soon_threadsafe(self._handle_signal, self.live, symbol, direction, candle,
                                       time.time(), time.perf_counter(), inv)
 
@@ -1032,7 +1189,7 @@ class KlineBot:
         arrived, t0 = time.time(), time.perf_counter()
         inv = self.inverted
         for eng in self.engines.values():
-            direction = strategy.entry_direction(candle.open, candle.close, eng.threshold_pct, inv)
+            direction = entry_direction(candle.open, candle.close, eng.threshold_pct, inv)
             if direction is None:
                 continue
             if eng is self.live:
@@ -1042,7 +1199,7 @@ class KlineBot:
             loop.call_soon_threadsafe(self._handle_signal, eng, symbol, direction, candle, arrived, t0, inv)
 
     def _record_eval(self, symbol: str, candle: Candle) -> None:
-        body = strategy.body_change_pct(candle.open, candle.close)
+        body = body_change_pct(candle.open, candle.close)
         with self._evals_lock:
             self.eval_count += 1
             rows = self._evals.get(candle.open_time)
@@ -1073,7 +1230,7 @@ class KlineBot:
             t, rows = buckets[0]
             for body, sym, o, c in sorted(rows, key=lambda r: abs(r[0]), reverse=True)[:EVAL_TOP_N]:
                 top.append({"symbol": sym, "body_pct": body, "open": o, "close": c,
-                            "signal": strategy.signal_direction(o, c, thr) or ""})
+                            "signal": signal_direction(o, c, thr) or ""})
         return {"total": self.eval_count, "minutes": minutes, "top": top,
                 "top_minute": minutes[0]["minute"] if minutes else ""}
 
@@ -1086,7 +1243,7 @@ class KlineBot:
                 "time":      _utc(now, "%H:%M:%S"),
                 "symbol":    symbol,
                 "direction": direction,
-                "body_pct":  strategy.body_change_pct(candle.open, candle.close),
+                "body_pct":  body_change_pct(candle.open, candle.close),
                 "open":      candle.open,
                 "close":     candle.close,
                 "candle":    _utc(candle.open_time / 1000, "%H:%M"),
@@ -1102,7 +1259,7 @@ class KlineBot:
             return                                          # duplicado tras reconexión
         eng._last_candle[symbol] = candle.open_time
         eng.signal_count += 1
-        body = strategy.body_change_pct(candle.open, candle.close)
+        body = body_change_pct(candle.open, candle.close)
         # Segundos de vela transcurridos (60 = al cierre).
         age = min(max(arrived - candle.open_time / 1000, 0.0), (candle.close_time + 1 - candle.open_time) / 1000)
 
@@ -1131,7 +1288,7 @@ class KlineBot:
         # price (1-3 s) que hay para los símbolos sin bookTicker suscrito.
         price = candle.close
         f = self.filters.get(symbol, {})
-        qty, eff, why = strategy.size_order(
+        qty, eff, why = size_order(
             NOTIONAL_USDT, price, f.get("stepSize", 0.001), f.get("minQty", 0.0),
             f.get("minNotional", 5.0), MAX_NOTIONAL_OVER)
         if qty <= 0:
@@ -1141,7 +1298,7 @@ class KlineBot:
         pos = Position(
             trade_id=self._next_trade_id(), symbol=symbol, direction=direction,
             entry_price=price, qty=qty, notional=eff,
-            tp_price=strategy.exit_price(price, direction, eng.tp_pct, inverted),
+            tp_price=exit_price(price, direction, eng.tp_pct, inverted),
             signal_pct=body, candle_open=candle.open, candle_close=candle.close,
             candle_time=candle.open_time, last_price=price,
             strategy=eng.name, candle_age_s=round(age, 2), inverted=inverted,
@@ -1224,11 +1381,11 @@ class KlineBot:
                     pos.update(price)
                     if pos.strategy == ENGINE_RATIO:
                         # TP/SL fijos por precio (la salida por ratio se revisa en el ciclo de 5 min)
-                        reason = strategy.price_exit(price, pos.direction, pos.tp_price, pos.sl_price)
+                        reason = price_exit(price, pos.direction, pos.tp_price, pos.sl_price)
                         if reason:
                             hits.append((tid, reason))
                         continue
-                    if strategy.exit_hit(price, pos.tp_price, pos.direction, pos.inverted):
+                    if exit_hit(price, pos.tp_price, pos.direction, pos.inverted):
                         hits.append((tid, "SL" if pos.inverted else "TP"))
         if hits and self.store.can_act():
             for tid, reason in hits:
@@ -1247,8 +1404,8 @@ class KlineBot:
                 if pos is None:
                     return False
                 pos.update(price)
-                gross = strategy.pnl_usd(price, pos.entry_price, pos.qty, pos.direction)
-                fees = strategy.fees_usd(pos.entry_price, price, pos.qty, self.fee_pct)
+                gross = pnl_usd(price, pos.entry_price, pos.qty, pos.direction)
+                fees = fees_usd(pos.entry_price, price, pos.qty, self.fee_pct)
                 pnl = gross - fees                          # neto: fees de entrada y salida
                 now = time.time()
                 rec = {
@@ -1256,7 +1413,7 @@ class KlineBot:
                     "close_price": price,
                     "closed_at_ts": now,
                     "duration_s": now - pos.opened_ts,
-                    "move_pct": strategy.favorable_move_pct(price, pos.entry_price, pos.direction),
+                    "move_pct": favorable_move_pct(price, pos.entry_price, pos.direction),
                     "pnl": pnl,
                     "pnl_gross": gross,
                     "fees": fees,
@@ -1354,7 +1511,7 @@ class KlineBot:
 
     def _ratio_exit_prices(self, entry: float, direction: str) -> Tuple[float, float]:
         cfg = self.ratio_cfg
-        return strategy.tp_sl_prices(entry, direction, cfg["tp_pct"], cfg["sl_pct"])
+        return tp_sl_prices(entry, direction, cfg["tp_pct"], cfg["sl_pct"])
 
     def _apply_ratio_exits(self) -> None:
         """Recalcula TP/SL por precio de las posiciones abiertas del bot de ratio con la
@@ -1368,29 +1525,22 @@ class KlineBot:
             self._on_price_event(sym, "config")
 
     async def _refresh_tickers(self) -> None:
-        """24 h de todo el mercado con UNA petición REST gzip (~50 KB) por ciclo de 5 min.
-        Si el REST falla, una foto rápida del WebSocket (TICKER_SNAPSHOT_S segundos)."""
-        if time.time() >= self._rest_block_until:
-            try:
-                rows = await asyncio.to_thread(self._rest_get, "/fapi/v1/ticker/24hr")
-                self._apply_tickers([{"s": r.get("symbol"), "c": r.get("lastPrice"),
-                                      "P": r.get("priceChangePercent"), "o": r.get("openPrice")}
-                                     for r in rows if isinstance(r, dict)] if isinstance(rows, list) else [])
-                self.ticker_connected, self.ticker_error = True, ""
-                return
-            except Exception as exc:
-                self.ticker_error = f"REST 24 h: {exc}"
-                self.log(f"[ticker] {self.ticker_error} — pruebo una foto por WebSocket")
-        self.ticker_connected = await self._ticker_ws_snapshot()
+        """Exploración de todo el mercado por WebSocket (TICKER_SCAN_S segundos): 24 h de cada
+        símbolo para la lista de vigilados y descubrimiento de símbolos nuevos."""
+        seen = await self._ticker_ws_snapshot(TICKER_SCAN_S)
+        self.ticker_connected = bool(seen)
+        if seen:
+            self._update_known_symbols(seen)
 
-    async def _ticker_ws_snapshot(self) -> bool:
-        """Abre el WebSocket del 24 h unos segundos, guarda lo recibido y lo cierra."""
+    async def _ticker_ws_snapshot(self, seconds: float) -> set:
+        """Abre el WebSocket del 24 h `seconds` segundos, guarda lo recibido y lo cierra.
+        Devuelve los símbolos vistos."""
         for url in TICKER_WS_URLS:
             it = None
-            got = False
+            self._scan_seen = set()
             try:
                 it = _ws_messages(url).__aiter__()
-                end = time.monotonic() + TICKER_SNAPSHOT_S
+                end = time.monotonic() + seconds
                 while (left := end - time.monotonic()) > 0:
                     try:
                         raw = await asyncio.wait_for(it.__anext__(), timeout=left)
@@ -1398,21 +1548,66 @@ class KlineBot:
                         break
                     self.rx_ticker_bytes += len(raw)
                     self._on_tickers(raw)
-                    got = True
             except asyncio.CancelledError:
                 raise
+            except StopAsyncIteration:
+                self.ticker_error = f"el servidor cerró la exploración ({url})"
             except Exception as exc:
-                self.ticker_error = f"foto WS 24 h: {exc!r}"
+                self.ticker_error = f"exploración 24 h: {exc!r}"
             finally:
                 if it is not None:
                     try:
                         await it.aclose()
                     except Exception:
                         pass
-            if got:
+            seen, self._scan_seen = self._scan_seen, None
+            if seen:
                 self.ticker_error = ""
-                return True
-        return False
+                return seen
+        self.log(f"[ticker] exploración sin datos: {self.ticker_error or 'ninguna URL respondió'}")
+        return set()
+
+    # ── Símbolos descubiertos por WebSocket ───────────────────────────────────
+
+    def _load_known_symbols(self) -> None:
+        try:
+            with open(KNOWN_SYMBOLS_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            self.known_symbols = {str(x) for x in data.get("symbols") or []}
+            self.symbols_scanned_at = float(data.get("scanned_at") or 0.0)
+        except Exception:
+            self.known_symbols, self.symbols_scanned_at = set(), 0.0
+
+    def _save_known_symbols(self) -> None:
+        tmp = f"{KNOWN_SYMBOLS_FILE}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"symbols": sorted(self.known_symbols), "scanned_at": self.symbols_scanned_at}, fh)
+            os.replace(tmp, KNOWN_SYMBOLS_FILE)
+        except Exception as exc:
+            self.log(f"No pude guardar la lista de símbolos: {exc}")
+
+    def _update_known_symbols(self, seen: set) -> None:
+        """Una vez al día la exploración REEMPLAZA la lista (salen los deslistados); el resto
+        de exploraciones solo añaden los símbolos nuevos que aparezcan."""
+        now = time.time()
+        had = bool(self.known_symbols)
+        new = seen - self.known_symbols
+        if now - self.symbols_scanned_at >= SYMBOL_SCAN_HOURS * 3600:
+            gone = self.known_symbols - seen
+            self.known_symbols, self.symbols_scanned_at = set(seen), now
+            self._save_known_symbols()
+            self.log(f"[símbolos] exploración diaria: {len(seen)} perpetuos {QUOTE_ASSET}"
+                     + (f" | nuevos: {', '.join(sorted(new)[:10])}" if had and new else "")
+                     + (f" | ya no aparecen: {', '.join(sorted(gone)[:10])}" if gone else ""))
+        elif new:
+            self.known_symbols |= new
+            self._save_known_symbols()
+            self.log(f"[símbolos] nuevos: {', '.join(sorted(new)[:10])}")
+        if self.filters and (seen - set(self.filters)):
+            self._filters_stale = True          # hay símbolos sin filtros de cantidad: se recargan
+        if not self.symbols and self.known_symbols:
+            self.symbols = sorted(self.known_symbols)
 
     async def _ticker_loop(self) -> None:
         """TICKER_MODE=ws: WebSocket de 24 h de todos los símbolos abierto siempre."""
@@ -1457,12 +1652,16 @@ class KlineBot:
             backoff *= 2
 
     async def _symbols_retry_loop(self) -> None:
-        """Si exchangeInfo falló al arrancar (proxy/región), reintenta cada 60 s."""
+        """Si exchangeInfo falló al arrancar (proxy/región), reintenta cada 60 s. Si la
+        exploración descubre un símbolo sin filtros, los recarga (como mucho 1 vez por hora)."""
         while self.running:
             await asyncio.sleep(60.0)
             if not self.filters:
                 self.log("[REST] reintentando exchangeInfo…")
                 await self._init_symbols()
+            elif self._filters_stale and time.time() - self._filters_ts >= 3600:
+                self.log("[REST] símbolos nuevos sin filtros de cantidad: recargo exchangeInfo")
+                await self._init_symbols(force=True)
 
     def _on_tickers(self, raw) -> None:
         data = json.loads(raw)
@@ -1476,9 +1675,12 @@ class KlineBot:
     def _apply_tickers(self, data: list) -> None:
         """Filas {s, c, P|o} (formato del WebSocket) → self._tick."""
         now = time.time()
+        seen = self._scan_seen
         for t in data:
             try:
                 sym = t["s"]
+                if seen is not None and sym.endswith(QUOTE_ASSET) and "_" not in sym:
+                    seen.add(sym)                   # descubrimiento de símbolos
                 if self.filters:
                     if sym not in self.filters:
                         continue
@@ -1500,14 +1702,14 @@ class KlineBot:
         y suscribe los nuevos a precios en vivo."""
         wmin = self.ratio_cfg["watch_min_pct"]
         eng = self.engines[ENGINE_RATIO]
-        want_short = not eng.blocked[strategy.SHORT]
-        want_long = not eng.blocked[strategy.LONG]
+        want_short = not eng.blocked[SHORT]
+        want_long = not eng.blocked[LONG]
         picked = []
         for sym, (pct, _px, _ts) in list(self._tick.items()):
             if pct >= wmin and want_short:
-                picked.append((abs(pct), sym, strategy.SHORT))
+                picked.append((abs(pct), sym, SHORT))
             elif pct <= -wmin and want_long:
-                picked.append((abs(pct), sym, strategy.LONG))
+                picked.append((abs(pct), sym, LONG))
         picked.sort(reverse=True)
         picked = picked[:RATIO_WATCH_MAX]
         old = set(self.watch)
@@ -1636,11 +1838,14 @@ class KlineBot:
                     return
             self.ratio_polls += 1
             try:
+                if self._entry_candidate(sym, pts):
+                    await self._prefetch_price(sym)
                 fresh[sym] = self._on_ratio_points(sym, pts)
             except Exception as exc:
                 self.ratio_last_error = f"{sym}: {exc!r}"
 
         await asyncio.gather(*(one(s) for s in symbols))
+        self._refresh_pos_syms(force=True)                  # da de baja los precios pedidos sin entrada
         return fresh
 
     def _on_ratio_points(self, sym: str, pts: List[Tuple[int, float]]) -> bool:
@@ -1669,21 +1874,21 @@ class KlineBot:
             return t[1]
         return None
 
-    def _entry_price(self, sym: str) -> Optional[float]:
-        """Precio para abrir: el del WS o el del 24 h si es fresco; si no (el 24 h va por
-        REST cada 5 min), una consulta REST de ~100 bytes del último precio."""
-        px = self._live_price(sym)
-        if px:
-            return px
-        if time.time() < self._rest_block_until:
-            return None
-        try:
-            data = self._rest_get("/fapi/v1/ticker/price", {"symbol": sym}, timeout=5.0)
-            px = float(data["price"])
-        except Exception as exc:
-            self.ratio_last_error = f"{sym}: precio de entrada: {exc}"
-            return None
-        return px if px > 0 else None
+    def _entry_candidate(self, sym: str, pts: List[Tuple[int, float]]) -> bool:
+        """¿Estos puntos de ratio pueden abrir una entrada? (para pedir antes el precio en vivo)"""
+        if len(pts) < 2 or pts[-1][0] == (self._ratio.get(sym) or {}).get("last_ts") or pts[-2][1] <= 0:
+            return False
+        chg = (pts[-1][1] - pts[-2][1]) / pts[-2][1] * 100.0
+        cfg = self.ratio_cfg
+        return cfg["drop_min_pct"] <= abs(chg) <= cfg["drop_max_pct"]
+
+    async def _prefetch_price(self, sym: str) -> None:
+        """Suscribe el precio en vivo del símbolo (markPrice@1s) y espera el primer tick, para
+        abrir con precio actual sin REST. Si no se abre, _refresh_pos_syms lo da de baja."""
+        pc = self.price_cache
+        if pc is None or self._price(sym):
+            return
+        await asyncio.to_thread(pc.wait_for_price, sym, 5.0, PRICE_MAX_AGE_S)
 
     def _ratio_check_tp(self, sym: str, pts: List[Tuple[int, float]]) -> None:
         """TP: el ratio recupera el valor que tenía antes del gatillo."""
@@ -1700,7 +1905,7 @@ class KlineBot:
             if not after:
                 continue
             goal = p.ratio_target or p.ratio_trigger
-            if p.direction == strategy.SHORT:
+            if p.direction == SHORT:
                 hit, best = max(after) >= goal, max(after)
             else:
                 hit, best = min(after) <= goal, min(after)
@@ -1725,14 +1930,14 @@ class KlineBot:
         cfg = self.ratio_cfg
         dmin, dmax, wmin = cfg["drop_min_pct"], cfg["drop_max_pct"], cfg["watch_min_pct"]
         if -dmax <= chg <= -dmin:
-            side = strategy.SHORT
+            side = SHORT
         elif dmin <= chg <= dmax:
-            side = strategy.LONG
+            side = LONG
         else:
             return
         t = self._tick.get(sym)
         pct24 = t[0] if t else None
-        if pct24 is None or (side == strategy.SHORT and pct24 < wmin) or (side == strategy.LONG and pct24 > -wmin):
+        if pct24 is None or (side == SHORT and pct24 < wmin) or (side == LONG and pct24 > -wmin):
             return                                  # solo se opera lo que está en la lista de vigilados
         eng = self.engines[ENGINE_RATIO]
         eng.signal_count += 1
@@ -1758,20 +1963,20 @@ class KlineBot:
             return skip("ya hay una abierta en este par y dirección")
         if until > time.time():
             return skip("ignorada: en pausa tras cierre")
-        price = self._entry_price(sym)
+        price = self._live_price(sym)
         if not price:
             return skip("sin precio en vivo")
         if sym not in self.filters:
             return skip("saltada: sin filtros del símbolo (exchangeInfo no cargó: revisa el proxy)")
         f = self.filters[sym]
-        qty, eff, why = strategy.size_order(
+        qty, eff, why = size_order(
             NOTIONAL_USDT, price, f.get("stepSize", 0.001), f.get("minQty", 0.0),
             f.get("minNotional", 5.0), MAX_NOTIONAL_OVER)
         if qty <= 0:
             self.log(f"[{eng.label}] señal {side} {sym} saltada: {why}")
             return skip(f"saltada: {why}")
         # TP: el ratio recupera el mismo % que cayó (SHORT) / subió (LONG), desde el ratio de entrada.
-        target = last[1] * (1 + abs(chg) / 100.0) if side == strategy.SHORT else last[1] * (1 - abs(chg) / 100.0)
+        target = last[1] * (1 + abs(chg) / 100.0) if side == SHORT else last[1] * (1 - abs(chg) / 100.0)
         tp_px, sl_px = self._ratio_exit_prices(price, side)
         pos = Position(
             trade_id=self._next_trade_id(), symbol=sym, direction=side,
@@ -1787,7 +1992,7 @@ class KlineBot:
         self._refresh_pos_syms()                            # suscribe el precio en vivo del par
         self.store.mark_dirty(True)
         skip(f"abierta #{pos.trade_id}")
-        by_ratio = (f" · TP ratio {'≥' if side == strategy.SHORT else '≤'} {target:g}"
+        by_ratio = (f" · TP ratio {'≥' if side == SHORT else '≤'} {target:g}"
                     if self.ratio_cfg["ratio_exit"] else "")
         self.log(f"[{eng.label}] ABRE {side} {sym}{'' if pos.sent else ' [SIMULADA: envíos al executor pausados]'} | "
                  f"ratio {prev[1]:g}→{last[1]:g} ({chg:+.1f}%) | 24 h {pct24:+.1f}% | px={price:g} qty={qty:g} "
@@ -1812,8 +2017,8 @@ class KlineBot:
             st = self._ratio.get(sym) or {}
             side = self.watch_side.get(sym, "")
             chg = st.get("chg")
-            in_range = bool(chg is not None and ((side == strategy.SHORT and -dmax <= chg <= -dmin)
-                                                 or (side == strategy.LONG and dmin <= chg <= dmax)))
+            in_range = bool(chg is not None and ((side == SHORT and -dmax <= chg <= -dmin)
+                                                 or (side == LONG and dmin <= chg <= dmax)))
             rows.append({
                 "symbol": sym, "pct24": t[0] if t else None, "price": self._price(sym) or (t[1] if t else None),
                 "prev": st.get("prev"), "last": st.get("last"), "chg": chg,
@@ -1826,9 +2031,11 @@ class KlineBot:
         rows.sort(key=lambda r: abs(r["pct24"] or 0), reverse=True)
         return {
             "cfg": cfg, "rows": rows, "watch_count": len(self.watch),
-            "long_enabled": not eng.blocked[strategy.LONG], "short_enabled": not eng.blocked[strategy.SHORT],
+            "long_enabled": not eng.blocked[LONG], "short_enabled": not eng.blocked[SHORT],
             "ticker_connected": self.ticker_connected, "ticker_symbols": len(self._tick),
-            "ticker_mode": TICKER_MODE,
+            "ticker_mode": TICKER_MODE, "scan_s": TICKER_SCAN_S,
+            "known_symbols": len(self.known_symbols),
+            "symbols_scanned": _utc(self.symbols_scanned_at, "%m-%d %H:%M") if self.symbols_scanned_at else "",
             "ticker_age_s": (now - self.ticker_last_ts) if self.ticker_last_ts else None,
             "ticker_error": self.ticker_error,
             "watch_updated": _utc(self.watch_ts, "%H:%M:%S") if self.watch_ts else "",
@@ -1964,8 +2171,8 @@ class KlineBot:
             }
         return {
             "all": agg(rows),
-            "LONG": agg([r for r in rows if r.get("direction") == strategy.LONG]),
-            "SHORT": agg([r for r in rows if r.get("direction") == strategy.SHORT]),
+            "LONG": agg([r for r in rows if r.get("direction") == LONG]),
+            "SHORT": agg([r for r in rows if r.get("direction") == SHORT]),
         }
 
     # Campos que pinta la web (el resto queda en /api/trades y el CSV): menos bytes por consulta.
@@ -1988,7 +2195,7 @@ class KlineBot:
                 price = self._price(p.symbol) or p.last_price
                 row = {k: getattr(p, k) for k in self._POS_FIELDS}
                 row.update(price=price,
-                           move_pct=strategy.favorable_move_pct(price, p.entry_price, p.direction),
+                           move_pct=favorable_move_pct(price, p.entry_price, p.direction),
                            pnl=self._net_pnl(p, price), age_s=round(now - p.opened_ts),
                            opened=_utc(p.opened_ts, "%m-%d %H:%M:%S"))
                 positions.append(row)
@@ -2099,8 +2306,9 @@ class KlineBot:
 # ─────────────────────────────────────────────────────────────────────────────
 
 bot = KlineBot()
-bot.start()
-atexit.register(bot.shutdown)
+if os.getenv("BOTKLINE_AUTOSTART", "true").lower() not in ("0", "false", "no"):   # las pruebas no lo arrancan
+    bot.start()
+    atexit.register(bot.shutdown)
 
 app = Flask(__name__, static_folder=None)
 app.json.sort_keys = False
@@ -2136,13 +2344,6 @@ def _no_store(resp):
     return resp
 
 
-def _load_page() -> Tuple[bytes, str]:
-    with open(os.path.join(WEB_DIR, "index.html"), "rb") as fh:
-        html = fh.read().replace(b"__POLL_MS__", str(STATUS_POLL_MS).encode())
-    return html, hashlib.sha1(html).hexdigest()[:16]
-
-
-PAGE, PAGE_ETAG = _load_page()
 
 
 def _guard():
@@ -2401,7 +2602,7 @@ def api_block():
     if err:
         return err
     direction = str(data.get("direction", "")).upper()
-    if direction not in (strategy.LONG, strategy.SHORT):
+    if direction not in (LONG, SHORT):
         return jsonify({"ok": False, "error": "direction debe ser LONG o SHORT"}), 400
     return jsonify({"ok": True, **bot.set_block(eng, direction, bool(data.get("blocked")))})
 
@@ -2496,6 +2697,822 @@ def api_recovery():
     return _no_store(jsonify({"status": bot.store.status(), "document": doc}))
 
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WEB (panel: tema claro / oscuro / automático)
+# ─────────────────────────────────────────────────────────────────────────────
+
+HTML = r"""<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>BOTKLINE · panel</title>
+<script>
+  // Tema antes de pintar (sin parpadeo): auto (sistema) | light | dark.
+  (function () { try { var t = localStorage.getItem('botkline_theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch (e) {} })();
+</script>
+<style>
+  :root {
+    --bg:#f4f6fb; --surface:#ffffff; --surface-2:#f7f8fc; --surface-3:#eef1f8; --line:#e3e7f0; --line-strong:#d3d9e6;
+    --txt:#0f172a; --muted:#64748b; --faint:#94a3b8;
+    --accent:#4f46e5; --accent-soft:rgba(79,70,229,.10); --accent-txt:#ffffff;
+    --green:#059669; --green-soft:rgba(5,150,105,.10); --red:#dc2626; --red-soft:rgba(220,38,38,.09);
+    --amber:#b45309; --amber-soft:rgba(217,119,6,.12);
+    --shadow:0 1px 2px rgba(15,23,42,.04), 0 4px 16px rgba(15,23,42,.05);
+    --radius:16px; --radius-sm:10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:#0b0f17; --surface:#121826; --surface-2:#0f1420; --surface-3:#1a2233; --line:#222b3d; --line-strong:#2d384e;
+      --txt:#e6eaf2; --muted:#8a96ad; --faint:#5f6b82;
+      --accent:#818cf8; --accent-soft:rgba(129,140,248,.14); --accent-txt:#0b0f17;
+      --green:#34d399; --green-soft:rgba(52,211,153,.12); --red:#f87171; --red-soft:rgba(248,113,113,.12);
+      --amber:#fbbf24; --amber-soft:rgba(251,191,36,.13);
+      --shadow:0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.25);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg:#0b0f17; --surface:#121826; --surface-2:#0f1420; --surface-3:#1a2233; --line:#222b3d; --line-strong:#2d384e;
+    --txt:#e6eaf2; --muted:#8a96ad; --faint:#5f6b82;
+    --accent:#818cf8; --accent-soft:rgba(129,140,248,.14); --accent-txt:#0b0f17;
+    --green:#34d399; --green-soft:rgba(52,211,153,.12); --red:#f87171; --red-soft:rgba(248,113,113,.12);
+    --amber:#fbbf24; --amber-soft:rgba(251,191,36,.13);
+    --shadow:0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.25);
+  }
+  * { box-sizing:border-box; }
+  html { -webkit-text-size-adjust:100%; }
+  body { margin:0; background:var(--bg); color:var(--txt);
+         font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+         font-variant-numeric:tabular-nums; transition:background .2s,color .2s; }
+  main { max-width:1280px; margin:0 auto; padding:20px 16px 48px; }
+  a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
+  .muted { color:var(--muted); } .faint { color:var(--faint); }
+  .pos { color:var(--green); } .neg { color:var(--red); } .warn { color:var(--amber); }
+  small { font-size:12px; }
+
+  /* Cabecera */
+  header.top { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; margin-bottom:6px; }
+  .brand { display:flex; align-items:center; gap:10px; }
+  .logo { width:34px; height:34px; border-radius:10px; background:linear-gradient(135deg,var(--accent),#22d3ee);
+          display:grid; place-items:center; color:#fff; font-weight:800; font-size:15px; box-shadow:var(--shadow); }
+  .brand h1 { font-size:18px; margin:0; letter-spacing:.2px; }
+  .brand p { margin:0; font-size:12px; color:var(--muted); }
+  .head-r { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .pills { display:flex; flex-wrap:wrap; gap:6px; }
+  .pill { display:inline-flex; align-items:center; gap:6px; border:1px solid var(--line); background:var(--surface);
+          border-radius:999px; padding:3px 10px; font-size:12px; color:var(--muted); }
+  .pill::before { content:''; width:7px; height:7px; border-radius:50%; background:var(--faint); }
+  .pill.ok::before { background:var(--green); } .pill.bad::before { background:var(--red); } .pill.alert::before { background:var(--amber); }
+  .pill.ok { color:var(--txt); } .pill.bad { color:var(--red); } .pill.alert { color:var(--amber); }
+  #rules { margin:6px 0 16px; font-size:13px; }
+  .icon-btn { background:var(--surface); color:var(--txt); border:1px solid var(--line); border-radius:10px;
+              padding:6px 10px; font-weight:600; font-size:12px; }
+  .icon-btn:hover { background:var(--surface-3); filter:none; }
+
+  /* Cifras */
+  .kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; margin-bottom:16px; }
+  .kpi { background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); padding:14px 16px; box-shadow:var(--shadow); }
+  .kpi .label { color:var(--muted); font-size:12px; font-weight:500; }
+  .kpi .v { font-size:22px; font-weight:700; margin-top:4px; letter-spacing:-.3px; }
+  .bar { height:6px; background:var(--surface-3); border-radius:99px; overflow:hidden; margin-top:10px; }
+  .bar > i { display:block; height:100%; width:0; background:linear-gradient(90deg,var(--green),#22d3ee); transition:width .4s; }
+
+  /* Secciones plegables */
+  details.panel { background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); margin-bottom:12px; box-shadow:var(--shadow); }
+  details.panel > summary { list-style:none; cursor:pointer; padding:14px 18px; font-weight:650; font-size:15px;
+                            display:flex; gap:8px; align-items:center; flex-wrap:wrap; user-select:none; }
+  details.panel > summary::-webkit-details-marker { display:none; }
+  details.panel > summary::before { content:''; width:7px; height:7px; border-right:2px solid var(--muted); border-bottom:2px solid var(--muted);
+                                    transform:rotate(-45deg); transition:transform .15s; margin-right:4px; }
+  details.panel[open] > summary::before { transform:rotate(45deg); }
+  details.panel > summary .hint { font-weight:400; font-size:12px; color:var(--muted); }
+  details.panel > summary .badge { margin-left:auto; }
+  .body { padding:0 18px 16px; }
+  .badge { background:var(--surface-3); border-radius:999px; padding:1px 10px; font-size:12px; font-weight:600; color:var(--muted); }
+
+  /* Tarjetas de bots */
+  .bots { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:12px; }
+  .bot { background:var(--surface-2); border:1px solid var(--line); border-radius:14px; padding:14px; }
+  .bot.sel { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
+  .bot.paused { border-style:dashed; }
+  .bot h3 { margin:0; font-size:15px; display:flex; align-items:center; gap:8px; }
+  .bot .rows { display:grid; grid-template-columns:repeat(4,1fr); gap:8px 6px; margin:12px 0; }
+  .bot .rows div { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.3px; }
+  .bot .rows b { display:block; color:var(--txt); font-size:14px; text-transform:none; letter-spacing:0; }
+  .bot .acts { display:flex; gap:6px; flex-wrap:wrap; }
+
+  /* Tablas */
+  .scroll { overflow:auto; max-height:440px; border:1px solid var(--line); border-radius:var(--radius-sm); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { padding:8px 10px; border-bottom:1px solid var(--line); text-align:right; white-space:nowrap; }
+  th:first-child, td:first-child { text-align:left; }
+  tbody tr:last-child td { border-bottom:0; }
+  thead th { position:sticky; top:0; background:var(--surface-3); color:var(--muted); font-weight:600; font-size:12px; z-index:1; }
+  tbody tr:hover td { background:var(--accent-soft); }
+  .tag { padding:2px 8px; border-radius:6px; font-weight:700; font-size:11px; letter-spacing:.3px; }
+  .LONG { background:var(--green-soft); color:var(--green); } .SHORT { background:var(--red-soft); color:var(--red); }
+  .st { padding:2px 8px; border-radius:6px; font-size:11px; font-weight:700; }
+  .st.on { background:var(--green-soft); color:var(--green); } .st.off { background:var(--amber-soft); color:var(--amber); }
+
+  /* Formularios y botones */
+  form, .row { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; }
+  input { flex:1 1 200px; background:var(--surface-2); color:var(--txt); border:1px solid var(--line-strong); border-radius:10px;
+          padding:9px 11px; font:inherit; outline:none; transition:border-color .15s, box-shadow .15s; }
+  input:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
+  label.f { flex:1 1 190px; display:flex; flex-direction:column; gap:5px; font-size:12px; color:var(--muted); font-weight:500; }
+  label.f input { flex:none; }
+  button { background:var(--accent); color:var(--accent-txt); border:1px solid transparent; border-radius:10px; padding:9px 15px;
+           cursor:pointer; font:inherit; font-weight:650; transition:filter .15s, background .15s; }
+  button:hover { filter:brightness(1.07); }
+  button.ghost { background:var(--surface-3); color:var(--txt); border-color:var(--line); }
+  button.danger { background:var(--red); color:#fff; }
+  button.ok { background:var(--green); color:#fff; }
+  button.warnb { background:var(--amber); color:#fff; }
+  :root[data-theme="dark"] button.ok, :root[data-theme="dark"] button.warnb, :root[data-theme="dark"] button.danger { color:#0b0f17; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) button.ok, :root:not([data-theme="light"]) button.warnb,
+                                        :root:not([data-theme="light"]) button.danger { color:#0b0f17; } }
+  button.small { padding:5px 11px; font-size:12px; }
+  .msg { margin-top:8px; min-height:18px; font-size:13px; }
+  .sub { font-size:12px; font-weight:700; margin:18px 0 10px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; }
+  .grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:16px; }
+  .card-in { background:var(--surface-2); border:1px solid var(--line); border-radius:14px; padding:14px; }
+  .card-in h4 { margin:0 0 10px; font-size:13px; }
+
+  /* Pestañas */
+  .tabs { display:flex; gap:6px; flex-wrap:wrap; position:sticky; top:0; z-index:5; background:color-mix(in srgb, var(--bg) 88%, transparent);
+          backdrop-filter:blur(8px); padding:10px 0; margin:8px 0 4px; }
+  .tabs button { background:var(--surface); color:var(--txt); border:1px solid var(--line); padding:8px 14px; font-weight:600; }
+  .tabs button.on { background:var(--accent); color:var(--accent-txt); border-color:var(--accent); }
+  .tabs button.on .pos, .tabs button.on .neg { color:inherit; }
+  .tabs button * { pointer-events:none; }
+  #engHint { margin:0 0 12px; font-size:13px; }
+  pre { margin:0; max-height:340px; overflow:auto; font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; color:var(--muted);
+        white-space:pre-wrap; background:var(--surface-2); border:1px solid var(--line); border-radius:var(--radius-sm); padding:12px; }
+  .netgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:8px; }
+  .netgrid div { background:var(--surface-2); border:1px solid var(--line); border-radius:10px; padding:10px 12px; font-size:12px; color:var(--muted); }
+  .netgrid b { display:block; font-size:15px; color:var(--txt); }
+  @media (max-width:640px) { .bot .rows { grid-template-columns:repeat(2,1fr); } .kpi .v { font-size:19px; } }
+</style>
+</head>
+<body>
+<main>
+  <header class="top">
+    <div class="brand">
+      <div class="logo">BK</div>
+      <div><h1>BOTKLINE</h1><p>ratio top traders · short a los que más suben</p></div>
+    </div>
+    <div class="head-r">
+      <div class="pills" id="pills"></div>
+      <button type="button" class="icon-btn" id="btnTheme" title="Tema claro / oscuro">Tema</button>
+    </div>
+  </header>
+  <div class="muted" id="rules"></div>
+
+  <section class="kpis">
+    <div class="kpi"><div class="label">PnL de la sesión <span id="sessTarget"></span></div><div class="v" id="sessPnl">—</div>
+      <div class="bar"><i id="sessBar"></i></div><small class="muted" id="sessDetail"></small></div>
+    <div class="kpi"><div class="label">PnL realizado (total)</div><div class="v" id="sRpnlAll">—</div><small class="muted" id="sWins"></small></div>
+    <div class="kpi"><div class="label">PnL abierto (total)</div><div class="v" id="sUpnlAll">—</div></div>
+    <div class="kpi"><div class="label">Posiciones abiertas</div><div class="v" id="sOpen">—</div><small class="muted" id="sOpenLim"></small></div>
+    <div class="kpi"><div class="label" id="kKlLabel">Vigilados (24 h)</div><div class="v" id="sKl">—</div><small class="muted" id="sEval"></small></div>
+  </section>
+
+  <details class="panel" data-key="control" open>
+    <summary>Control <span class="hint">pausar bots, invertir, cerrar todo, objetivo y límite</span></summary>
+    <div class="body">
+      <div class="bots" id="bots"></div>
+
+      <div class="sub">Acciones para todos los bots</div>
+      <div class="row">
+        <button type="button" id="btnInvert">—</button>
+        <button type="button" class="danger" id="btnCloseAll">Cerrar TODAS las posiciones</button>
+        <button type="button" id="btnExPause">—</button>
+        <button type="button" class="ghost" id="btnReset">Poner a cero el PnL de la sesión</button>
+      </div>
+      <div class="muted" id="modeHint" style="margin-top:8px"></div>
+      <div class="muted" id="sessHits" style="margin-top:4px"></div>
+
+      <div class="sub">Ajustes</div>
+      <form id="glbForm">
+        <label class="f">Objetivo en USD para cerrar todo (0 = apagado) <span id="curTarget"></span>
+          <input id="glbTarget" type="number" step="0.01" min="0" placeholder="ej. 12"></label>
+        <label class="f">Límite de posiciones abiertas (0 = sin límite) <span id="curMax"></span>
+          <input id="glbMax" type="number" step="1" min="0" placeholder="ej. 10"></label>
+        <label class="f">Fee % por lado <span id="curFee"></span>
+          <input id="glbFee" type="number" step="0.001" min="0" max="1" placeholder="ej. 0.05"></label>
+        <button type="submit">Guardar</button>
+      </form>
+      <div class="row" style="margin-top:10px" id="tokenRow">
+        <input id="exToken" type="password" placeholder="Token admin (si está configurado)" autocomplete="off" style="display:none;max-width:320px">
+      </div>
+      <div id="glbMsg" class="muted msg"></div>
+    </div>
+  </details>
+
+  <details class="panel" data-key="ratio" open>
+    <summary>Ratio top traders <span class="hint" id="rtSum"></span> <span class="badge" id="rtN">0</span></summary>
+    <div class="body">
+      <div class="muted" id="rtInfo" style="font-size:13px"></div>
+      <div class="grid2" style="margin-top:14px">
+        <div class="card-in">
+          <h4>Salida de las operaciones <span class="muted" style="font-weight:400">· se aplica también a las abiertas</span></h4>
+          <form id="rtExitForm">
+            <label class="f">Take profit, % a favor <span id="rtCurTp"></span>
+              <input id="rtTp" type="number" step="0.1" min="0" max="1000" placeholder="ej. 10 (0 = sin TP)"></label>
+            <label class="f">Stop loss, % en contra <span id="rtCurSl"></span>
+              <input id="rtSl" type="number" step="0.1" min="-99.9" max="99.9" placeholder="ej. -5 (0 = sin SL)"></label>
+            <button type="submit">Guardar</button>
+          </form>
+          <div class="row" style="margin-top:10px">
+            <button type="button" id="rtBtnExit">—</button>
+            <span class="muted" style="font-size:12px">TP por ratio: cierra cuando el ratio recupera el mismo % que cayó.</span>
+          </div>
+        </div>
+        <div class="card-in">
+          <h4>Entrada</h4>
+          <form id="rtForm">
+            <label class="f">Vigilar 24 h ≥ ±% <span id="rtCurW"></span>
+              <input id="rtWatch" type="number" step="0.1" min="0.1" max="1000" placeholder="ej. 20"></label>
+            <label class="f">Caída mín. del ratio, % <span id="rtCurMin"></span>
+              <input id="rtMin" type="number" step="0.1" min="0.1" max="100" placeholder="ej. 25"></label>
+            <label class="f">Caída máx. del ratio, % <span id="rtCurMax"></span>
+              <input id="rtMax" type="number" step="0.1" min="0.1" max="100" placeholder="ej. 30"></label>
+            <button type="submit">Guardar</button>
+          </form>
+          <div class="row" style="margin-top:10px">
+            <button type="button" id="rtBtnShort">SHORT</button>
+            <button type="button" id="rtBtnLong">LONG</button>
+          </div>
+          <div class="muted" style="font-size:12px;margin-top:6px">SHORT: ganadores (24 h ≥ +X %), el ratio cae. LONG (espejo): perdedores (24 h ≤ −X %), el ratio sube.</div>
+        </div>
+      </div>
+      <div id="rtMsg" class="muted msg"></div>
+      <div class="scroll"><table>
+        <thead><tr><th>Símbolo</th><th>24 h</th><th>Precio</th><th>Ratio antes</th><th>Ratio ahora</th><th>Cambio</th><th>Dato</th><th>Lado</th><th>Estado</th></tr></thead>
+        <tbody id="tRt"></tbody></table></div>
+    </div>
+  </details>
+
+  <div class="tabs" id="tabs"></div>
+  <div class="muted" id="engHint"></div>
+
+  <details class="panel" data-key="pos" open>
+    <summary>Posiciones abiertas · <span class="engName"></span> <span class="badge" id="nPos">0</span></summary>
+    <div class="body">
+      <div class="row" style="margin-bottom:10px;align-items:center">
+        <span class="muted" id="engPnl"></span>
+        <button type="button" class="danger small" id="btnCloseEng" style="margin-left:auto">Cerrar todas las de este bot</button>
+      </div>
+      <div class="scroll"><table>
+        <thead><tr><th>Símbolo</th><th>Dir.</th><th id="thPosSig">Vela</th><th>Entrada</th><th>Precio</th><th>Avance</th><th>Salida</th><th>Notional</th><th>PnL neto</th><th>MFE</th><th>MAE</th><th>Abierta</th><th></th></tr></thead>
+        <tbody id="tPos"></tbody></table></div>
+    </div>
+  </details>
+
+  <details class="panel" data-key="cfg">
+    <summary>Parámetros · <span class="engName"></span> <span class="hint" id="cfgSum"></span></summary>
+    <div class="body">
+      <div class="muted">Señal actual: <b id="cfgThr">—</b> · <span id="cfgTpLbl">TP</span> actual: <b id="cfgTp">—</b> · <span id="engLat"></span></div>
+      <form id="cfgForm" style="margin-top:12px">
+        <input id="cfgNewThr" type="number" step="0.01" min="0.01" max="100" placeholder="% cuerpo de vela para entrar (ej. 3)">
+        <input id="cfgNewTp" type="number" step="0.01" min="0.01" max="100" placeholder="% take profit (normal) / stop loss (invertido)">
+        <button type="submit">Guardar</button>
+      </form>
+      <div id="cfgMsg" class="muted msg"></div>
+      <div class="row" style="align-items:center">
+        <button type="button" id="btnLong" data-block="LONG">LONG</button>
+        <button type="button" id="btnShort" data-block="SHORT">SHORT</button>
+        <span class="muted">Solo afecta a este bot. Bloquear frena las entradas nuevas de esa dirección.</span>
+      </div>
+    </div>
+  </details>
+
+  <details class="panel" data-key="sig">
+    <summary>Señales recientes · <span class="engName"></span> <span class="badge" id="nSig">0</span></summary>
+    <div class="body"><div class="scroll"><table>
+      <thead><tr><th>Hora</th><th>Símbolo</th><th>Dir.</th><th id="thSigC">Vela</th><th id="thSigB">Cuerpo</th><th id="thSigS">Segundo</th><th>Acción</th></tr></thead>
+      <tbody id="tSig"></tbody></table></div></div>
+  </details>
+
+  <details class="panel" data-key="closed">
+    <summary>Operaciones cerradas · <span class="engName"></span> <span class="badge" id="nClosed">0</span></summary>
+    <div class="body"><div class="scroll"><table>
+      <thead><tr><th>Cierre</th><th>Símbolo</th><th>Dir.</th><th>Entrada</th><th>Salida</th><th>Avance</th><th>PnL neto</th><th>Fees</th><th>MFE</th><th>MAE</th><th>Duración</th><th>Motivo</th></tr></thead>
+      <tbody id="tClosed"></tbody></table></div>
+      <small class="muted">Se muestran los 50 últimos; el historial completo está en el CSV.</small></div>
+  </details>
+
+  <details class="panel" data-key="exc">
+    <summary>MFE / MAE de las cerradas · <span class="engName"></span> <a id="csvLink" class="hint" href="/api/trades.csv" onclick="event.stopPropagation()">descargar CSV</a></summary>
+    <div class="body"><div class="scroll"><table>
+      <thead><tr><th>Dirección</th><th>Ops</th><th>Ganadas</th><th>MFE medio</th><th>MAE medio</th><th>Mejor MFE</th><th>Peor MAE</th><th>MAE medio USD</th><th>Hasta MAE</th><th>Duración media</th></tr></thead>
+      <tbody id="tExc"></tbody></table></div></div>
+  </details>
+
+  <details class="panel" data-key="eval">
+    <summary>Evaluaciones <span class="hint">cuerpo al cierre, con el umbral de <span class="engName"></span></span></summary>
+    <div class="body">
+      <div class="sub" style="margin-top:0">Mayores cuerpos de la vela <span id="evMin"></span></div>
+      <div class="scroll"><table>
+        <thead><tr><th>Símbolo</th><th>Apertura</th><th>Cierre</th><th>Cuerpo</th><th>Señal</th></tr></thead>
+        <tbody id="tTop"></tbody></table></div>
+      <div class="sub">Por minuto</div>
+      <div class="scroll"><table>
+        <thead><tr><th>Vela</th><th>Evaluadas</th><th>≥ umbral (LONG)</th><th>≤ −umbral (SHORT)</th><th>Mayor subida</th><th>Mayor caída</th></tr></thead>
+        <tbody id="tMin"></tbody></table></div>
+    </div>
+  </details>
+
+  <details class="panel" data-key="exec">
+    <summary>Executor <span class="hint" id="exSum"></span></summary>
+    <div class="body">
+      <div class="muted">Actual: <b id="exUrl">—</b> · enviadas <span id="exSent">0</span> · errores <span id="exErr">0</span></div>
+      <div class="muted" id="exLat" style="margin-top:4px"></div>
+      <form id="exForm" style="margin-top:12px">
+        <input id="exNew" type="url" placeholder="https://mi-executor.onrender.com" autocomplete="off">
+        <input id="exSecret" type="password" placeholder="Secreto (opcional, vacío = mantener)" autocomplete="off">
+        <button type="submit">Cambiar link</button>
+      </form>
+      <div id="exMsg" class="muted msg"></div>
+    </div>
+  </details>
+
+  <details class="panel" data-key="net">
+    <summary>Red <span class="hint" id="netSum"></span></summary>
+    <div class="body">
+      <div class="netgrid" id="netGrid"></div>
+      <div class="muted" style="font-size:12px;margin-top:8px">Bytes desde el arranque del servicio. «Entrada» es lo que el bot descarga de Binance; «Web» es lo que el panel y la API envían (ya comprimido). El panel deja de consultar cuando la pestaña está oculta.</div>
+    </div>
+  </details>
+
+  <details class="panel" data-key="events">
+    <summary>Eventos <span class="hint">todos los bots</span></summary>
+    <div class="body"><pre id="events"></pre></div>
+  </details>
+</main>
+<script>
+const POLL_MS = __POLL_MS__;
+const q = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const num = (v, d=4) => (v === null || v === undefined || isNaN(v)) ? '—' : (+v).toLocaleString('es', {maximumFractionDigits:d});
+const pct = v => `<span class="${v >= 0 ? 'pos' : 'neg'}">${v >= 0 ? '+' : ''}${(+v).toFixed(2)}%</span>`;
+const usd = v => `<span class="${v >= 0 ? 'pos' : 'neg'}">${v >= 0 ? '+' : ''}${(+v).toFixed(4)}</span>`;
+const dur = s => { s = Math.floor(s); const h = Math.floor(s/3600), m = Math.floor(s%3600/60);
+                   return h ? `${h}h ${m}m` : m ? `${m}m ${s%60}s` : `${s}s`; };
+const bytes = b => b >= 1073741824 ? (b/1073741824).toFixed(2) + ' GB' : b >= 1048576 ? (b/1048576).toFixed(1) + ' MB' : (b/1024).toFixed(0) + ' KB';
+const tag = d => `<span class="tag ${esc(d)}">${esc(d)}</span>`;
+const store = {get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } },
+               set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }};
+let cur = store.get('botkline_engine', 'ratio'), last = null;
+q('exToken').value = store.get('botkline_token', '');
+
+// Tema: auto → claro → oscuro.
+const THEMES = ['auto', 'light', 'dark'], THEME_LABEL = {auto: 'Tema: auto', light: 'Tema: claro', dark: 'Tema: oscuro'};
+function applyTheme(t) {
+  if (t === 'auto') delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t;
+  q('btnTheme').textContent = THEME_LABEL[t];
+}
+let theme = store.get('botkline_theme', 'auto'); if (!THEMES.includes(theme)) theme = 'auto';
+applyTheme(theme);
+q('btnTheme').addEventListener('click', () => {
+  theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+  store.set('botkline_theme', theme); applyTheme(theme);
+});
+
+// Secciones plegables: se recuerda cuáles están abiertas.
+const folds = JSON.parse(store.get('botkline_folds', '{}') || '{}');
+document.querySelectorAll('details.panel').forEach(d => {
+  const k = d.dataset.key;
+  if (k in folds) d.open = folds[k];
+  d.addEventListener('toggle', () => { folds[k] = d.open; store.set('botkline_folds', JSON.stringify(folds)); });
+});
+
+function headers() {
+  const h = {'Content-Type': 'application/json'};
+  const t = q('exToken').value.trim();
+  if (t) h['X-Admin-Token'] = t;
+  return h;
+}
+async function post(url, body) {
+  store.set('botkline_token', q('exToken').value.trim());
+  const r = await fetch(url, {method: 'POST', headers: headers(), body: JSON.stringify(body || {})});
+  return r.json();
+}
+
+// Consulta del estado: solo con la pestaña visible y sin solapar peticiones.
+let timer = null, inflight = false, again = false;
+async function refresh() {
+  clearTimeout(timer);
+  if (inflight) { again = true; return; }             // ya hay una en curso: se repite al terminar
+  inflight = true;
+  try {
+    const r = await fetch('/api/status?engine=' + encodeURIComponent(cur), {cache: 'no-store'});
+    last = await r.json();
+    render(last);
+  } catch (e) { /* sin conexión: se reintenta en el siguiente ciclo */ }
+  finally { inflight = false; }
+  if (again) { again = false; return refresh(); }
+  if (!document.hidden) timer = setTimeout(refresh, POLL_MS);
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); else clearTimeout(timer); });
+
+function shown(d, n) {
+  // Los bots de velas solo se muestran si sus velas están activas o tienen operaciones.
+  const b = d.engines[n];
+  return n === 'ratio' || d.klines.enabled || b.positions.length || b.closed_count;
+}
+
+function render(d) {
+  const c = d.config, g = d.global, names = Object.keys(d.engines).filter(n => shown(d, n));
+  if (!names.includes(cur)) cur = names[0];
+  const e = d.engines[cur], ec = e.config, xk = g.inverted ? 'SL' : 'TP';
+  if (!e.detail) { again = true; return; }            // llegó el detalle de otro bot: se pide el bueno
+  const all = Object.keys(d.engines);
+  const sum = f => all.reduce((s, n) => s + f(d.engines[n]), 0);
+  const isRatio = cur === 'ratio';
+  const r = d.ratio || {}, rc = r.cfg || {};
+
+  // Cabecera
+  const k = d.klines, p = d.persistence || {}, x = d.executor;
+  q('pills').innerHTML = [
+    ...(k.enabled ? [`<span class="pill ${g.inverted ? 'alert' : 'ok'}">${g.inverted ? 'Modo INVERTIDO' : 'Modo normal'}</span>`] : []),
+    ...names.map(n => `<span class="pill ${d.engines[n].config.paused ? 'alert' : 'ok'}">${esc(d.engines[n].label)}: ${d.engines[n].config.paused ? 'pausado' : 'en marcha'}</span>`),
+    ...(k.enabled ? [`<span class="pill ${k.active ? 'ok' : 'bad'}">Velas ${k.active ? 'conectadas' : 'desconectadas'}</span>`] : []),
+    ...(d.ratio ? [`<span class="pill ${r.ticker_connected ? 'ok' : 'bad'}">24 h ${r.ticker_connected ? 'ok' : 'sin datos'}</span>`,
+                   `<span class="pill ${r.rest_blocked_s > 0 ? 'bad' : 'ok'}">Ratio REST ${r.rest_blocked_s > 0 ? 'en pausa' : 'ok'}</span>`] : []),
+    `<span class="pill ${!x.url ? 'bad' : g.executor_paused ? 'alert' : (x.errors && x.last_error ? 'alert' : 'ok')}">Executor ${!x.url ? 'sin link' : g.executor_paused ? 'PAUSADO (prueba)' : 'activo'}</span>`,
+    `<span class="pill ${p.mode === 'ok' || p.mode === 'local' ? 'ok' : 'alert'}">Estado ${esc(p.mode)}</span>`,
+  ].join('');
+  const exitTxt = [rc.tp_pct > 0 ? `TP +${rc.tp_pct}%` : 'sin TP', rc.sl_pct > 0 ? `SL −${rc.sl_pct}%` : 'sin SL',
+                   rc.ratio_exit ? 'TP por ratio' : ''].filter(Boolean).join(' · ');
+  q('rules').textContent = d.ratio
+    ? `Ratio top traders: vigila 24 h ≥ ±${rc.watch_min_pct}% · SHORT si el ratio cae ${rc.drop_min_pct}–${rc.drop_max_pct}% en 5 min · salida: ${exitTxt} · ${c.notional} USDT por entrada · fee ${g.fee_pct}% por lado`
+    : `Cuerpo de la vela 1m ≥ umbral → ${g.inverted ? 'entra CONTRA la vela · el % es stop loss' : 'sigue la tendencia · el % es take profit'} · ${c.notional} USDT por entrada · fee ${g.fee_pct}% por lado`;
+
+  // Cifras
+  q('sessPnl').innerHTML = usd(g.session_pnl);
+  q('sessTarget').textContent = g.profit_target_usd > 0 ? `· objetivo +${g.profit_target_usd} USD` : '· objetivo apagado';
+  q('sessBar').style.width = g.profit_target_usd > 0 ? `${Math.max(0, Math.min(100, g.session_pnl / g.profit_target_usd * 100))}%` : '0';
+  q('sessDetail').innerHTML = `realizado ${usd(g.session_realized)} + abierto ${usd(g.session_unrealized)} · desde ${esc(g.session_since)}`;
+  q('sRpnlAll').innerHTML = usd(sum(n => n.realized_pnl));
+  q('sWins').textContent = `${sum(n => n.wins)}/${sum(n => n.closed_count)} ganadas · netas de fees`;
+  q('sUpnlAll').innerHTML = usd(sum(n => n.unrealized_pnl));
+  q('sOpen').textContent = g.open_count;
+  q('sOpenLim').textContent = g.max_open > 0 ? `límite ${g.max_open}` : 'sin límite';
+  if (d.ratio) {
+    q('kKlLabel').textContent = 'Vigilados (24 h)';
+    q('sKl').textContent = r.watch_count;
+    q('sEval').textContent = `de ${r.ticker_symbols} símbolos · lista de ${r.watch_updated || '—'}`;
+  } else {
+    q('kKlLabel').textContent = 'Velas';
+    q('sKl').textContent = `${k.with_data}/${k.symbols}`;
+    q('sEval').textContent = `${k.active}/${k.connections} conexiones · ${d.eval_total.toLocaleString('es')} velas evaluadas`;
+  }
+
+  // Control
+  q('bots').innerHTML = names.map(n => { const b = d.engines[n], bc = b.config;
+    const bl = [bc.block_long && 'LONG', bc.block_short && 'SHORT'].filter(Boolean).join(', ');
+    return `<div class="bot ${n === cur ? 'sel' : ''} ${bc.paused ? 'paused' : ''}">
+      <h3>${esc(b.label)} <span class="st ${bc.paused ? 'off' : 'on'}">${bc.paused ? 'PAUSADO' : 'EN MARCHA'}</span></h3>
+      <div class="muted" style="font-size:12px;margin-top:4px">${esc(b.hint)}</div>
+      <div class="rows">
+        ${n === 'ratio' ? `<div>TP / SL<b>${rc.tp_pct > 0 ? '+' + rc.tp_pct + '%' : '—'} / ${rc.sl_pct > 0 ? '−' + rc.sl_pct + '%' : '—'}</b></div><div>Caída ratio<b>${rc.drop_min_pct}–${rc.drop_max_pct}%</b></div>`
+                        : `<div>Señal<b>±${bc.threshold_pct}%</b></div><div>${xk}<b>${bc.tp_pct}%</b></div>`}
+        <div>Abiertas<b>${b.positions.length}</b></div><div>Bloqueados<b class="${bl ? 'neg' : ''}">${bl || '—'}</b></div>
+        <div>Señales / abiertas<b>${b.signal_count} / ${b.opened_count}</b></div><div>Cerradas<b>${b.closed_count} (${b.wins} gan.)</b></div>
+        <div>PnL abierto<b>${usd(b.unrealized_pnl)}</b></div><div>PnL realizado<b>${usd(b.realized_pnl)}</b></div>
+      </div>
+      <div class="acts">
+        <button type="button" class="small ${bc.paused ? 'ok' : 'warnb'}" data-pause="${esc(n)}" data-paused="${bc.paused ? '1' : ''}">${bc.paused ? 'Reanudar' : 'Pausar'}</button>
+        <button type="button" class="small ghost" data-engine="${esc(n)}">Ver detalle</button>
+      </div></div>`; }).join('');
+  const bi = q('btnInvert');
+  bi.style.display = k.enabled ? '' : 'none';                 // el modo invertido solo afecta a los bots de velas
+  bi.dataset.inverted = g.inverted ? '1' : '';
+  bi.textContent = g.inverted ? 'Modo INVERTIDO · volver a normal' : 'Modo normal · invertir';
+  bi.className = g.inverted ? 'warnb' : 'ok';
+  const bx = q('btnExPause');
+  bx.dataset.paused = g.executor_paused ? '1' : '';
+  bx.textContent = g.executor_paused ? 'Envíos al executor PAUSADOS · reanudar' : 'Pausar entradas al executor (prueba)';
+  bx.className = g.executor_paused ? 'warnb' : 'ghost';
+  q('modeHint').textContent = (g.executor_paused ? 'MODO PRUEBA: las entradas nuevas solo se simulan aquí, no se mandan al executor. ' : '') + (k.enabled ? (g.inverted
+    ? 'Invertido (bots de velas): vela verde → SHORT, roja → LONG. El % es stop loss; no hay TP.'
+    : 'Normal (bots de velas): vela verde → LONG, roja → SHORT. El % es take profit.') : '');
+  q('sessHits').textContent = g.target_hits ? `Objetivo alcanzado ${g.target_hits} vez/veces · último: ${g.last_target || '—'}` : 'Al llegar al objetivo se cierran todas las posiciones y el contador vuelve a cero.';
+  q('curTarget').textContent = `(ahora ${g.profit_target_usd > 0 ? '+' + g.profit_target_usd : 'apagado'})`;
+  q('curMax').textContent = `(ahora ${g.max_open > 0 ? g.max_open : 'sin límite'})`;
+  q('curFee').textContent = `(ahora ${g.fee_pct}%)`;
+  q('exToken').style.display = c.admin_token ? '' : 'none';
+  q('tokenRow').style.display = c.admin_token ? '' : 'none';
+
+  // Pestañas
+  q('tabs').style.display = names.length > 1 ? '' : 'none';
+  q('tabs').innerHTML = names.map(n => { const b = d.engines[n];
+    return `<button type="button" data-engine="${esc(n)}" class="${n === cur ? 'on' : ''}">${esc(b.label)}${b.config.paused ? ' (pausado)' : ''} <span>· ${b.positions.length} abiertas · </span>${usd(b.realized_pnl)}</button>`; }).join('');
+  q('engHint').textContent = `${e.label}: ${e.hint}.`;
+  document.querySelectorAll('.engName').forEach(el => el.textContent = e.label);
+  q('csvLink').href = '/api/trades.csv?engine=' + encodeURIComponent(cur);
+
+  // Posiciones
+  q('nPos').textContent = e.positions.length;
+  q('thPosSig').textContent = isRatio ? 'Ratio' : 'Vela';
+  q('engPnl').innerHTML = `PnL abierto ${usd(e.unrealized_pnl)} · realizado ${usd(e.realized_pnl)} (${e.wins}/${e.closed_count} ganadas)`;
+  const rn = {}; (r.rows || []).forEach(x => rn[x.symbol] = x);
+  const exitCell = row => {
+    if (!isRatio) return `<span class="muted">${row.inverted ? 'SL' : 'TP'}</span> ${num(row.tp_price, 8)}`;
+    const parts = [];
+    if (row.tp_price > 0) parts.push(`<span class="pos">TP</span> ${num(row.tp_price, 8)}`);
+    if (row.sl_price > 0) parts.push(`<span class="neg">SL</span> ${num(row.sl_price, 8)}`);
+    if (rc.ratio_exit) parts.push(`<span class="muted">ratio ${row.direction === 'SHORT' ? '≥' : '≤'}</span> ${num(row.ratio_target || row.ratio_trigger, 4)} <span class="muted">(ahora ${rn[row.symbol] && rn[row.symbol].last != null ? num(rn[row.symbol].last, 4) : '—'})</span>`);
+    return parts.join(' · ') || '<span class="muted">manual</span>';
+  };
+  q('tPos').innerHTML = e.positions.map(row => `<tr>
+    <td><b>${esc(row.symbol)}</b> <span class="muted">#${row.trade_id}</span>${row.sent === false ? ' <span class="st off">SIMULADA</span>' : ''}</td><td>${tag(row.direction)}</td>
+    <td>${isRatio ? `${num(row.ratio_trigger, 4)}→${num(row.ratio_entry, 4)} ${pct(row.ratio_change_pct || 0)}` : pct(row.signal_pct) + (cur === 'live' ? ` <span class="muted">${Math.round(row.candle_age_s || 0)}s</span>` : '')}</td><td>${num(row.entry_price, 8)}</td><td>${num(row.price, 8)}</td>
+    <td>${pct(row.move_pct)}</td><td>${exitCell(row)}</td><td>${num(row.notional, 2)}</td><td>${usd(row.pnl)}</td>
+    <td>${pct(row.mfe_pct)} <span class="muted">${usd(row.mfe_usd)}</span></td><td>${pct(row.mae_pct)} <span class="muted">${usd(row.mae_usd)}</span></td>
+    <td>${esc(row.opened)} <span class="muted">(${dur(row.age_s)})</span></td>
+    <td><button class="small ghost" data-close="${row.trade_id}" data-label="${esc(row.direction)} ${esc(row.symbol)} #${row.trade_id}">Cerrar</button></td></tr>`).join('')
+    || '<tr><td colspan="13" class="muted">Sin posiciones abiertas</td></tr>';
+
+  // Parámetros (el bot de ratio se ajusta en su propio panel)
+  document.querySelector('details[data-key="cfg"]').style.display = isRatio ? 'none' : '';
+  document.querySelector('details[data-key="eval"]').style.display = isRatio || !k.enabled ? 'none' : '';
+  q('thSigC').textContent = isRatio ? 'Ratio' : 'Vela';
+  q('thSigB').textContent = isRatio ? 'Cambio' : 'Cuerpo';
+  q('thSigS').textContent = isRatio ? '' : 'Segundo';
+  q('cfgThr').textContent = `±${ec.threshold_pct}%`;
+  q('cfgTp').textContent = `${ec.tp_pct}%`;
+  q('cfgTpLbl').textContent = xk;
+  q('cfgSum').textContent = `señal ±${ec.threshold_pct}% · ${xk} ${ec.tp_pct}%`;
+  q('engLat').textContent = e.decide_ms === null ? 'decisión: sin entradas aún' : `decisión media ${e.decide_ms} ms`;
+  for (const [id, dir, blocked] of [['btnLong', 'LONG', ec.block_long], ['btnShort', 'SHORT', ec.block_short]]) {
+    const b = q(id);
+    b.dataset.blocked = blocked ? '1' : '';
+    b.textContent = blocked ? `${dir} bloqueados · desbloquear` : `${dir} activos · bloquear`;
+    b.className = blocked ? 'danger' : 'ok';
+  }
+
+  // Señales y cerradas
+  q('nSig').textContent = e.signal_count;
+  q('tSig').innerHTML = e.signals.map(s => `<tr><td>${esc(s.time)}</td><td>${esc(s.symbol)}</td><td>${tag(s.direction)}</td>
+    <td>${esc(s.candle)} <span class="muted">${num(s.open, 8)}→${num(s.close, 8)}</span></td><td>${pct(s.body_pct)}</td>
+    <td class="muted">${isRatio ? '' : Math.round(s.candle_age_s || 0) + 's'}</td>
+    <td class="${s.action.startsWith('abierta') ? 'pos' : 'muted'}">${esc(s.action)}</td></tr>`).join('')
+    || `<tr><td colspan="7" class="muted">${isRatio ? 'Esperando una caída del ratio dentro del rango' : 'Esperando velas con cuerpo ≥ ±' + ec.threshold_pct + '%'}</td></tr>`;
+  q('nClosed').textContent = e.closed_count;
+  q('tClosed').innerHTML = e.closed_trades.map(t => `<tr><td>${esc(t.closed)}</td><td>${esc(t.symbol)}</td><td>${tag(t.direction)}</td>
+    <td>${num(t.entry_price, 8)}</td><td>${num(t.close_price, 8)}</td><td>${pct(t.move_pct)}</td><td>${usd(t.pnl)}</td>
+    <td class="muted">${num(t.fees || 0, 4)}</td><td>${pct(t.mfe_pct || 0)}</td><td>${pct(t.mae_pct || 0)}</td>
+    <td>${dur(t.duration_s || 0)}</td><td>${esc(t.reason)}${t.sent === false ? ' <span class="st off">SIMULADA</span>' : ''}</td></tr>`).join('')
+    || '<tr><td colspan="12" class="muted">Aún no hay cierres</td></tr>';
+
+  const exc = e.excursions || {};
+  q('tExc').innerHTML = ['all', 'LONG', 'SHORT'].map(kk => {
+    const rr = exc[kk] || {n: 0}, label = kk === 'all' ? 'Todas' : tag(kk);
+    if (!rr.n) return `<tr><td>${label}</td><td>0</td><td colspan="8" class="muted">—</td></tr>`;
+    return `<tr><td>${label}</td><td>${rr.n}</td><td>${rr.wins}</td><td>${pct(rr.avg_mfe_pct)}</td><td>${pct(rr.avg_mae_pct)}</td>
+      <td>${pct(rr.best_mfe_pct)}</td><td>${pct(rr.worst_mae_pct)}</td><td>${usd(rr.avg_mae_usd)}</td>
+      <td>${dur(rr.avg_time_to_mae_s)}</td><td>${dur(rr.avg_duration_s)}</td></tr>`;
+  }).join('');
+
+  // Evaluaciones
+  const ev = e.evaluations;
+  q('evMin').textContent = ev.top_minute;
+  q('tTop').innerHTML = ev.top.map(rr => `<tr><td>${esc(rr.symbol)}</td><td>${num(rr.open, 8)}</td><td>${num(rr.close, 8)}</td>
+    <td>${pct(rr.body_pct)}</td><td>${rr.signal ? tag(rr.signal) : '<span class="muted">—</span>'}</td></tr>`).join('')
+    || '<tr><td colspan="5" class="muted">Esperando el primer cierre de vela</td></tr>';
+  q('tMin').innerHTML = ev.minutes.map(m => `<tr><td>${esc(m.minute)}</td><td>${m.evaluated}</td><td>${m.long}</td><td>${m.short}</td>
+    <td>${pct(m.max_up)}</td><td>${pct(m.max_down)}</td></tr>`).join('')
+    || '<tr><td colspan="6" class="muted">Sin evaluaciones todavía</td></tr>';
+
+  // Executor
+  q('exUrl').textContent = x.url || '(vacío: sin señales)';
+  q('exSum').textContent = x.url ? `${x.url} · ${x.sent} enviadas · ${x.errors} errores` : 'sin link: no se mandan señales';
+  q('exSent').textContent = x.sent;
+  q('exErr').textContent = x.errors;
+  q('exLat').textContent = x.last_ok
+    ? `Última señal (${x.last_ok}): HTTP al executor ${x.http_ms} ms · total desde el mensaje de Binance ${x.total_ms} ms`
+    : 'Latencia: aún no hay señales enviadas';
+
+  // Red
+  const nt = d.net;
+  if (nt) {
+    q('netSum').textContent = `entrada ${bytes(nt.rx_per_hour)}/h · web ${bytes(nt.web_per_hour)}/h`;
+    q('netGrid').innerHTML = [
+      ['Entrada total', bytes(nt.rx_total)], ['Entrada por hora', bytes(nt.rx_per_hour)],
+      ['REST Binance', bytes(nt.rx.rest)], [`Precios (${esc(nt.price_stream)}, ${nt.price_symbols} pares)`, bytes(nt.rx.prices)],
+      [`24 h por WebSocket (${nt.ticker_mode === 'ws' ? 'continuo' : 'exploración cada 5 min'})`, bytes(nt.rx.ticker)],
+      ...(k.enabled ? [['Velas', bytes(nt.rx.klines)]] : []),
+      ['Web enviada', bytes(nt.web_tx)], ['Web por hora', bytes(nt.web_per_hour)],
+    ].map(([a, b]) => `<div>${a}<b>${b}</b></div>`).join('');
+  }
+  renderRatio(d);
+  q('events').textContent = d.events.join('\n');
+}
+
+q('exForm').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const body = {url: q('exNew').value.trim()};
+  const secret = q('exSecret').value;
+  if (secret) body.secret = secret;
+  if (!body.url && !confirm('Link vacío: los bots dejarán de mandar señales. ¿Seguir?')) return;
+  q('exMsg').textContent = 'Guardando…';
+  try {
+    const r = await post('/api/executor', body);
+    q('exMsg').innerHTML = r.ok
+      ? `<span class="pos">Link cambiado.</span> ${r.url ? (r.reachable ? 'El executor responde (' + esc(r.detail) + ').' : '<span class="warn">No responde: ' + esc(r.detail) + '</span>') : esc(r.detail)}`
+      : `<span class="neg">${esc(r.error)}</span>`;
+    if (r.ok) { q('exNew').value = ''; q('exSecret').value = ''; }
+  } catch (e) { q('exMsg').innerHTML = `<span class="neg">${esc(e)}</span>`; }
+  refresh();
+});
+
+q('cfgForm').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  q('cfgMsg').textContent = 'Guardando…';
+  try {
+    const r = await post('/api/config', {engine: cur, threshold_pct: q('cfgNewThr').value, tp_pct: q('cfgNewTp').value});
+    q('cfgMsg').innerHTML = r.ok
+      ? `<span class="pos">Guardado en ${esc(last && last.engines[r.engine] ? last.engines[r.engine].label : r.engine)}.</span> Señal ±${r.threshold_pct}% · ${last && last.global.inverted ? 'SL' : 'TP'} ${r.tp_pct}%`
+      : `<span class="neg">${esc(r.error)}</span>`;
+    if (r.ok) { q('cfgNewThr').value = ''; q('cfgNewTp').value = ''; }
+  } catch (e) { q('cfgMsg').innerHTML = `<span class="neg">${esc(e)}</span>`; }
+  refresh();
+});
+
+async function glb(body, url = '/api/global') {
+  q('glbMsg').textContent = 'Guardando…';
+  try {
+    const r = await post(url, body);
+    q('glbMsg').innerHTML = r.ok
+      ? `<span class="pos">Guardado.</span> ${r.executor_paused ? 'Envíos al executor pausados · ' : ''}objetivo ${r.profit_target_usd > 0 ? '+' + r.profit_target_usd + ' USD' : 'apagado'} · límite ${r.max_open > 0 ? r.max_open + ' abiertas' : 'sin límite'} · fee ${r.fee_pct}% por lado`
+      : `<span class="neg">${esc(r.error)}</span>`;
+    return r.ok;
+  } catch (e) { q('glbMsg').innerHTML = `<span class="neg">${esc(e)}</span>`; }
+  finally { refresh(); }
+}
+
+q('glbForm').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  if (await glb({profit_target_usd: q('glbTarget').value, max_open: q('glbMax').value, fee_pct: q('glbFee').value})) {
+    q('glbTarget').value = ''; q('glbMax').value = ''; q('glbFee').value = '';
+  }
+});
+
+q('btnInvert').addEventListener('click', () => {
+  const inv = !q('btnInvert').dataset.inverted;
+  const msg = inv
+    ? '¿Invertir los bots de velas? Las entradas nuevas irán CONTRA la vela y el % será stop loss, sin TP. Las posiciones abiertas siguen con su TP.'
+    : '¿Volver al modo normal? Las entradas nuevas seguirán la vela con TP. Las posiciones abiertas invertidas siguen con su SL.';
+  if (confirm(msg)) glb({inverted: inv});
+});
+
+q('btnExPause').addEventListener('click', () => {
+  const p = !q('btnExPause').dataset.paused;
+  const msg = p
+    ? '¿Pausar las entradas al executor? Los bots seguirán operando en simulación (verás posiciones SIMULADAS) pero no se mandará ninguna apertura. Los cierres de lo ya enviado sí se mandan.'
+    : '¿Reanudar los envíos al executor? Las entradas nuevas volverán a abrirse de verdad. Las simuladas que sigan abiertas no se mandan.';
+  if (confirm(msg)) glb({executor_paused: p});
+});
+
+q('btnReset').addEventListener('click', () => {
+  if (confirm('¿Poner a cero el PnL de la sesión? El objetivo se contará desde ahora.')) glb({}, '/api/session/reset');
+});
+
+async function closeAll(engine) {
+  const n = engine ? last.engines[engine].positions.length : last.global.open_count;
+  const who = engine ? `del ${last.engines[engine].label}` : 'de todos los bots';
+  if (!n) { alert(`No hay posiciones abiertas ${who}.`); return; }
+  if (!confirm(`¿Cerrar a mercado las ${n} posiciones abiertas ${who}?`)) return;
+  try {
+    const r = await post('/api/close-all', engine ? {engine} : {});
+    alert(r.ok ? r.msg : r.error);
+  } catch (e) { alert(e); }
+  refresh();
+}
+q('btnCloseAll').addEventListener('click', () => closeAll(null));
+q('btnCloseEng').addEventListener('click', () => closeAll(cur));
+
+document.addEventListener('click', async ev => {
+  const t = ev.target, ds = t.dataset || {};
+  if (ds.pause) {
+    const paused = !ds.paused, label = last ? last.engines[ds.pause].label : ds.pause;
+    if (!confirm(paused ? `¿Pausar el ${label}? No abrirá entradas nuevas; sus posiciones abiertas siguen hasta su TP/SL.` : `¿Reanudar el ${label}?`)) return;
+    try { const r = await post('/api/pause', {engine: ds.pause, paused}); if (!r.ok) alert(r.error); } catch (e) { alert(e); }
+    refresh();
+    return;
+  }
+  const tab = t.closest && t.closest('[data-engine]');
+  if (tab) {
+    cur = tab.dataset.engine;
+    store.set('botkline_engine', cur);
+    q('cfgMsg').textContent = '';
+    refresh();                                         // trae el detalle del bot elegido
+    if (tab.closest('#bots')) q('tabs').scrollIntoView({behavior: 'smooth'});
+    return;
+  }
+  if (ds.block) {
+    try { const r = await post('/api/block', {engine: cur, direction: ds.block, blocked: !ds.blocked}); if (!r.ok) alert(r.error); } catch (e) { alert(e); }
+    refresh();
+    return;
+  }
+  if (!ds.close || !confirm(`¿Cerrar ${ds.label || ds.close} a mercado?`)) return;
+  try {
+    const r = await post('/api/close/' + encodeURIComponent(ds.close), {});
+    alert(r.ok ? r.msg : (r.error || r.msg));
+  } catch (e) { alert(e); }
+  refresh();
+});
+
+function renderRatio(d) {
+  const r = d.ratio; if (!r) return;
+  const c = r.cfg;
+  q('rtSum').textContent = `24 h ≥ ±${c.watch_min_pct}% · caída ${c.drop_min_pct}–${c.drop_max_pct}% · TP ${c.tp_pct > 0 ? '+' + c.tp_pct + '%' : 'apagado'} · SL ${c.sl_pct > 0 ? '−' + c.sl_pct + '%' : 'apagado'}`;
+  q('rtN').textContent = r.rows.length;
+  q('rtCurW').textContent = `(ahora ${c.watch_min_pct}%)`;
+  q('rtCurMin').textContent = `(ahora ${c.drop_min_pct}%)`;
+  q('rtCurMax').textContent = `(ahora ${c.drop_max_pct}%)`;
+  q('rtCurTp').textContent = `(ahora ${c.tp_pct > 0 ? '+' + c.tp_pct + '%' : 'apagado'})`;
+  q('rtCurSl').textContent = `(ahora ${c.sl_pct > 0 ? '−' + c.sl_pct + '%' : 'apagado'})`;
+  const be = q('rtBtnExit');
+  be.dataset.on = c.ratio_exit ? '1' : '';
+  be.textContent = c.ratio_exit ? 'TP por ratio activo · desactivar' : 'TP por ratio desactivado · activar';
+  be.className = c.ratio_exit ? 'ok small' : 'ghost small';
+  const viaWs = r.ticker_mode === 'ws';
+  q('rtInfo').innerHTML = `24 h por WebSocket (${viaWs ? 'continuo' : 'exploración de ' + r.scan_s + ' s cada 5 min'}): ${r.ticker_connected ? '<span class="pos">ok</span>' : '<span class="neg">sin datos</span>'}`
+    + ` · ${r.known_symbols} símbolos conocidos (lista diaria ${esc(r.symbols_scanned || '—')})`
+    + ` (${r.ticker_symbols} símbolos, ${r.ticker_age_s === null ? '—' : 'hace ' + dur(r.ticker_age_s)})`
+    + ` · lista ${esc(r.watch_updated || '—')} · próxima consulta en ${r.next_cycle_in > 0 ? dur(r.next_cycle_in) : '—'}`
+    + ` · consultas ${r.polls} · errores ${r.errors}`
+    + (r.filters === 0 ? ` · <span class="neg">sin exchangeInfo (proxy/región): no se puede operar ni consultar el ratio</span>` : '')
+    + (r.ticker_error && !r.ticker_connected ? ` · <span class="warn">24 h: ${esc(r.ticker_error)}</span>` : '')
+    + (r.rest_blocked_s > 0 ? ` · <span class="neg">REST en pausa ${dur(r.rest_blocked_s)} (límite de peticiones)</span>` : '')
+    + (r.last_error ? ` · <span class="warn">${esc(r.last_error)}</span>` : '');
+  for (const [id, dir, on] of [['rtBtnShort', 'SHORT', r.short_enabled], ['rtBtnLong', 'LONG', r.long_enabled]]) {
+    const b = q(id);
+    b.dataset.on = on ? '1' : '';
+    b.textContent = on ? `${dir} activo · desactivar` : `${dir} desactivado · activar`;
+    b.className = on ? 'ok' : 'danger';
+  }
+  q('tRt').innerHTML = r.rows.map(x => `<tr>
+    <td><b>${esc(x.symbol)}</b></td><td>${x.pct24 === null ? '—' : pct(x.pct24)}</td><td>${num(x.price, 8)}</td>
+    <td>${num(x.prev, 4)}</td><td>${num(x.last, 4)}</td><td>${x.chg === null ? '<span class="muted">—</span>' : pct(x.chg)}</td>
+    <td class="${x.lag ? 'warn' : 'muted'}" title="${x.lag ? 'Binance aún no publicó el punto más nuevo de este símbolo' : ''}">${esc(x.data_time || '—')}${x.lag ? ' ⏳' : ''}</td><td>${x.side ? tag(x.side) : '<span class="muted">—</span>'}</td>
+    <td>${x.has_position ? '<span class="st on">POSICIÓN</span>' : x.in_range ? '<span class="st off">EN RANGO</span>' : '<span class="muted">—</span>'}</td></tr>`).join('')
+    || '<tr><td colspan="9" class="muted">Ningún símbolo cumple el % de 24 h todavía</td></tr>';
+}
+
+async function ratioPost(body, okMsg) {
+  q('rtMsg').textContent = 'Guardando…';
+  try {
+    const r = await post('/api/ratio', body);
+    q('rtMsg').innerHTML = r.ok ? `<span class="pos">Guardado.</span> ${okMsg(r)}` : `<span class="neg">${esc(r.error)}</span>`;
+    return r.ok;
+  } catch (e) { q('rtMsg').innerHTML = `<span class="neg">${esc(e)}</span>`; }
+  finally { refresh(); }
+}
+
+q('rtForm').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const ok = await ratioPost({watch_min_pct: q('rtWatch').value, drop_min_pct: q('rtMin').value, drop_max_pct: q('rtMax').value},
+    r => `24 h ≥ ±${r.watch_min_pct}% · caída del ratio ${r.drop_min_pct}–${r.drop_max_pct}% (la lista se recalcula en la próxima consulta de 5 min)`);
+  if (ok) { q('rtWatch').value = ''; q('rtMin').value = ''; q('rtMax').value = ''; }
+});
+
+q('rtExitForm').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const ok = await ratioPost({tp_pct: q('rtTp').value, sl_pct: q('rtSl').value},
+    r => `TP ${r.tp_pct > 0 ? '+' + r.tp_pct + '%' : 'apagado'} · SL ${r.sl_pct > 0 ? '−' + r.sl_pct + '%' : 'apagado'} (también en las posiciones abiertas)`);
+  if (ok) { q('rtTp').value = ''; q('rtSl').value = ''; }
+});
+
+q('rtBtnExit').addEventListener('click', () => {
+  const on = !q('rtBtnExit').dataset.on;
+  ratioPost({ratio_exit: on}, r => `TP por ratio ${r.ratio_exit ? 'activado' : 'desactivado'}`);
+});
+
+for (const [id, dir] of [['rtBtnShort', 'SHORT'], ['rtBtnLong', 'LONG']]) {
+  q(id).addEventListener('click', async () => {
+    const on = !!q(id).dataset.on;                       // activo ahora → se va a bloquear
+    const msg = on ? `¿Desactivar ${dir} en el bot de ratio? No abrirá entradas nuevas de ese lado (las abiertas siguen hasta su TP/SL).`
+                   : `¿Activar ${dir} en el bot de ratio?` + (dir === 'LONG' ? ' Pasará a vigilar también los símbolos con 24 h ≤ −X % (perdedores).' : '');
+    if (!confirm(msg)) return;
+    try { const r = await post('/api/block', {engine: 'ratio', direction: dir, blocked: on}); if (!r.ok) alert(r.error); } catch (e) { alert(e); }
+    refresh();
+  });
+}
+
+refresh();
+</script>
+</body>
+</html>"""
+
+PAGE = HTML.replace("__POLL_MS__", str(STATUS_POLL_MS)).encode("utf-8")
+PAGE_ETAG = hashlib.sha1(PAGE).hexdigest()[:16]
 
 
 if __name__ == "__main__":

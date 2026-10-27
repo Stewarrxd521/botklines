@@ -6,16 +6,16 @@ Servicio web para Render que vigila los perpetuos USDT que más se mueven en 24 
 
 | Archivo | Qué hace |
 | --- | --- |
-| `app.py` | Bots, API Flask y persistencia de ajustes. |
-| `web/index.html` | Panel web (tema claro / oscuro / automático). |
-| `strategy.py` | Reglas puras (señal, TP/SL, PnL, tamaño), con pruebas en `tests/`. |
+| `app.py` | Todo el bot: estrategia (reglas puras, con pruebas en `tests/`), bots, API Flask y panel web (tema claro / oscuro / automático). |
 | `WS.py` | Precio en vivo por WebSocket, solo de los símbolos con posición abierta. |
+| `KlineWebSocketCache_v4.py` | Caché de velas (versión anterior, no la usa `app.py`). |
 | `kline_ws.py` | Velas 1m por WebSocket (solo si los bots de velas están activos). |
 | `state_store.py` | Copia en disco de posiciones e historial para recuperarse tras un reinicio. |
 
 ## Bot de ratio de top traders
 
-1. **Vigilados**: perpetuos con variación 24 h ≥ +20 % (`RATIO_WATCH_MIN_PCT`). Con LONG activo, también los ≤ −20 %.
+1. **Exploración por WebSocket**: en cada ciclo de 5 min se abre `!miniTicker@arr` durante 30 s (`TICKER_SCAN_S`) y se lee el 24 h de todo el mercado. La misma exploración descubre los símbolos: una vez al día la lista se rehace (salen los deslistados) y entre medias se añaden los nuevos; se guarda en `KNOWN_SYMBOLS_FILE`.
+   **Vigilados**: los perpetuos con variación 24 h ≥ +20 % (`RATIO_WATCH_MIN_PCT`, editable en la web). Con LONG activo, también los ≤ −20 %.
 2. **Entrada**: cada 5 min se consulta el ratio de cuentas de los top traders de cada vigilado. Si cae entre 25 % y 30 % de un punto de 5 min al siguiente → **SHORT** (LONG es el espejo: el ratio sube en un perdedor).
 3. **Salida** (lo que llegue antes):
    - **Take profit por precio**: **+10 %** a favor desde la entrada (`RATIO_TP_PCT`).
@@ -38,9 +38,9 @@ El tráfico de red venía casi todo de streams de *todo el mercado* abiertos las
 | Antes | Ahora |
 | --- | --- |
 | `!markPrice@arr@1s` + `!ticker@arr` en `WS.py` (~250 KB/s siempre) | Apagados por defecto (`WS_ALL_MARKET`, `WS_ALL_TICKER`). |
-| `!miniTicker@arr` abierto siempre para el 24 h (~80 KB/s) | Una petición REST gzip a `/fapi/v1/ticker/24hr` por ciclo de 5 min (`TICKER_MODE=rest`). Si falla, una foto de 4 s por WebSocket. |
+| `!miniTicker@arr` abierto siempre para el 24 h (~80 KB/s) | Exploración de 30 s por WebSocket en cada ciclo de 5 min (`TICKER_MODE=scan`, ~10 % del tráfico; `ws` = abierto siempre). |
 | `bookTicker` de cada vigilado, sin darlo de baja nunca | Precio en vivo **solo** de los símbolos con posición, con `markPrice@1s` (1 msg/s); se da de baja al cerrar. Los bots de velas usan `bookTicker`. |
-| REST sin comprimir (`exchangeInfo` ≈ 1,5 MB en cada arranque) | Todo el REST pide gzip (~5-10× menos). |
+| REST sin comprimir (`exchangeInfo` ≈ 1,5 MB en cada arranque) | Solo queda REST para el ratio (no existe por WebSocket) y para los filtros de cantidad de `exchangeInfo` (al arrancar, caché de 12 h, o si aparece un símbolo nuevo), todo con gzip. |
 | Panel: estado completo de los 3 bots cada 1,5 s, sin comprimir | Cada 3 s, gzip, solo el detalle del bot que se ve, y pausa con la pestaña oculta. La página tiene ETag (recarga = 304). |
 | Executor: `GET /api/state` cada 20 s por hilo | `HEAD` (sin cuerpo). |
 
@@ -180,7 +180,9 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 | `RATIO_SL_PCT` | `5` | Bot de ratio: stop loss por precio, % en contra (0 = sin SL). |
 | `RATIO_EXIT_BY_RATIO` | `true` | Bot de ratio: cerrar también cuando el ratio recupera el % que cayó. |
 | `KLINE_BOTS_ENABLED` | `false` | Activa los dos bots de velas 1m (abre el stream de velas). |
-| `TICKER_MODE` | `rest` | 24 h por REST cada 5 min (`rest`) o WebSocket continuo (`ws`). |
+| `TICKER_MODE` | `scan` | 24 h por WebSocket: exploración cada 5 min (`scan`) o abierto siempre (`ws`). |
+| `TICKER_SCAN_S` | `30` | Segundos de cada exploración del mercado. |
+| `SYMBOL_SCAN_HOURS` | `24` | Cada cuánto la exploración rehace la lista de símbolos. |
 | `WS_SYMBOL_STREAM` | auto | Stream de precio por posición: `markPrice@1s` (solo ratio) o `bookTicker` (con velas). |
 | `WS_ALL_MARKET` / `WS_ALL_TICKER` | `false` | Streams de todo el mercado en `WS.py` (mucho tráfico). |
 | `STATUS_POLL_MS` | `3000` | Intervalo de consulta del panel. |
@@ -216,4 +218,4 @@ python -m pytest tests
 
 ## Deploy en Render
 
-`render.yaml` define el servicio y las variables. El código de la estrategia está en `strategy.py` (funciones puras, con pruebas en `tests/test_strategy.py`), los bots y la API en `app.py` y el panel en `web/index.html`.
+`render.yaml` define el servicio y las variables. La estrategia, los bots, la API y el panel están en `app.py` (las reglas puras tienen pruebas en `tests/test_strategy.py`).
