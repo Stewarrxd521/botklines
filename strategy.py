@@ -3,7 +3,8 @@ strategy.py — Reglas puras de la estrategia (sin red ni estado), fáciles de p
 
   Señal   cuerpo de la última vela 1m cerrada = (cierre - apertura) / apertura.
           ≥ +UMBRAL% → LONG  |  ≤ -UMBRAL% → SHORT (se sigue la tendencia).
-  Salida  el precio avanza TP% a favor desde la entrada. Sin stop loss.
+  Salida  el precio avanza TP% a favor desde la entrada. Sin stop loss
+          (el bot de ratio usa además TP y SL fijos en %: tp_sl_prices / price_exit).
   Modo invertido (botón de la web): la señal va AL REVÉS (vela verde → SHORT,
           roja → LONG) y el mismo % funciona como STOP LOSS; no hay TP.
   Fees    el PnL neto resta la comisión de entrada y la de salida
@@ -79,6 +80,22 @@ def exit_hit(price: float, target: float, direction: str, inverted: bool = False
     if inverted:
         return down if direction == LONG else up
     return up if direction == LONG else down
+
+
+def tp_sl_prices(entry: float, direction: str, tp_pct: float, sl_pct: float) -> Tuple[float, float]:
+    """(precio de TP, precio de SL) con TP/SL fijos en % de la entrada. 0 % = apagado (precio 0)."""
+    tp = take_profit_price(entry, direction, tp_pct) if tp_pct > 0 and entry > 0 else 0.0
+    sl = stop_loss_price(entry, direction, sl_pct) if 0 < sl_pct < 100 and entry > 0 else 0.0
+    return tp, sl
+
+
+def price_exit(price: float, direction: str, tp_price: float, sl_price: float) -> Optional[str]:
+    """"TP", "SL" o None según el precio haya tocado el take profit o el stop loss."""
+    if exit_hit(price, sl_price, direction, inverted=True):
+        return "SL"
+    if exit_hit(price, tp_price, direction):
+        return "TP"
+    return None
 
 
 def take_profit_hit(price: float, entry: float, direction: str, tp_pct: float) -> bool:

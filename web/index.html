@@ -1,0 +1,806 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>BOTKLINE · panel</title>
+<script>
+  // Tema antes de pintar (sin parpadeo): auto (sistema) | light | dark.
+  (function () { try { var t = localStorage.getItem('botkline_theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch (e) {} })();
+</script>
+<style>
+  :root {
+    --bg:#f4f6fb; --surface:#ffffff; --surface-2:#f7f8fc; --surface-3:#eef1f8; --line:#e3e7f0; --line-strong:#d3d9e6;
+    --txt:#0f172a; --muted:#64748b; --faint:#94a3b8;
+    --accent:#4f46e5; --accent-soft:rgba(79,70,229,.10); --accent-txt:#ffffff;
+    --green:#059669; --green-soft:rgba(5,150,105,.10); --red:#dc2626; --red-soft:rgba(220,38,38,.09);
+    --amber:#b45309; --amber-soft:rgba(217,119,6,.12);
+    --shadow:0 1px 2px rgba(15,23,42,.04), 0 4px 16px rgba(15,23,42,.05);
+    --radius:16px; --radius-sm:10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:#0b0f17; --surface:#121826; --surface-2:#0f1420; --surface-3:#1a2233; --line:#222b3d; --line-strong:#2d384e;
+      --txt:#e6eaf2; --muted:#8a96ad; --faint:#5f6b82;
+      --accent:#818cf8; --accent-soft:rgba(129,140,248,.14); --accent-txt:#0b0f17;
+      --green:#34d399; --green-soft:rgba(52,211,153,.12); --red:#f87171; --red-soft:rgba(248,113,113,.12);
+      --amber:#fbbf24; --amber-soft:rgba(251,191,36,.13);
+      --shadow:0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.25);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg:#0b0f17; --surface:#121826; --surface-2:#0f1420; --surface-3:#1a2233; --line:#222b3d; --line-strong:#2d384e;
+    --txt:#e6eaf2; --muted:#8a96ad; --faint:#5f6b82;
+    --accent:#818cf8; --accent-soft:rgba(129,140,248,.14); --accent-txt:#0b0f17;
+    --green:#34d399; --green-soft:rgba(52,211,153,.12); --red:#f87171; --red-soft:rgba(248,113,113,.12);
+    --amber:#fbbf24; --amber-soft:rgba(251,191,36,.13);
+    --shadow:0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.25);
+  }
+  * { box-sizing:border-box; }
+  html { -webkit-text-size-adjust:100%; }
+  body { margin:0; background:var(--bg); color:var(--txt);
+         font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+         font-variant-numeric:tabular-nums; transition:background .2s,color .2s; }
+  main { max-width:1280px; margin:0 auto; padding:20px 16px 48px; }
+  a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
+  .muted { color:var(--muted); } .faint { color:var(--faint); }
+  .pos { color:var(--green); } .neg { color:var(--red); } .warn { color:var(--amber); }
+  small { font-size:12px; }
+
+  /* Cabecera */
+  header.top { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; margin-bottom:6px; }
+  .brand { display:flex; align-items:center; gap:10px; }
+  .logo { width:34px; height:34px; border-radius:10px; background:linear-gradient(135deg,var(--accent),#22d3ee);
+          display:grid; place-items:center; color:#fff; font-weight:800; font-size:15px; box-shadow:var(--shadow); }
+  .brand h1 { font-size:18px; margin:0; letter-spacing:.2px; }
+  .brand p { margin:0; font-size:12px; color:var(--muted); }
+  .head-r { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .pills { display:flex; flex-wrap:wrap; gap:6px; }
+  .pill { display:inline-flex; align-items:center; gap:6px; border:1px solid var(--line); background:var(--surface);
+          border-radius:999px; padding:3px 10px; font-size:12px; color:var(--muted); }
+  .pill::before { content:''; width:7px; height:7px; border-radius:50%; background:var(--faint); }
+  .pill.ok::before { background:var(--green); } .pill.bad::before { background:var(--red); } .pill.alert::before { background:var(--amber); }
+  .pill.ok { color:var(--txt); } .pill.bad { color:var(--red); } .pill.alert { color:var(--amber); }
+  #rules { margin:6px 0 16px; font-size:13px; }
+  .icon-btn { background:var(--surface); color:var(--txt); border:1px solid var(--line); border-radius:10px;
+              padding:6px 10px; font-weight:600; font-size:12px; }
+  .icon-btn:hover { background:var(--surface-3); filter:none; }
+
+  /* Cifras */
+  .kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; margin-bottom:16px; }
+  .kpi { background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); padding:14px 16px; box-shadow:var(--shadow); }
+  .kpi .label { color:var(--muted); font-size:12px; font-weight:500; }
+  .kpi .v { font-size:22px; font-weight:700; margin-top:4px; letter-spacing:-.3px; }
+  .bar { height:6px; background:var(--surface-3); border-radius:99px; overflow:hidden; margin-top:10px; }
+  .bar > i { display:block; height:100%; width:0; background:linear-gradient(90deg,var(--green),#22d3ee); transition:width .4s; }
+
+  /* Secciones plegables */
+  details.panel { background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); margin-bottom:12px; box-shadow:var(--shadow); }
+  details.panel > summary { list-style:none; cursor:pointer; padding:14px 18px; font-weight:650; font-size:15px;
+                            display:flex; gap:8px; align-items:center; flex-wrap:wrap; user-select:none; }
+  details.panel > summary::-webkit-details-marker { display:none; }
+  details.panel > summary::before { content:''; width:7px; height:7px; border-right:2px solid var(--muted); border-bottom:2px solid var(--muted);
+                                    transform:rotate(-45deg); transition:transform .15s; margin-right:4px; }
+  details.panel[open] > summary::before { transform:rotate(45deg); }
+  details.panel > summary .hint { font-weight:400; font-size:12px; color:var(--muted); }
+  details.panel > summary .badge { margin-left:auto; }
+  .body { padding:0 18px 16px; }
+  .badge { background:var(--surface-3); border-radius:999px; padding:1px 10px; font-size:12px; font-weight:600; color:var(--muted); }
+
+  /* Tarjetas de bots */
+  .bots { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:12px; }
+  .bot { background:var(--surface-2); border:1px solid var(--line); border-radius:14px; padding:14px; }
+  .bot.sel { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
+  .bot.paused { border-style:dashed; }
+  .bot h3 { margin:0; font-size:15px; display:flex; align-items:center; gap:8px; }
+  .bot .rows { display:grid; grid-template-columns:repeat(4,1fr); gap:8px 6px; margin:12px 0; }
+  .bot .rows div { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.3px; }
+  .bot .rows b { display:block; color:var(--txt); font-size:14px; text-transform:none; letter-spacing:0; }
+  .bot .acts { display:flex; gap:6px; flex-wrap:wrap; }
+
+  /* Tablas */
+  .scroll { overflow:auto; max-height:440px; border:1px solid var(--line); border-radius:var(--radius-sm); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { padding:8px 10px; border-bottom:1px solid var(--line); text-align:right; white-space:nowrap; }
+  th:first-child, td:first-child { text-align:left; }
+  tbody tr:last-child td { border-bottom:0; }
+  thead th { position:sticky; top:0; background:var(--surface-3); color:var(--muted); font-weight:600; font-size:12px; z-index:1; }
+  tbody tr:hover td { background:var(--accent-soft); }
+  .tag { padding:2px 8px; border-radius:6px; font-weight:700; font-size:11px; letter-spacing:.3px; }
+  .LONG { background:var(--green-soft); color:var(--green); } .SHORT { background:var(--red-soft); color:var(--red); }
+  .st { padding:2px 8px; border-radius:6px; font-size:11px; font-weight:700; }
+  .st.on { background:var(--green-soft); color:var(--green); } .st.off { background:var(--amber-soft); color:var(--amber); }
+
+  /* Formularios y botones */
+  form, .row { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; }
+  input { flex:1 1 200px; background:var(--surface-2); color:var(--txt); border:1px solid var(--line-strong); border-radius:10px;
+          padding:9px 11px; font:inherit; outline:none; transition:border-color .15s, box-shadow .15s; }
+  input:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
+  label.f { flex:1 1 190px; display:flex; flex-direction:column; gap:5px; font-size:12px; color:var(--muted); font-weight:500; }
+  label.f input { flex:none; }
+  button { background:var(--accent); color:var(--accent-txt); border:1px solid transparent; border-radius:10px; padding:9px 15px;
+           cursor:pointer; font:inherit; font-weight:650; transition:filter .15s, background .15s; }
+  button:hover { filter:brightness(1.07); }
+  button.ghost { background:var(--surface-3); color:var(--txt); border-color:var(--line); }
+  button.danger { background:var(--red); color:#fff; }
+  button.ok { background:var(--green); color:#fff; }
+  button.warnb { background:var(--amber); color:#fff; }
+  :root[data-theme="dark"] button.ok, :root[data-theme="dark"] button.warnb, :root[data-theme="dark"] button.danger { color:#0b0f17; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) button.ok, :root:not([data-theme="light"]) button.warnb,
+                                        :root:not([data-theme="light"]) button.danger { color:#0b0f17; } }
+  button.small { padding:5px 11px; font-size:12px; }
+  .msg { margin-top:8px; min-height:18px; font-size:13px; }
+  .sub { font-size:12px; font-weight:700; margin:18px 0 10px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; }
+  .grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:16px; }
+  .card-in { background:var(--surface-2); border:1px solid var(--line); border-radius:14px; padding:14px; }
+  .card-in h4 { margin:0 0 10px; font-size:13px; }
+
+  /* Pestañas */
+  .tabs { display:flex; gap:6px; flex-wrap:wrap; position:sticky; top:0; z-index:5; background:color-mix(in srgb, var(--bg) 88%, transparent);
+          backdrop-filter:blur(8px); padding:10px 0; margin:8px 0 4px; }
+  .tabs button { background:var(--surface); color:var(--txt); border:1px solid var(--line); padding:8px 14px; font-weight:600; }
+  .tabs button.on { background:var(--accent); color:var(--accent-txt); border-color:var(--accent); }
+  .tabs button.on .pos, .tabs button.on .neg { color:inherit; }
+  .tabs button * { pointer-events:none; }
+  #engHint { margin:0 0 12px; font-size:13px; }
+  pre { margin:0; max-height:340px; overflow:auto; font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; color:var(--muted);
+        white-space:pre-wrap; background:var(--surface-2); border:1px solid var(--line); border-radius:var(--radius-sm); padding:12px; }
+  .netgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:8px; }
+  .netgrid div { background:var(--surface-2); border:1px solid var(--line); border-radius:10px; padding:10px 12px; font-size:12px; color:var(--muted); }
+  .netgrid b { display:block; font-size:15px; color:var(--txt); }
+  @media (max-width:640px) { .bot .rows { grid-template-columns:repeat(2,1fr); } .kpi .v { font-size:19px; } }
+</style>
+</head>
+<body>
+<main>
+  <header class="top">
+    <div class="brand">
+      <div class="logo">BK</div>
+      <div><h1>BOTKLINE</h1><p>ratio top traders · short a los que más suben</p></div>
+    </div>
+    <div class="head-r">
+      <div class="pills" id="pills"></div>
+      <button type="button" class="icon-btn" id="btnTheme" title="Tema claro / oscuro">Tema</button>
+    </div>
+  </header>
+  <div class="muted" id="rules"></div>
+
+  <section class="kpis">
+    <div class="kpi"><div class="label">PnL de la sesión <span id="sessTarget"></span></div><div class="v" id="sessPnl">—</div>
+      <div class="bar"><i id="sessBar"></i></div><small class="muted" id="sessDetail"></small></div>
+    <div class="kpi"><div class="label">PnL realizado (total)</div><div class="v" id="sRpnlAll">—</div><small class="muted" id="sWins"></small></div>
+    <div class="kpi"><div class="label">PnL abierto (total)</div><div class="v" id="sUpnlAll">—</div></div>
+    <div class="kpi"><div class="label">Posiciones abiertas</div><div class="v" id="sOpen">—</div><small class="muted" id="sOpenLim"></small></div>
+    <div class="kpi"><div class="label" id="kKlLabel">Vigilados (24 h)</div><div class="v" id="sKl">—</div><small class="muted" id="sEval"></small></div>
+  </section>
+
+  <details class="panel" data-key="control" open>
+    <summary>Control <span class="hint">pausar bots, invertir, cerrar todo, objetivo y límite</span></summary>
+    <div class="body">
+      <div class="bots" id="bots"></div>
+
+      <div class="sub">Acciones para todos los bots</div>
+      <div class="row">
+        <button type="button" id="btnInvert">—</button>
+        <button type="button" class="danger" id="btnCloseAll">Cerrar TODAS las posiciones</button>
+        <button type="button" id="btnExPause">—</button>
+        <button type="button" class="ghost" id="btnReset">Poner a cero el PnL de la sesión</button>
+      </div>
+      <div class="muted" id="modeHint" style="margin-top:8px"></div>
+      <div class="muted" id="sessHits" style="margin-top:4px"></div>
+
+      <div class="sub">Ajustes</div>
+      <form id="glbForm">
+        <label class="f">Objetivo en USD para cerrar todo (0 = apagado) <span id="curTarget"></span>
+          <input id="glbTarget" type="number" step="0.01" min="0" placeholder="ej. 12"></label>
+        <label class="f">Límite de posiciones abiertas (0 = sin límite) <span id="curMax"></span>
+          <input id="glbMax" type="number" step="1" min="0" placeholder="ej. 10"></label>
+        <label class="f">Fee % por lado <span id="curFee"></span>
+          <input id="glbFee" type="number" step="0.001" min="0" max="1" placeholder="ej. 0.05"></label>
+        <button type="submit">Guardar</button>
+      </form>
+      <div class="row" style="margin-top:10px" id="tokenRow">
+        <input id="exToken" type="password" placeholder="Token admin (si está configurado)" autocomplete="off" style="display:none;max-width:320px">
+      </div>
+      <div id="glbMsg" class="muted msg"></div>
+    </div>
+  </details>
+
+  <details class="panel" data-key="ratio" open>
+    <summary>Ratio top traders <span class="hint" id="rtSum"></span> <span class="badge" id="rtN">0</span></summary>
+    <div class="body">
+      <div class="muted" id="rtInfo" style="font-size:13px"></div>
+      <div class="grid2" style="margin-top:14px">
+        <div class="card-in">
+          <h4>Salida de las operaciones <span class="muted" style="font-weight:400">· se aplica también a las abiertas</span></h4>
+          <form id="rtExitForm">
+            <label class="f">Take profit, % a favor <span id="rtCurTp"></span>
+              <input id="rtTp" type="number" step="0.1" min="0" max="1000" placeholder="ej. 10 (0 = sin TP)"></label>
+            <label class="f">Stop loss, % en contra <span id="rtCurSl"></span>
+              <input id="rtSl" type="number" step="0.1" min="-99.9" max="99.9" placeholder="ej. -5 (0 = sin SL)"></label>
+            <button type="submit">Guardar</button>
+          </form>
+          <div class="row" style="margin-top:10px">
+            <button type="button" id="rtBtnExit">—</button>
+            <span class="muted" style="font-size:12px">TP por ratio: cierra cuando el ratio recupera el mismo % que cayó.</span>
+          </div>
+        </div>
+        <div class="card-in">
+          <h4>Entrada</h4>
+          <form id="rtForm">
+            <label class="f">Vigilar 24 h ≥ ±% <span id="rtCurW"></span>
+              <input id="rtWatch" type="number" step="0.1" min="0.1" max="1000" placeholder="ej. 20"></label>
+            <label class="f">Caída mín. del ratio, % <span id="rtCurMin"></span>
+              <input id="rtMin" type="number" step="0.1" min="0.1" max="100" placeholder="ej. 25"></label>
+            <label class="f">Caída máx. del ratio, % <span id="rtCurMax"></span>
+              <input id="rtMax" type="number" step="0.1" min="0.1" max="100" placeholder="ej. 30"></label>
+            <button type="submit">Guardar</button>
+          </form>
+          <div class="row" style="margin-top:10px">
+            <button type="button" id="rtBtnShort">SHORT</button>
+            <button type="button" id="rtBtnLong">LONG</button>
+          </div>
+          <div class="muted" style="font-size:12px;margin-top:6px">SHORT: ganadores (24 h ≥ +X %), el ratio cae. LONG (espejo): perdedores (24 h ≤ −X %), el ratio sube.</div>
+        </div>
+      </div>
+      <div id="rtMsg" class="muted msg"></div>
+      <div class="scroll"><table>
+        <thead><tr><th>Símbolo</th><th>24 h</th><th>Precio</th><th>Ratio antes</th><th>Ratio ahora</th><th>Cambio</th><th>Dato</th><th>Lado</th><th>Estado</th></tr></thead>
+        <tbody id="tRt"></tbody></table></div>
+    </div>
+  </details>
+
+  <div class="tabs" id="tabs"></div>
+  <div class="muted" id="engHint"></div>
+
+  <details class="panel" data-key="pos" open>
+    <summary>Posiciones abiertas · <span class="engName"></span> <span class="badge" id="nPos">0</span></summary>
+    <div class="body">
+      <div class="row" style="margin-bottom:10px;align-items:center">
+        <span class="muted" id="engPnl"></span>
+        <button type="button" class="danger small" id="btnCloseEng" style="margin-left:auto">Cerrar todas las de este bot</button>
+      </div>
+      <div class="scroll"><table>
+        <thead><tr><th>Símbolo</th><th>Dir.</th><th id="thPosSig">Vela</th><th>Entrada</th><th>Precio</th><th>Avance</th><th>Salida</th><th>Notional</th><th>PnL neto</th><th>MFE</th><th>MAE</th><th>Abierta</th><th></th></tr></thead>
+        <tbody id="tPos"></tbody></table></div>
+    </div>
+  </details>
+
+  <details class="panel" data-key="cfg">
+    <summary>Parámetros · <span class="engName"></span> <span class="hint" id="cfgSum"></span></summary>
+    <div class="body">
+      <div class="muted">Señal actual: <b id="cfgThr">—</b> · <span id="cfgTpLbl">TP</span> actual: <b id="cfgTp">—</b> · <span id="engLat"></span></div>
+      <form id="cfgForm" style="margin-top:12px">
+        <input id="cfgNewThr" type="number" step="0.01" min="0.01" max="100" placeholder="% cuerpo de vela para entrar (ej. 3)">
+        <input id="cfgNewTp" type="number" step="0.01" min="0.01" max="100" placeholder="% take profit (normal) / stop loss (invertido)">
+        <button type="submit">Guardar</button>
+      </form>
+      <div id="cfgMsg" class="muted msg"></div>
+      <div class="row" style="align-items:center">
+        <button type="button" id="btnLong" data-block="LONG">LONG</button>
+        <button type="button" id="btnShort" data-block="SHORT">SHORT</button>
+        <span class="muted">Solo afecta a este bot. Bloquear frena las entradas nuevas de esa dirección.</span>
+      </div>
+    </div>
+  </details>
+
+  <details class="panel" data-key="sig">
+    <summary>Señales recientes · <span class="engName"></span> <span class="badge" id="nSig">0</span></summary>
+    <div class="body"><div class="scroll"><table>
+      <thead><tr><th>Hora</th><th>Símbolo</th><th>Dir.</th><th id="thSigC">Vela</th><th id="thSigB">Cuerpo</th><th id="thSigS">Segundo</th><th>Acción</th></tr></thead>
+      <tbody id="tSig"></tbody></table></div></div>
+  </details>
+
+  <details class="panel" data-key="closed">
+    <summary>Operaciones cerradas · <span class="engName"></span> <span class="badge" id="nClosed">0</span></summary>
+    <div class="body"><div class="scroll"><table>
+      <thead><tr><th>Cierre</th><th>Símbolo</th><th>Dir.</th><th>Entrada</th><th>Salida</th><th>Avance</th><th>PnL neto</th><th>Fees</th><th>MFE</th><th>MAE</th><th>Duración</th><th>Motivo</th></tr></thead>
+      <tbody id="tClosed"></tbody></table></div>
+      <small class="muted">Se muestran los 50 últimos; el historial completo está en el CSV.</small></div>
+  </details>
+
+  <details class="panel" data-key="exc">
+    <summary>MFE / MAE de las cerradas · <span class="engName"></span> <a id="csvLink" class="hint" href="/api/trades.csv" onclick="event.stopPropagation()">descargar CSV</a></summary>
+    <div class="body"><div class="scroll"><table>
+      <thead><tr><th>Dirección</th><th>Ops</th><th>Ganadas</th><th>MFE medio</th><th>MAE medio</th><th>Mejor MFE</th><th>Peor MAE</th><th>MAE medio USD</th><th>Hasta MAE</th><th>Duración media</th></tr></thead>
+      <tbody id="tExc"></tbody></table></div></div>
+  </details>
+
+  <details class="panel" data-key="eval">
+    <summary>Evaluaciones <span class="hint">cuerpo al cierre, con el umbral de <span class="engName"></span></span></summary>
+    <div class="body">
+      <div class="sub" style="margin-top:0">Mayores cuerpos de la vela <span id="evMin"></span></div>
+      <div class="scroll"><table>
+        <thead><tr><th>Símbolo</th><th>Apertura</th><th>Cierre</th><th>Cuerpo</th><th>Señal</th></tr></thead>
+        <tbody id="tTop"></tbody></table></div>
+      <div class="sub">Por minuto</div>
+      <div class="scroll"><table>
+        <thead><tr><th>Vela</th><th>Evaluadas</th><th>≥ umbral (LONG)</th><th>≤ −umbral (SHORT)</th><th>Mayor subida</th><th>Mayor caída</th></tr></thead>
+        <tbody id="tMin"></tbody></table></div>
+    </div>
+  </details>
+
+  <details class="panel" data-key="exec">
+    <summary>Executor <span class="hint" id="exSum"></span></summary>
+    <div class="body">
+      <div class="muted">Actual: <b id="exUrl">—</b> · enviadas <span id="exSent">0</span> · errores <span id="exErr">0</span></div>
+      <div class="muted" id="exLat" style="margin-top:4px"></div>
+      <form id="exForm" style="margin-top:12px">
+        <input id="exNew" type="url" placeholder="https://mi-executor.onrender.com" autocomplete="off">
+        <input id="exSecret" type="password" placeholder="Secreto (opcional, vacío = mantener)" autocomplete="off">
+        <button type="submit">Cambiar link</button>
+      </form>
+      <div id="exMsg" class="muted msg"></div>
+    </div>
+  </details>
+
+  <details class="panel" data-key="net">
+    <summary>Red <span class="hint" id="netSum"></span></summary>
+    <div class="body">
+      <div class="netgrid" id="netGrid"></div>
+      <div class="muted" style="font-size:12px;margin-top:8px">Bytes desde el arranque del servicio. «Entrada» es lo que el bot descarga de Binance; «Web» es lo que el panel y la API envían (ya comprimido). El panel deja de consultar cuando la pestaña está oculta.</div>
+    </div>
+  </details>
+
+  <details class="panel" data-key="events">
+    <summary>Eventos <span class="hint">todos los bots</span></summary>
+    <div class="body"><pre id="events"></pre></div>
+  </details>
+</main>
+<script>
+const POLL_MS = __POLL_MS__;
+const q = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const num = (v, d=4) => (v === null || v === undefined || isNaN(v)) ? '—' : (+v).toLocaleString('es', {maximumFractionDigits:d});
+const pct = v => `<span class="${v >= 0 ? 'pos' : 'neg'}">${v >= 0 ? '+' : ''}${(+v).toFixed(2)}%</span>`;
+const usd = v => `<span class="${v >= 0 ? 'pos' : 'neg'}">${v >= 0 ? '+' : ''}${(+v).toFixed(4)}</span>`;
+const dur = s => { s = Math.floor(s); const h = Math.floor(s/3600), m = Math.floor(s%3600/60);
+                   return h ? `${h}h ${m}m` : m ? `${m}m ${s%60}s` : `${s}s`; };
+const bytes = b => b >= 1073741824 ? (b/1073741824).toFixed(2) + ' GB' : b >= 1048576 ? (b/1048576).toFixed(1) + ' MB' : (b/1024).toFixed(0) + ' KB';
+const tag = d => `<span class="tag ${esc(d)}">${esc(d)}</span>`;
+const store = {get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } },
+               set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }};
+let cur = store.get('botkline_engine', 'ratio'), last = null;
+q('exToken').value = store.get('botkline_token', '');
+
+// Tema: auto → claro → oscuro.
+const THEMES = ['auto', 'light', 'dark'], THEME_LABEL = {auto: 'Tema: auto', light: 'Tema: claro', dark: 'Tema: oscuro'};
+function applyTheme(t) {
+  if (t === 'auto') delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t;
+  q('btnTheme').textContent = THEME_LABEL[t];
+}
+let theme = store.get('botkline_theme', 'auto'); if (!THEMES.includes(theme)) theme = 'auto';
+applyTheme(theme);
+q('btnTheme').addEventListener('click', () => {
+  theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+  store.set('botkline_theme', theme); applyTheme(theme);
+});
+
+// Secciones plegables: se recuerda cuáles están abiertas.
+const folds = JSON.parse(store.get('botkline_folds', '{}') || '{}');
+document.querySelectorAll('details.panel').forEach(d => {
+  const k = d.dataset.key;
+  if (k in folds) d.open = folds[k];
+  d.addEventListener('toggle', () => { folds[k] = d.open; store.set('botkline_folds', JSON.stringify(folds)); });
+});
+
+function headers() {
+  const h = {'Content-Type': 'application/json'};
+  const t = q('exToken').value.trim();
+  if (t) h['X-Admin-Token'] = t;
+  return h;
+}
+async function post(url, body) {
+  store.set('botkline_token', q('exToken').value.trim());
+  const r = await fetch(url, {method: 'POST', headers: headers(), body: JSON.stringify(body || {})});
+  return r.json();
+}
+
+// Consulta del estado: solo con la pestaña visible y sin solapar peticiones.
+let timer = null, inflight = false, again = false;
+async function refresh() {
+  clearTimeout(timer);
+  if (inflight) { again = true; return; }             // ya hay una en curso: se repite al terminar
+  inflight = true;
+  try {
+    const r = await fetch('/api/status?engine=' + encodeURIComponent(cur), {cache: 'no-store'});
+    last = await r.json();
+    render(last);
+  } catch (e) { /* sin conexión: se reintenta en el siguiente ciclo */ }
+  finally { inflight = false; }
+  if (again) { again = false; return refresh(); }
+  if (!document.hidden) timer = setTimeout(refresh, POLL_MS);
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); else clearTimeout(timer); });
+
+function shown(d, n) {
+  // Los bots de velas solo se muestran si sus velas están activas o tienen operaciones.
+  const b = d.engines[n];
+  return n === 'ratio' || d.klines.enabled || b.positions.length || b.closed_count;
+}
+
+function render(d) {
+  const c = d.config, g = d.global, names = Object.keys(d.engines).filter(n => shown(d, n));
+  if (!names.includes(cur)) cur = names[0];
+  const e = d.engines[cur], ec = e.config, xk = g.inverted ? 'SL' : 'TP';
+  if (!e.detail) { again = true; return; }            // llegó el detalle de otro bot: se pide el bueno
+  const all = Object.keys(d.engines);
+  const sum = f => all.reduce((s, n) => s + f(d.engines[n]), 0);
+  const isRatio = cur === 'ratio';
+  const r = d.ratio || {}, rc = r.cfg || {};
+
+  // Cabecera
+  const k = d.klines, p = d.persistence || {}, x = d.executor;
+  q('pills').innerHTML = [
+    ...(k.enabled ? [`<span class="pill ${g.inverted ? 'alert' : 'ok'}">${g.inverted ? 'Modo INVERTIDO' : 'Modo normal'}</span>`] : []),
+    ...names.map(n => `<span class="pill ${d.engines[n].config.paused ? 'alert' : 'ok'}">${esc(d.engines[n].label)}: ${d.engines[n].config.paused ? 'pausado' : 'en marcha'}</span>`),
+    ...(k.enabled ? [`<span class="pill ${k.active ? 'ok' : 'bad'}">Velas ${k.active ? 'conectadas' : 'desconectadas'}</span>`] : []),
+    ...(d.ratio ? [`<span class="pill ${r.ticker_connected ? 'ok' : 'bad'}">24 h ${r.ticker_connected ? 'ok' : 'sin datos'}</span>`,
+                   `<span class="pill ${r.rest_blocked_s > 0 ? 'bad' : 'ok'}">Ratio REST ${r.rest_blocked_s > 0 ? 'en pausa' : 'ok'}</span>`] : []),
+    `<span class="pill ${!x.url ? 'bad' : g.executor_paused ? 'alert' : (x.errors && x.last_error ? 'alert' : 'ok')}">Executor ${!x.url ? 'sin link' : g.executor_paused ? 'PAUSADO (prueba)' : 'activo'}</span>`,
+    `<span class="pill ${p.mode === 'ok' || p.mode === 'local' ? 'ok' : 'alert'}">Estado ${esc(p.mode)}</span>`,
+  ].join('');
+  const exitTxt = [rc.tp_pct > 0 ? `TP +${rc.tp_pct}%` : 'sin TP', rc.sl_pct > 0 ? `SL −${rc.sl_pct}%` : 'sin SL',
+                   rc.ratio_exit ? 'TP por ratio' : ''].filter(Boolean).join(' · ');
+  q('rules').textContent = d.ratio
+    ? `Ratio top traders: vigila 24 h ≥ ±${rc.watch_min_pct}% · SHORT si el ratio cae ${rc.drop_min_pct}–${rc.drop_max_pct}% en 5 min · salida: ${exitTxt} · ${c.notional} USDT por entrada · fee ${g.fee_pct}% por lado`
+    : `Cuerpo de la vela 1m ≥ umbral → ${g.inverted ? 'entra CONTRA la vela · el % es stop loss' : 'sigue la tendencia · el % es take profit'} · ${c.notional} USDT por entrada · fee ${g.fee_pct}% por lado`;
+
+  // Cifras
+  q('sessPnl').innerHTML = usd(g.session_pnl);
+  q('sessTarget').textContent = g.profit_target_usd > 0 ? `· objetivo +${g.profit_target_usd} USD` : '· objetivo apagado';
+  q('sessBar').style.width = g.profit_target_usd > 0 ? `${Math.max(0, Math.min(100, g.session_pnl / g.profit_target_usd * 100))}%` : '0';
+  q('sessDetail').innerHTML = `realizado ${usd(g.session_realized)} + abierto ${usd(g.session_unrealized)} · desde ${esc(g.session_since)}`;
+  q('sRpnlAll').innerHTML = usd(sum(n => n.realized_pnl));
+  q('sWins').textContent = `${sum(n => n.wins)}/${sum(n => n.closed_count)} ganadas · netas de fees`;
+  q('sUpnlAll').innerHTML = usd(sum(n => n.unrealized_pnl));
+  q('sOpen').textContent = g.open_count;
+  q('sOpenLim').textContent = g.max_open > 0 ? `límite ${g.max_open}` : 'sin límite';
+  if (d.ratio) {
+    q('kKlLabel').textContent = 'Vigilados (24 h)';
+    q('sKl').textContent = r.watch_count;
+    q('sEval').textContent = `de ${r.ticker_symbols} símbolos · lista de ${r.watch_updated || '—'}`;
+  } else {
+    q('kKlLabel').textContent = 'Velas';
+    q('sKl').textContent = `${k.with_data}/${k.symbols}`;
+    q('sEval').textContent = `${k.active}/${k.connections} conexiones · ${d.eval_total.toLocaleString('es')} velas evaluadas`;
+  }
+
+  // Control
+  q('bots').innerHTML = names.map(n => { const b = d.engines[n], bc = b.config;
+    const bl = [bc.block_long && 'LONG', bc.block_short && 'SHORT'].filter(Boolean).join(', ');
+    return `<div class="bot ${n === cur ? 'sel' : ''} ${bc.paused ? 'paused' : ''}">
+      <h3>${esc(b.label)} <span class="st ${bc.paused ? 'off' : 'on'}">${bc.paused ? 'PAUSADO' : 'EN MARCHA'}</span></h3>
+      <div class="muted" style="font-size:12px;margin-top:4px">${esc(b.hint)}</div>
+      <div class="rows">
+        ${n === 'ratio' ? `<div>TP / SL<b>${rc.tp_pct > 0 ? '+' + rc.tp_pct + '%' : '—'} / ${rc.sl_pct > 0 ? '−' + rc.sl_pct + '%' : '—'}</b></div><div>Caída ratio<b>${rc.drop_min_pct}–${rc.drop_max_pct}%</b></div>`
+                        : `<div>Señal<b>±${bc.threshold_pct}%</b></div><div>${xk}<b>${bc.tp_pct}%</b></div>`}
+        <div>Abiertas<b>${b.positions.length}</b></div><div>Bloqueados<b class="${bl ? 'neg' : ''}">${bl || '—'}</b></div>
+        <div>Señales / abiertas<b>${b.signal_count} / ${b.opened_count}</b></div><div>Cerradas<b>${b.closed_count} (${b.wins} gan.)</b></div>
+        <div>PnL abierto<b>${usd(b.unrealized_pnl)}</b></div><div>PnL realizado<b>${usd(b.realized_pnl)}</b></div>
+      </div>
+      <div class="acts">
+        <button type="button" class="small ${bc.paused ? 'ok' : 'warnb'}" data-pause="${esc(n)}" data-paused="${bc.paused ? '1' : ''}">${bc.paused ? 'Reanudar' : 'Pausar'}</button>
+        <button type="button" class="small ghost" data-engine="${esc(n)}">Ver detalle</button>
+      </div></div>`; }).join('');
+  const bi = q('btnInvert');
+  bi.style.display = k.enabled ? '' : 'none';                 // el modo invertido solo afecta a los bots de velas
+  bi.dataset.inverted = g.inverted ? '1' : '';
+  bi.textContent = g.inverted ? 'Modo INVERTIDO · volver a normal' : 'Modo normal · invertir';
+  bi.className = g.inverted ? 'warnb' : 'ok';
+  const bx = q('btnExPause');
+  bx.dataset.paused = g.executor_paused ? '1' : '';
+  bx.textContent = g.executor_paused ? 'Envíos al executor PAUSADOS · reanudar' : 'Pausar entradas al executor (prueba)';
+  bx.className = g.executor_paused ? 'warnb' : 'ghost';
+  q('modeHint').textContent = (g.executor_paused ? 'MODO PRUEBA: las entradas nuevas solo se simulan aquí, no se mandan al executor. ' : '') + (k.enabled ? (g.inverted
+    ? 'Invertido (bots de velas): vela verde → SHORT, roja → LONG. El % es stop loss; no hay TP.'
+    : 'Normal (bots de velas): vela verde → LONG, roja → SHORT. El % es take profit.') : '');
+  q('sessHits').textContent = g.target_hits ? `Objetivo alcanzado ${g.target_hits} vez/veces · último: ${g.last_target || '—'}` : 'Al llegar al objetivo se cierran todas las posiciones y el contador vuelve a cero.';
+  q('curTarget').textContent = `(ahora ${g.profit_target_usd > 0 ? '+' + g.profit_target_usd : 'apagado'})`;
+  q('curMax').textContent = `(ahora ${g.max_open > 0 ? g.max_open : 'sin límite'})`;
+  q('curFee').textContent = `(ahora ${g.fee_pct}%)`;
+  q('exToken').style.display = c.admin_token ? '' : 'none';
+  q('tokenRow').style.display = c.admin_token ? '' : 'none';
+
+  // Pestañas
+  q('tabs').style.display = names.length > 1 ? '' : 'none';
+  q('tabs').innerHTML = names.map(n => { const b = d.engines[n];
+    return `<button type="button" data-engine="${esc(n)}" class="${n === cur ? 'on' : ''}">${esc(b.label)}${b.config.paused ? ' (pausado)' : ''} <span>· ${b.positions.length} abiertas · </span>${usd(b.realized_pnl)}</button>`; }).join('');
+  q('engHint').textContent = `${e.label}: ${e.hint}.`;
+  document.querySelectorAll('.engName').forEach(el => el.textContent = e.label);
+  q('csvLink').href = '/api/trades.csv?engine=' + encodeURIComponent(cur);
+
+  // Posiciones
+  q('nPos').textContent = e.positions.length;
+  q('thPosSig').textContent = isRatio ? 'Ratio' : 'Vela';
+  q('engPnl').innerHTML = `PnL abierto ${usd(e.unrealized_pnl)} · realizado ${usd(e.realized_pnl)} (${e.wins}/${e.closed_count} ganadas)`;
+  const rn = {}; (r.rows || []).forEach(x => rn[x.symbol] = x);
+  const exitCell = row => {
+    if (!isRatio) return `<span class="muted">${row.inverted ? 'SL' : 'TP'}</span> ${num(row.tp_price, 8)}`;
+    const parts = [];
+    if (row.tp_price > 0) parts.push(`<span class="pos">TP</span> ${num(row.tp_price, 8)}`);
+    if (row.sl_price > 0) parts.push(`<span class="neg">SL</span> ${num(row.sl_price, 8)}`);
+    if (rc.ratio_exit) parts.push(`<span class="muted">ratio ${row.direction === 'SHORT' ? '≥' : '≤'}</span> ${num(row.ratio_target || row.ratio_trigger, 4)} <span class="muted">(ahora ${rn[row.symbol] && rn[row.symbol].last != null ? num(rn[row.symbol].last, 4) : '—'})</span>`);
+    return parts.join(' · ') || '<span class="muted">manual</span>';
+  };
+  q('tPos').innerHTML = e.positions.map(row => `<tr>
+    <td><b>${esc(row.symbol)}</b> <span class="muted">#${row.trade_id}</span>${row.sent === false ? ' <span class="st off">SIMULADA</span>' : ''}</td><td>${tag(row.direction)}</td>
+    <td>${isRatio ? `${num(row.ratio_trigger, 4)}→${num(row.ratio_entry, 4)} ${pct(row.ratio_change_pct || 0)}` : pct(row.signal_pct) + (cur === 'live' ? ` <span class="muted">${Math.round(row.candle_age_s || 0)}s</span>` : '')}</td><td>${num(row.entry_price, 8)}</td><td>${num(row.price, 8)}</td>
+    <td>${pct(row.move_pct)}</td><td>${exitCell(row)}</td><td>${num(row.notional, 2)}</td><td>${usd(row.pnl)}</td>
+    <td>${pct(row.mfe_pct)} <span class="muted">${usd(row.mfe_usd)}</span></td><td>${pct(row.mae_pct)} <span class="muted">${usd(row.mae_usd)}</span></td>
+    <td>${esc(row.opened)} <span class="muted">(${dur(row.age_s)})</span></td>
+    <td><button class="small ghost" data-close="${row.trade_id}" data-label="${esc(row.direction)} ${esc(row.symbol)} #${row.trade_id}">Cerrar</button></td></tr>`).join('')
+    || '<tr><td colspan="13" class="muted">Sin posiciones abiertas</td></tr>';
+
+  // Parámetros (el bot de ratio se ajusta en su propio panel)
+  document.querySelector('details[data-key="cfg"]').style.display = isRatio ? 'none' : '';
+  document.querySelector('details[data-key="eval"]').style.display = isRatio || !k.enabled ? 'none' : '';
+  q('thSigC').textContent = isRatio ? 'Ratio' : 'Vela';
+  q('thSigB').textContent = isRatio ? 'Cambio' : 'Cuerpo';
+  q('thSigS').textContent = isRatio ? '' : 'Segundo';
+  q('cfgThr').textContent = `±${ec.threshold_pct}%`;
+  q('cfgTp').textContent = `${ec.tp_pct}%`;
+  q('cfgTpLbl').textContent = xk;
+  q('cfgSum').textContent = `señal ±${ec.threshold_pct}% · ${xk} ${ec.tp_pct}%`;
+  q('engLat').textContent = e.decide_ms === null ? 'decisión: sin entradas aún' : `decisión media ${e.decide_ms} ms`;
+  for (const [id, dir, blocked] of [['btnLong', 'LONG', ec.block_long], ['btnShort', 'SHORT', ec.block_short]]) {
+    const b = q(id);
+    b.dataset.blocked = blocked ? '1' : '';
+    b.textContent = blocked ? `${dir} bloqueados · desbloquear` : `${dir} activos · bloquear`;
+    b.className = blocked ? 'danger' : 'ok';
+  }
+
+  // Señales y cerradas
+  q('nSig').textContent = e.signal_count;
+  q('tSig').innerHTML = e.signals.map(s => `<tr><td>${esc(s.time)}</td><td>${esc(s.symbol)}</td><td>${tag(s.direction)}</td>
+    <td>${esc(s.candle)} <span class="muted">${num(s.open, 8)}→${num(s.close, 8)}</span></td><td>${pct(s.body_pct)}</td>
+    <td class="muted">${isRatio ? '' : Math.round(s.candle_age_s || 0) + 's'}</td>
+    <td class="${s.action.startsWith('abierta') ? 'pos' : 'muted'}">${esc(s.action)}</td></tr>`).join('')
+    || `<tr><td colspan="7" class="muted">${isRatio ? 'Esperando una caída del ratio dentro del rango' : 'Esperando velas con cuerpo ≥ ±' + ec.threshold_pct + '%'}</td></tr>`;
+  q('nClosed').textContent = e.closed_count;
+  q('tClosed').innerHTML = e.closed_trades.map(t => `<tr><td>${esc(t.closed)}</td><td>${esc(t.symbol)}</td><td>${tag(t.direction)}</td>
+    <td>${num(t.entry_price, 8)}</td><td>${num(t.close_price, 8)}</td><td>${pct(t.move_pct)}</td><td>${usd(t.pnl)}</td>
+    <td class="muted">${num(t.fees || 0, 4)}</td><td>${pct(t.mfe_pct || 0)}</td><td>${pct(t.mae_pct || 0)}</td>
+    <td>${dur(t.duration_s || 0)}</td><td>${esc(t.reason)}${t.sent === false ? ' <span class="st off">SIMULADA</span>' : ''}</td></tr>`).join('')
+    || '<tr><td colspan="12" class="muted">Aún no hay cierres</td></tr>';
+
+  const exc = e.excursions || {};
+  q('tExc').innerHTML = ['all', 'LONG', 'SHORT'].map(kk => {
+    const rr = exc[kk] || {n: 0}, label = kk === 'all' ? 'Todas' : tag(kk);
+    if (!rr.n) return `<tr><td>${label}</td><td>0</td><td colspan="8" class="muted">—</td></tr>`;
+    return `<tr><td>${label}</td><td>${rr.n}</td><td>${rr.wins}</td><td>${pct(rr.avg_mfe_pct)}</td><td>${pct(rr.avg_mae_pct)}</td>
+      <td>${pct(rr.best_mfe_pct)}</td><td>${pct(rr.worst_mae_pct)}</td><td>${usd(rr.avg_mae_usd)}</td>
+      <td>${dur(rr.avg_time_to_mae_s)}</td><td>${dur(rr.avg_duration_s)}</td></tr>`;
+  }).join('');
+
+  // Evaluaciones
+  const ev = e.evaluations;
+  q('evMin').textContent = ev.top_minute;
+  q('tTop').innerHTML = ev.top.map(rr => `<tr><td>${esc(rr.symbol)}</td><td>${num(rr.open, 8)}</td><td>${num(rr.close, 8)}</td>
+    <td>${pct(rr.body_pct)}</td><td>${rr.signal ? tag(rr.signal) : '<span class="muted">—</span>'}</td></tr>`).join('')
+    || '<tr><td colspan="5" class="muted">Esperando el primer cierre de vela</td></tr>';
+  q('tMin').innerHTML = ev.minutes.map(m => `<tr><td>${esc(m.minute)}</td><td>${m.evaluated}</td><td>${m.long}</td><td>${m.short}</td>
+    <td>${pct(m.max_up)}</td><td>${pct(m.max_down)}</td></tr>`).join('')
+    || '<tr><td colspan="6" class="muted">Sin evaluaciones todavía</td></tr>';
+
+  // Executor
+  q('exUrl').textContent = x.url || '(vacío: sin señales)';
+  q('exSum').textContent = x.url ? `${x.url} · ${x.sent} enviadas · ${x.errors} errores` : 'sin link: no se mandan señales';
+  q('exSent').textContent = x.sent;
+  q('exErr').textContent = x.errors;
+  q('exLat').textContent = x.last_ok
+    ? `Última señal (${x.last_ok}): HTTP al executor ${x.http_ms} ms · total desde el mensaje de Binance ${x.total_ms} ms`
+    : 'Latencia: aún no hay señales enviadas';
+
+  // Red
+  const nt = d.net;
+  if (nt) {
+    q('netSum').textContent = `entrada ${bytes(nt.rx_per_hour)}/h · web ${bytes(nt.web_per_hour)}/h`;
+    q('netGrid').innerHTML = [
+      ['Entrada total', bytes(nt.rx_total)], ['Entrada por hora', bytes(nt.rx_per_hour)],
+      ['REST Binance', bytes(nt.rx.rest)], [`Precios (${esc(nt.price_stream)}, ${nt.price_symbols} pares)`, bytes(nt.rx.prices)],
+      [`24 h (${nt.ticker_mode === 'ws' ? 'WebSocket' : 'REST cada 5 min'})`, bytes(nt.rx.ticker)],
+      ...(k.enabled ? [['Velas', bytes(nt.rx.klines)]] : []),
+      ['Web enviada', bytes(nt.web_tx)], ['Web por hora', bytes(nt.web_per_hour)],
+    ].map(([a, b]) => `<div>${a}<b>${b}</b></div>`).join('');
+  }
+  renderRatio(d);
+  q('events').textContent = d.events.join('\n');
+}
+
+q('exForm').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const body = {url: q('exNew').value.trim()};
+  const secret = q('exSecret').value;
+  if (secret) body.secret = secret;
+  if (!body.url && !confirm('Link vacío: los bots dejarán de mandar señales. ¿Seguir?')) return;
+  q('exMsg').textContent = 'Guardando…';
+  try {
+    const r = await post('/api/executor', body);
+    q('exMsg').innerHTML = r.ok
+      ? `<span class="pos">Link cambiado.</span> ${r.url ? (r.reachable ? 'El executor responde (' + esc(r.detail) + ').' : '<span class="warn">No responde: ' + esc(r.detail) + '</span>') : esc(r.detail)}`
+      : `<span class="neg">${esc(r.error)}</span>`;
+    if (r.ok) { q('exNew').value = ''; q('exSecret').value = ''; }
+  } catch (e) { q('exMsg').innerHTML = `<span class="neg">${esc(e)}</span>`; }
+  refresh();
+});
+
+q('cfgForm').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  q('cfgMsg').textContent = 'Guardando…';
+  try {
+    const r = await post('/api/config', {engine: cur, threshold_pct: q('cfgNewThr').value, tp_pct: q('cfgNewTp').value});
+    q('cfgMsg').innerHTML = r.ok
+      ? `<span class="pos">Guardado en ${esc(last && last.engines[r.engine] ? last.engines[r.engine].label : r.engine)}.</span> Señal ±${r.threshold_pct}% · ${last && last.global.inverted ? 'SL' : 'TP'} ${r.tp_pct}%`
+      : `<span class="neg">${esc(r.error)}</span>`;
+    if (r.ok) { q('cfgNewThr').value = ''; q('cfgNewTp').value = ''; }
+  } catch (e) { q('cfgMsg').innerHTML = `<span class="neg">${esc(e)}</span>`; }
+  refresh();
+});
+
+async function glb(body, url = '/api/global') {
+  q('glbMsg').textContent = 'Guardando…';
+  try {
+    const r = await post(url, body);
+    q('glbMsg').innerHTML = r.ok
+      ? `<span class="pos">Guardado.</span> ${r.executor_paused ? 'Envíos al executor pausados · ' : ''}objetivo ${r.profit_target_usd > 0 ? '+' + r.profit_target_usd + ' USD' : 'apagado'} · límite ${r.max_open > 0 ? r.max_open + ' abiertas' : 'sin límite'} · fee ${r.fee_pct}% por lado`
+      : `<span class="neg">${esc(r.error)}</span>`;
+    return r.ok;
+  } catch (e) { q('glbMsg').innerHTML = `<span class="neg">${esc(e)}</span>`; }
+  finally { refresh(); }
+}
+
+q('glbForm').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  if (await glb({profit_target_usd: q('glbTarget').value, max_open: q('glbMax').value, fee_pct: q('glbFee').value})) {
+    q('glbTarget').value = ''; q('glbMax').value = ''; q('glbFee').value = '';
+  }
+});
+
+q('btnInvert').addEventListener('click', () => {
+  const inv = !q('btnInvert').dataset.inverted;
+  const msg = inv
+    ? '¿Invertir los bots de velas? Las entradas nuevas irán CONTRA la vela y el % será stop loss, sin TP. Las posiciones abiertas siguen con su TP.'
+    : '¿Volver al modo normal? Las entradas nuevas seguirán la vela con TP. Las posiciones abiertas invertidas siguen con su SL.';
+  if (confirm(msg)) glb({inverted: inv});
+});
+
+q('btnExPause').addEventListener('click', () => {
+  const p = !q('btnExPause').dataset.paused;
+  const msg = p
+    ? '¿Pausar las entradas al executor? Los bots seguirán operando en simulación (verás posiciones SIMULADAS) pero no se mandará ninguna apertura. Los cierres de lo ya enviado sí se mandan.'
+    : '¿Reanudar los envíos al executor? Las entradas nuevas volverán a abrirse de verdad. Las simuladas que sigan abiertas no se mandan.';
+  if (confirm(msg)) glb({executor_paused: p});
+});
+
+q('btnReset').addEventListener('click', () => {
+  if (confirm('¿Poner a cero el PnL de la sesión? El objetivo se contará desde ahora.')) glb({}, '/api/session/reset');
+});
+
+async function closeAll(engine) {
+  const n = engine ? last.engines[engine].positions.length : last.global.open_count;
+  const who = engine ? `del ${last.engines[engine].label}` : 'de todos los bots';
+  if (!n) { alert(`No hay posiciones abiertas ${who}.`); return; }
+  if (!confirm(`¿Cerrar a mercado las ${n} posiciones abiertas ${who}?`)) return;
+  try {
+    const r = await post('/api/close-all', engine ? {engine} : {});
+    alert(r.ok ? r.msg : r.error);
+  } catch (e) { alert(e); }
+  refresh();
+}
+q('btnCloseAll').addEventListener('click', () => closeAll(null));
+q('btnCloseEng').addEventListener('click', () => closeAll(cur));
+
+document.addEventListener('click', async ev => {
+  const t = ev.target, ds = t.dataset || {};
+  if (ds.pause) {
+    const paused = !ds.paused, label = last ? last.engines[ds.pause].label : ds.pause;
+    if (!confirm(paused ? `¿Pausar el ${label}? No abrirá entradas nuevas; sus posiciones abiertas siguen hasta su TP/SL.` : `¿Reanudar el ${label}?`)) return;
+    try { const r = await post('/api/pause', {engine: ds.pause, paused}); if (!r.ok) alert(r.error); } catch (e) { alert(e); }
+    refresh();
+    return;
+  }
+  const tab = t.closest && t.closest('[data-engine]');
+  if (tab) {
+    cur = tab.dataset.engine;
+    store.set('botkline_engine', cur);
+    q('cfgMsg').textContent = '';
+    refresh();                                         // trae el detalle del bot elegido
+    if (tab.closest('#bots')) q('tabs').scrollIntoView({behavior: 'smooth'});
+    return;
+  }
+  if (ds.block) {
+    try { const r = await post('/api/block', {engine: cur, direction: ds.block, blocked: !ds.blocked}); if (!r.ok) alert(r.error); } catch (e) { alert(e); }
+    refresh();
+    return;
+  }
+  if (!ds.close || !confirm(`¿Cerrar ${ds.label || ds.close} a mercado?`)) return;
+  try {
+    const r = await post('/api/close/' + encodeURIComponent(ds.close), {});
+    alert(r.ok ? r.msg : (r.error || r.msg));
+  } catch (e) { alert(e); }
+  refresh();
+});
+
+function renderRatio(d) {
+  const r = d.ratio; if (!r) return;
+  const c = r.cfg;
+  q('rtSum').textContent = `24 h ≥ ±${c.watch_min_pct}% · caída ${c.drop_min_pct}–${c.drop_max_pct}% · TP ${c.tp_pct > 0 ? '+' + c.tp_pct + '%' : 'apagado'} · SL ${c.sl_pct > 0 ? '−' + c.sl_pct + '%' : 'apagado'}`;
+  q('rtN').textContent = r.rows.length;
+  q('rtCurW').textContent = `(ahora ${c.watch_min_pct}%)`;
+  q('rtCurMin').textContent = `(ahora ${c.drop_min_pct}%)`;
+  q('rtCurMax').textContent = `(ahora ${c.drop_max_pct}%)`;
+  q('rtCurTp').textContent = `(ahora ${c.tp_pct > 0 ? '+' + c.tp_pct + '%' : 'apagado'})`;
+  q('rtCurSl').textContent = `(ahora ${c.sl_pct > 0 ? '−' + c.sl_pct + '%' : 'apagado'})`;
+  const be = q('rtBtnExit');
+  be.dataset.on = c.ratio_exit ? '1' : '';
+  be.textContent = c.ratio_exit ? 'TP por ratio activo · desactivar' : 'TP por ratio desactivado · activar';
+  be.className = c.ratio_exit ? 'ok small' : 'ghost small';
+  const viaWs = r.ticker_mode === 'ws';
+  q('rtInfo').innerHTML = `24 h ${viaWs ? 'por WebSocket' : 'por REST cada 5 min'}: ${r.ticker_connected ? '<span class="pos">ok</span>' : '<span class="neg">sin datos</span>'}`
+    + ` (${r.ticker_symbols} símbolos, ${r.ticker_age_s === null ? '—' : 'hace ' + dur(r.ticker_age_s)})`
+    + ` · lista ${esc(r.watch_updated || '—')} · próxima consulta en ${r.next_cycle_in > 0 ? dur(r.next_cycle_in) : '—'}`
+    + ` · consultas ${r.polls} · errores ${r.errors}`
+    + (r.filters === 0 ? ` · <span class="neg">sin exchangeInfo (proxy/región): no se puede operar ni consultar el ratio</span>` : '')
+    + (r.ticker_error && !r.ticker_connected ? ` · <span class="warn">24 h: ${esc(r.ticker_error)}</span>` : '')
+    + (r.rest_blocked_s > 0 ? ` · <span class="neg">REST en pausa ${dur(r.rest_blocked_s)} (límite de peticiones)</span>` : '')
+    + (r.last_error ? ` · <span class="warn">${esc(r.last_error)}</span>` : '');
+  for (const [id, dir, on] of [['rtBtnShort', 'SHORT', r.short_enabled], ['rtBtnLong', 'LONG', r.long_enabled]]) {
+    const b = q(id);
+    b.dataset.on = on ? '1' : '';
+    b.textContent = on ? `${dir} activo · desactivar` : `${dir} desactivado · activar`;
+    b.className = on ? 'ok' : 'danger';
+  }
+  q('tRt').innerHTML = r.rows.map(x => `<tr>
+    <td><b>${esc(x.symbol)}</b></td><td>${x.pct24 === null ? '—' : pct(x.pct24)}</td><td>${num(x.price, 8)}</td>
+    <td>${num(x.prev, 4)}</td><td>${num(x.last, 4)}</td><td>${x.chg === null ? '<span class="muted">—</span>' : pct(x.chg)}</td>
+    <td class="${x.lag ? 'warn' : 'muted'}" title="${x.lag ? 'Binance aún no publicó el punto más nuevo de este símbolo' : ''}">${esc(x.data_time || '—')}${x.lag ? ' ⏳' : ''}</td><td>${x.side ? tag(x.side) : '<span class="muted">—</span>'}</td>
+    <td>${x.has_position ? '<span class="st on">POSICIÓN</span>' : x.in_range ? '<span class="st off">EN RANGO</span>' : '<span class="muted">—</span>'}</td></tr>`).join('')
+    || '<tr><td colspan="9" class="muted">Ningún símbolo cumple el % de 24 h todavía</td></tr>';
+}
+
+async function ratioPost(body, okMsg) {
+  q('rtMsg').textContent = 'Guardando…';
+  try {
+    const r = await post('/api/ratio', body);
+    q('rtMsg').innerHTML = r.ok ? `<span class="pos">Guardado.</span> ${okMsg(r)}` : `<span class="neg">${esc(r.error)}</span>`;
+    return r.ok;
+  } catch (e) { q('rtMsg').innerHTML = `<span class="neg">${esc(e)}</span>`; }
+  finally { refresh(); }
+}
+
+q('rtForm').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const ok = await ratioPost({watch_min_pct: q('rtWatch').value, drop_min_pct: q('rtMin').value, drop_max_pct: q('rtMax').value},
+    r => `24 h ≥ ±${r.watch_min_pct}% · caída del ratio ${r.drop_min_pct}–${r.drop_max_pct}% (la lista se recalcula en la próxima consulta de 5 min)`);
+  if (ok) { q('rtWatch').value = ''; q('rtMin').value = ''; q('rtMax').value = ''; }
+});
+
+q('rtExitForm').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const ok = await ratioPost({tp_pct: q('rtTp').value, sl_pct: q('rtSl').value},
+    r => `TP ${r.tp_pct > 0 ? '+' + r.tp_pct + '%' : 'apagado'} · SL ${r.sl_pct > 0 ? '−' + r.sl_pct + '%' : 'apagado'} (también en las posiciones abiertas)`);
+  if (ok) { q('rtTp').value = ''; q('rtSl').value = ''; }
+});
+
+q('rtBtnExit').addEventListener('click', () => {
+  const on = !q('rtBtnExit').dataset.on;
+  ratioPost({ratio_exit: on}, r => `TP por ratio ${r.ratio_exit ? 'activado' : 'desactivado'}`);
+});
+
+for (const [id, dir] of [['rtBtnShort', 'SHORT'], ['rtBtnLong', 'LONG']]) {
+  q(id).addEventListener('click', async () => {
+    const on = !!q(id).dataset.on;                       // activo ahora → se va a bloquear
+    const msg = on ? `¿Desactivar ${dir} en el bot de ratio? No abrirá entradas nuevas de ese lado (las abiertas siguen hasta su TP/SL).`
+                   : `¿Activar ${dir} en el bot de ratio?` + (dir === 'LONG' ? ' Pasará a vigilar también los símbolos con 24 h ≤ −X % (perdedores).' : '');
+    if (!confirm(msg)) return;
+    try { const r = await post('/api/block', {engine: 'ratio', direction: dir, blocked: on}); if (!r.ok) alert(r.error); } catch (e) { alert(e); }
+    refresh();
+  });
+}
+
+refresh();
+</script>
+</body>
+</html>

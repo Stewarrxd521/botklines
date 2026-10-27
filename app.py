@@ -32,20 +32,28 @@ Los dos bots
   Executor se puede cambiar en caliente desde la web o con POST /api/executor.
 
 Bot de ratio de top traders (tercer bot, "ratio")
-  • Vigila SOLO los perpetuos con variación 24 h ≥ +RATIO_WATCH_MIN_PCT (20 %), leída del
-    WebSocket !ticker@arr. La lista se recalcula cada 5 min y se suscribe a precios en vivo.
+  • Vigila SOLO los perpetuos con variación 24 h ≥ +RATIO_WATCH_MIN_PCT (20 %). El 24 h se
+    lee con UNA petición REST comprimida cada 5 min (TICKER_MODE=rest, por defecto) en vez
+    de un WebSocket de todo el mercado abierto todo el día.
   • Cada 5 min consulta el Top Trader Long/Short Ratio (Accounts) de esa lista. (Binance
     NO ofrece este dato por WebSocket: es REST, 1 petición por símbolo vigilado cada 5 min,
     por el proxy, con freno automático ante HTTP 429/418.)
   • Si el ratio cae entre drop_min % y drop_max % de un punto de 5 m al siguiente → SHORT.
-  • TP: cuando el ratio RECUPERA el mismo % que cayó, medido desde el ratio de entrada
-    (cae 27,1 % de 1,18 a 0,86 → TP cuando sube 27,1 % desde 0,86 = 1,093). Sin stop loss.
+  • Salidas (lo que llegue antes, todo configurable en caliente desde la web):
+      - TP por precio: +RATIO_TP_PCT % a favor (10 %).
+      - SL por precio: -RATIO_SL_PCT % en contra (5 %).
+      - TP por ratio (desactivable): el ratio RECUPERA el mismo % que cayó, medido desde
+        el ratio de entrada (cae 27,1 % de 1,18 a 0,86 → TP cuando sube 27,1 % desde 0,86).
   • LONG (apagado por defecto, se activa desde la web): espejo para los PERDEDORES
     (24 h ≤ -20 %): el ratio SUBE entre drop_min % y drop_max % → LONG; TP cuando el
     ratio baja ese mismo % desde el ratio de entrada.
 
-Precios para el take profit: WS.py (!markPrice@arr de todos los símbolos +
-bookTicker en tiempo real de los que tienen posición abierta).
+Precios para TP/SL: WS.py, SOLO de los símbolos con posición abierta (markPrice@1s
+con el bot de ratio; bookTicker en tiempo real si están activos los bots de velas).
+
+Ancho de banda: sin streams de todo el mercado, REST con gzip, la web pide solo el
+detalle del bot que se está viendo, las respuestas van comprimidas y el panel deja
+de consultar cuando la pestaña del navegador está oculta.
 Recuperación tras reinicio: state_store.py, solo con copia en disco local (Upstash
 desactivado por ahora: en Render free el disco se borra en cada reinicio).
 """
@@ -56,6 +64,8 @@ import asyncio
 import atexit
 import concurrent.futures
 import csv
+import gzip
+import hashlib
 import io
 import json
 import http.client
@@ -146,6 +156,14 @@ RATIO_REQ_BUDGET    = int(os.getenv("RATIO_REQ_BUDGET", "700"))       # máx. pe
 RATIO_MAX_AGE_S     = float(os.getenv("RATIO_MAX_AGE_S", "720"))      # dato de ratio más viejo no dispara
 RATIO_WATCH_MAX     = int(os.getenv("RATIO_WATCH_MAX", "100"))        # tope de símbolos vigilados
 RATIO_CONCURRENCY   = max(1, int(os.getenv("RATIO_CONCURRENCY", "4")))
+# Salidas por precio del bot de ratio (0 = apagado). Editables en caliente desde la web.
+RATIO_TP_PCT        = float(os.getenv("RATIO_TP_PCT", "10"))           # take profit: +10 % a favor
+RATIO_SL_PCT        = abs(float(os.getenv("RATIO_SL_PCT", "5")))       # stop loss: -5 % en contra
+RATIO_EXIT_BY_RATIO = os.getenv("RATIO_EXIT_BY_RATIO", "true").lower() in ("1", "true", "yes")
+# Fuente del 24 h: "rest" = 1 petición gzip por ciclo de 5 min (~50 KB);
+# "ws" = WebSocket !miniTicker@arr abierto siempre (~80 KB/s, decenas de GB al mes).
+TICKER_MODE         = os.getenv("TICKER_MODE", "rest").strip().lower()
+TICKER_SNAPSHOT_S   = float(os.getenv("TICKER_SNAPSHOT_S", "4"))      # respaldo por WS si falla el REST
 
 # ── Velas ─────────────────────────────────────────────────────────────────────
 KLINE_INTERVAL = "1m"
@@ -158,7 +176,7 @@ EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "clave-secreta-aleatoria")
 # Si se define, los POST de la web (cambiar executor, cerrar) exigen este token.
 ADMIN_TOKEN     = os.getenv("ADMIN_TOKEN", "").strip()
 EXECUTOR_WORKERS = max(1, int(os.getenv("EXECUTOR_WORKERS", "4")))      # envíos en paralelo
-EXECUTOR_WARM_S  = float(os.getenv("EXECUTOR_WARM_S", "20"))            # GET para mantener viva la conexión
+EXECUTOR_WARM_S  = float(os.getenv("EXECUTOR_WARM_S", "20"))            # HEAD para mantener viva la conexión
 
 # ── Persistencia ──────────────────────────────────────────────────────────────
 SETTINGS_FILE     = os.getenv("SETTINGS_FILE", os.path.join(_HERE, "bot_settings.json"))
@@ -172,7 +190,25 @@ SHUTDOWN_DRAIN_S  = 5.0
 EVAL_MINUTES_KEPT = int(os.getenv("EVAL_MINUTES_KEPT", "30"))   # minutos de evaluaciones en la web
 EVAL_TOP_N        = int(os.getenv("EVAL_TOP_N", "15"))          # mayores cuerpos mostrados
 
-STATUS_POLL_MS = int(os.getenv("STATUS_POLL_MS", "1500"))
+STATUS_POLL_MS = int(os.getenv("STATUS_POLL_MS", "3000"))
+# Stream de precio por símbolo con posición: el bot de ratio sale a ±5-10 %, le basta
+# markPrice@1s (1 msg/s). Los bots de velas usan bookTicker (tiempo real, mucho más tráfico).
+PRICE_STREAM = os.getenv("WS_SYMBOL_STREAM", "").strip() or ("bookTicker" if KLINE_BOTS_ENABLED else "markPrice@1s")
+WEB_DIR = os.path.join(_HERE, "web")
+
+
+def http_get_json(url: str, proxy: str = "", timeout: float = 15.0) -> Tuple[object, int]:
+    """GET JSON pidiendo gzip (Binance lo admite: ~5-10× menos bytes). (datos, bytes recibidos)."""
+    handlers = [urllib.request.ProxyHandler({"http": proxy, "https": proxy})] if proxy else []
+    opener = urllib.request.build_opener(*handlers)
+    req = urllib.request.Request(url, headers={"User-Agent": "BOTKLINE/1.0", "Accept-Encoding": "gzip"})
+    with opener.open(req, timeout=timeout) as resp:
+        raw = resp.read()
+        if (resp.headers.get("Content-Encoding") or "").lower() == "gzip":
+            body = gzip.decompress(raw)
+        else:
+            body = raw
+    return json.loads(body), len(raw)
 
 
 def _utc(ts: float, pattern: str = "%Y-%m-%d %H:%M:%S") -> str:
@@ -228,7 +264,7 @@ class ExecutorBridge:
     # ── Envío con conexiones persistentes ────────────────────────────────────
     # Abrir TCP+TLS por cada señal cuesta 100-300 ms hasta Render. Cada hilo
     # trabajador mantiene su conexión abierta (keep-alive) y la "calienta" con
-    # un GET cada EXECUTOR_WARM_S si está ociosa, así una señal sale en el RTT.
+    # un HEAD cada EXECUTOR_WARM_S si está ociosa, así una señal sale en el RTT.
 
     def _ensure_workers(self) -> None:
         if self._workers:
@@ -246,7 +282,8 @@ class ExecutorBridge:
         if not target.url:
             return
         try:
-            self._request(conns, target, "GET", "/api/state", None, retry=False)
+            # HEAD: mantiene viva la conexión sin descargar el estado del executor.
+            self._request(conns, target, "HEAD", "/api/state", None, retry=False)
         except Exception:
             pass                        # la próxima señal abrirá una conexión nueva
 
@@ -379,6 +416,7 @@ class Position:
     ratio_change_pct: float = 0.0
     ratio_ts:      int = 0      # timestamp (ms) del punto de ratio que disparó
     ratio_target:  float = 0.0  # ratio de salida (TP): recupera el mismo % que cayó/subió
+    sl_price:      float = 0.0  # stop loss por precio (bot de ratio). 0 = sin SL
 
     def update(self, price: float) -> float:
         """Actualiza precio y excursiones. Llamar con el lock del bot tomado."""
@@ -405,7 +443,7 @@ ENGINE_LABELS = {ENGINE_CLOSE: "Bot al cierre", ENGINE_LIVE: "Bot en vivo",
                  ENGINE_RATIO: "Bot ratio top traders"}
 ENGINE_HINTS = {
     ENGINE_RATIO: "SHORT cuando el ratio de cuentas de los top traders se gira (cae) en un símbolo con 24 h ≥ +20 %; "
-                  "TP cuando el ratio recupera el mismo % que cayó",
+                  "sale por TP/SL de precio o cuando el ratio recupera el mismo % que cayó",
     ENGINE_CLOSE: "entra cuando la vela 1m CIERRA con cuerpo ≥ umbral",
     ENGINE_LIVE:  "entra en cuanto la vela 1m EN CURSO supera el umbral, sin esperar al cierre",
 }
@@ -525,9 +563,17 @@ class KlineBot:
                 return v if v > 0 else d
             except (TypeError, ValueError):
                 return d
+        def _nonneg(v, d):
+            try:
+                return abs(float(v))
+            except (TypeError, ValueError):
+                return d
         self.ratio_cfg = {"watch_min_pct": _pos(rs.get("watch_min_pct"), RATIO_WATCH_MIN_PCT),
                           "drop_min_pct":  _pos(rs.get("drop_min_pct"), RATIO_DROP_MIN_PCT),
-                          "drop_max_pct":  _pos(rs.get("drop_max_pct"), RATIO_DROP_MAX_PCT)}
+                          "drop_max_pct":  _pos(rs.get("drop_max_pct"), RATIO_DROP_MAX_PCT),
+                          "tp_pct":        _nonneg(rs.get("tp_pct"), RATIO_TP_PCT),
+                          "sl_pct":        _nonneg(rs.get("sl_pct"), RATIO_SL_PCT),
+                          "ratio_exit":    bool(rs.get("ratio_exit", RATIO_EXIT_BY_RATIO))}
         if self.ratio_cfg["drop_min_pct"] >= self.ratio_cfg["drop_max_pct"]:
             self.ratio_cfg["drop_min_pct"], self.ratio_cfg["drop_max_pct"] = RATIO_DROP_MIN_PCT, RATIO_DROP_MAX_PCT
         # Estado del bot de ratio (se toca solo desde el loop del bot).
@@ -547,6 +593,10 @@ class KlineBot:
         self._rest_block_until = 0.0
         self._rest_route = 0
         self._rest_times: Deque[float] = deque()      # peticiones de los últimos 5 min
+        # Tráfico de entrada propio (bytes): REST a Binance y snapshots/stream del 24 h.
+        self.rx_rest_bytes = 0
+        self.rx_ticker_bytes = 0
+        self.tx_web_bytes = 0                         # respuestas de la web (comprimidas)
         # Ajustes comunes a los dos bots (botón y campos de la web).
         self.inverted = bool(settings.get("inverted", INVERT_SIGNALS))
         self.fee_pct = float(settings["fee_pct"]) if settings.get("fee_pct") is not None else FEE_PCT
@@ -597,9 +647,15 @@ class KlineBot:
             return self.trade_id_seq
 
     def _refresh_pos_syms(self) -> None:
+        """Actualiza los símbolos con posición y alinea con ellos las suscripciones
+        de precio en vivo (se dan de baja al cerrar: nada de streams olvidados)."""
         with self.lock:
-            self._pos_syms = frozenset(p.symbol for e in self.engines.values()
-                                       for p in e.positions.values())
+            syms = frozenset(p.symbol for e in self.engines.values() for p in e.positions.values())
+            changed = syms != self._pos_syms
+            self._pos_syms = syms
+        pc = self.price_cache
+        if changed and pc is not None:
+            pc.update_symbols(sorted(syms))
 
     def _find(self, trade_id: int) -> Tuple[Optional[Engine], Optional[Position]]:
         with self.lock:
@@ -809,7 +865,7 @@ class KlineBot:
 
     async def _main(self) -> None:
         for eng in self.engines.values():
-            if eng.name == ENGINE_RATIO:
+            if eng.name == ENGINE_RATIO or not KLINE_BOTS_ENABLED:
                 continue
             self.log(f"{eng.label} | {ENGINE_HINTS[eng.name]} | señal ≥ {eng.threshold_pct:g}% | "
                      f"{'SL' if self.inverted else 'TP'} {eng.tp_pct:g}% | {NOTIONAL_USDT:g} USDT")
@@ -821,7 +877,10 @@ class KlineBot:
         self.log(f"Bot ratio top traders | vigila 24 h ≥ {rc['watch_min_pct']:g}% | caída del ratio "
                  f"{rc['drop_min_pct']:g}–{rc['drop_max_pct']:g}% | LONG "
                  f"{'bloqueado' if self.engines[ENGINE_RATIO].blocked[strategy.LONG] else 'activo'} | "
-                 f"{NOTIONAL_USDT:g} USDT | TP = ratio recupera el mismo % que cayó")
+                 f"{NOTIONAL_USDT:g} USDT | TP +{rc['tp_pct']:g}% · SL -{rc['sl_pct']:g}% por precio"
+                 f"{' · TP por ratio (recupera el % que cayó)' if rc['ratio_exit'] else ''}")
+        self.log(f"Red: 24 h por {'REST cada 5 min' if TICKER_MODE != 'ws' else 'WebSocket continuo'} · "
+                 f"precio en vivo solo de símbolos con posición ({PRICE_STREAM})")
         self.log(f"[estado] Persistencia: {self._store_desc}")
         self.store.start()
         self.executor.warm()
@@ -833,7 +892,7 @@ class KlineBot:
         else:
             self.log("[estado] ⚠️ Aún no recupero el estado local: sin entradas ni cierres hasta recuperarlo")
 
-        self.price_cache = SymbolWebSocketPriceCache(sorted(self._pos_syms))
+        self.price_cache = SymbolWebSocketPriceCache(sorted(self._pos_syms), symbol_stream=PRICE_STREAM)
         self.price_cache.set_update_callback(self._on_price_event)
         self.price_cache.start()
 
@@ -851,7 +910,7 @@ class KlineBot:
         await asyncio.gather(
             self._supervised(self._engine_loop, "engine"),
             self._supervised(self._maintenance_loop, "maintenance"),
-            self._supervised(self._ticker_loop, "ticker"),
+            *([self._supervised(self._ticker_loop, "ticker")] if TICKER_MODE == "ws" else []),
             self._supervised(self._ratio_loop, "ratio"),
             self._supervised(self._symbols_retry_loop, "symbols"),
         )
@@ -885,13 +944,9 @@ class KlineBot:
         last_exc: Optional[Exception] = None
         for label, proxy in routes:
             try:
-                handlers = [urllib.request.ProxyHandler({"http": proxy, "https": proxy})] if proxy else []
-                opener = urllib.request.build_opener(*handlers)
-                req = urllib.request.Request(f"{BASE_URL}/fapi/v1/exchangeInfo",
-                                             headers={"User-Agent": "BOTKLINE/1.0"})
-                with opener.open(req, timeout=15) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                self.log(f"REST exchangeInfo por {label}")
+                data, nbytes = http_get_json(f"{BASE_URL}/fapi/v1/exchangeInfo", proxy, 20.0)
+                self.rx_rest_bytes += nbytes
+                self.log(f"REST exchangeInfo por {label} ({nbytes / 1024:.0f} KB comprimido)")
                 break
             except Exception as exc:
                 last_exc = exc
@@ -1095,9 +1150,7 @@ class KlineBot:
         with self.lock:
             eng.positions[pos.trade_id] = pos
             eng.opened_count += 1
-        self._refresh_pos_syms()
-        if self.price_cache is not None:
-            self.price_cache.ensure_symbols([symbol])       # bookTicker en tiempo real
+        self._refresh_pos_syms()                            # suscribe el precio en vivo del par
         self.store.mark_dirty(True)
         decide_ms = (time.perf_counter() - t0) * 1000 if t0 else 0.0
         skip(f"abierta #{pos.trade_id} en {decide_ms:.1f} ms")
@@ -1170,7 +1223,11 @@ class KlineBot:
                         continue
                     pos.update(price)
                     if pos.strategy == ENGINE_RATIO:
-                        continue                    # su salida es por ratio, no por precio
+                        # TP/SL fijos por precio (la salida por ratio se revisa en el ciclo de 5 min)
+                        reason = strategy.price_exit(price, pos.direction, pos.tp_price, pos.sl_price)
+                        if reason:
+                            hits.append((tid, reason))
+                        continue
                     if strategy.exit_hit(price, pos.tp_price, pos.direction, pos.inverted):
                         hits.append((tid, "SL" if pos.inverted else "TP"))
         if hits and self.store.can_act():
@@ -1262,26 +1319,103 @@ class KlineBot:
     # ── Bot de ratio de top traders ───────────────────────────────────────────
 
     def set_ratio_config(self, watch_min_pct: Optional[float] = None, drop_min_pct: Optional[float] = None,
-                         drop_max_pct: Optional[float] = None) -> dict:
-        """Ajusta en caliente el % 24 h para vigilar y el rango de caída del ratio."""
-        new = dict(self.ratio_cfg)
+                         drop_max_pct: Optional[float] = None, tp_pct: Optional[float] = None,
+                         sl_pct: Optional[float] = None, ratio_exit: Optional[bool] = None) -> dict:
+        """Ajusta en caliente el bot de ratio: % 24 h para vigilar, rango de caída del ratio,
+        TP/SL por precio (también a las posiciones abiertas) y la salida por ratio."""
+        old = self.ratio_cfg
+        new = dict(old)
         for key, v in (("watch_min_pct", watch_min_pct), ("drop_min_pct", drop_min_pct),
-                       ("drop_max_pct", drop_max_pct)):
+                       ("drop_max_pct", drop_max_pct), ("tp_pct", tp_pct), ("sl_pct", sl_pct)):
             if v is not None:
-                new[key] = float(v)
+                new[key] = abs(float(v))
+        if ratio_exit is not None:
+            new["ratio_exit"] = bool(ratio_exit)
         if new["drop_min_pct"] >= new["drop_max_pct"]:
             raise ValueError("la caída mínima debe ser menor que la máxima")
-        if new != self.ratio_cfg:
-            self.log(f"[config] ratio: 24 h ≥ {self.ratio_cfg['watch_min_pct']:g}% → {new['watch_min_pct']:g}% | "
-                     f"rango {self.ratio_cfg['drop_min_pct']:g}–{self.ratio_cfg['drop_max_pct']:g}% → "
-                     f"{new['drop_min_pct']:g}–{new['drop_max_pct']:g}%")
-            self.ratio_cfg = new
-            self._save_settings()
-            self.store.mark_dirty(True)
+        if new["sl_pct"] >= 100:
+            raise ValueError("el stop loss debe ser menor que 100 %")
+        if new == old:
+            return dict(old)
+        changes = []
+        for key, label in (("watch_min_pct", "24 h ≥"), ("drop_min_pct", "caída mín."),
+                           ("drop_max_pct", "caída máx."), ("tp_pct", "TP +"), ("sl_pct", "SL -")):
+            if new[key] != old[key]:
+                changes.append(f"{label}{old[key]:g}% → {new[key]:g}%")
+        if new["ratio_exit"] != old["ratio_exit"]:
+            changes.append(f"salida por ratio {'activada' if new['ratio_exit'] else 'desactivada'}")
+        self.ratio_cfg = new
+        if new["tp_pct"] != old["tp_pct"] or new["sl_pct"] != old["sl_pct"]:
+            self._apply_ratio_exits()
+        self._save_settings()
+        self.store.mark_dirty(True)
+        self.log("[config] ratio: " + " | ".join(changes))
         return dict(self.ratio_cfg)
 
+    def _ratio_exit_prices(self, entry: float, direction: str) -> Tuple[float, float]:
+        cfg = self.ratio_cfg
+        return strategy.tp_sl_prices(entry, direction, cfg["tp_pct"], cfg["sl_pct"])
+
+    def _apply_ratio_exits(self) -> None:
+        """Recalcula TP/SL por precio de las posiciones abiertas del bot de ratio con la
+        configuración vigente y las revisa ya (por si el nivel nuevo ya se tocó)."""
+        eng = self.engines[ENGINE_RATIO]
+        with self.lock:
+            for p in eng.positions.values():
+                p.tp_price, p.sl_price = self._ratio_exit_prices(p.entry_price, p.direction)
+            syms = {p.symbol for p in eng.positions.values()}
+        for sym in syms:
+            self._on_price_event(sym, "config")
+
+    async def _refresh_tickers(self) -> None:
+        """24 h de todo el mercado con UNA petición REST gzip (~50 KB) por ciclo de 5 min.
+        Si el REST falla, una foto rápida del WebSocket (TICKER_SNAPSHOT_S segundos)."""
+        if time.time() >= self._rest_block_until:
+            try:
+                rows = await asyncio.to_thread(self._rest_get, "/fapi/v1/ticker/24hr")
+                self._apply_tickers([{"s": r.get("symbol"), "c": r.get("lastPrice"),
+                                      "P": r.get("priceChangePercent"), "o": r.get("openPrice")}
+                                     for r in rows if isinstance(r, dict)] if isinstance(rows, list) else [])
+                self.ticker_connected, self.ticker_error = True, ""
+                return
+            except Exception as exc:
+                self.ticker_error = f"REST 24 h: {exc}"
+                self.log(f"[ticker] {self.ticker_error} — pruebo una foto por WebSocket")
+        self.ticker_connected = await self._ticker_ws_snapshot()
+
+    async def _ticker_ws_snapshot(self) -> bool:
+        """Abre el WebSocket del 24 h unos segundos, guarda lo recibido y lo cierra."""
+        for url in TICKER_WS_URLS:
+            it = None
+            got = False
+            try:
+                it = _ws_messages(url).__aiter__()
+                end = time.monotonic() + TICKER_SNAPSHOT_S
+                while (left := end - time.monotonic()) > 0:
+                    try:
+                        raw = await asyncio.wait_for(it.__anext__(), timeout=left)
+                    except asyncio.TimeoutError:
+                        break
+                    self.rx_ticker_bytes += len(raw)
+                    self._on_tickers(raw)
+                    got = True
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.ticker_error = f"foto WS 24 h: {exc!r}"
+            finally:
+                if it is not None:
+                    try:
+                        await it.aclose()
+                    except Exception:
+                        pass
+            if got:
+                self.ticker_error = ""
+                return True
+        return False
+
     async def _ticker_loop(self) -> None:
-        """WebSocket de 24 h de todos los símbolos (!miniTicker@arr / !ticker@arr)."""
+        """TICKER_MODE=ws: WebSocket de 24 h de todos los símbolos abierto siempre."""
         idx, backoff = 0, 1.0
         while self.running:
             url = TICKER_WS_URLS[idx % len(TICKER_WS_URLS)]
@@ -1298,6 +1432,7 @@ class KlineBot:
                     self.ticker_connected = True
                     self.ticker_error = ""
                     backoff = 1.0
+                    self.rx_ticker_bytes += len(raw)
                     self._on_tickers(raw)
             except StopAsyncIteration:
                 self.ticker_error = "conexión cerrada por el servidor"
@@ -1335,8 +1470,11 @@ class KlineBot:
             data = data["data"]
         if isinstance(data, dict):
             data = [data]
-        if not isinstance(data, list):
-            return
+        if isinstance(data, list):
+            self._apply_tickers(data)
+
+    def _apply_tickers(self, data: list) -> None:
+        """Filas {s, c, P|o} (formato del WebSocket) → self._tick."""
         now = time.time()
         for t in data:
             try:
@@ -1352,7 +1490,7 @@ class KlineBot:
                 else:
                     o = float(t["o"])
                     pct = (last - o) / o * 100.0 if o > 0 else 0.0
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError, AttributeError):
                 continue
             self._tick[sym] = (pct, last, now)
         self.ticker_last_ts = now
@@ -1381,8 +1519,8 @@ class KlineBot:
         if added or removed or not old:
             self.log(f"[ratio] vigilados (24 h ≥ ±{wmin:g}%): {len(self.watch)} "
                      f"(+{len(added)} −{len(removed)}) {', '.join(self.watch[:12])}{'…' if len(self.watch) > 12 else ''}")
-        if added and self.price_cache is not None:
-            self.price_cache.ensure_symbols(added)          # bookTicker en vivo
+        # Los vigilados NO se suscriben a precio en vivo (era el mayor consumo de tráfico):
+        # solo los símbolos con posición abierta, ver _refresh_pos_syms.
 
     def _ratio_symbols(self) -> List[str]:
         eng = self.engines[ENGINE_RATIO]
@@ -1390,20 +1528,17 @@ class KlineBot:
             open_syms = {p.symbol for p in eng.positions.values()}
         return list(dict.fromkeys(list(self.watch) + sorted(open_syms)))
 
-    def _rest_get(self, path: str, params: dict):
-        """GET público a Binance por el proxy (y por IP directa si el proxy falla).
+    def _rest_get(self, path: str, params: Optional[dict] = None, timeout: float = 15.0):
+        """GET público a Binance (gzip) por el proxy (y por IP directa si el proxy falla).
         Un 429/418 NO se reintenta por otra ruta: se pausa todo el REST."""
         routes = [REST_PROXY_URL, ""] if REST_PROXY_URL else [""]
         order = routes[self._rest_route:] + routes[:self._rest_route]
-        url = f"{BASE_URL}{path}?{urlencode(params)}"
+        url = f"{BASE_URL}{path}" + (f"?{urlencode(params)}" if params else "")
         last_exc: Optional[Exception] = None
         for proxy in order:
             try:
-                handlers = [urllib.request.ProxyHandler({"http": proxy, "https": proxy})] if proxy else []
-                opener = urllib.request.build_opener(*handlers)
-                req = urllib.request.Request(url, headers={"User-Agent": "BOTKLINE/1.0"})
-                with opener.open(req, timeout=15) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
+                data, nbytes = http_get_json(url, proxy, timeout)
+                self.rx_rest_bytes += nbytes
                 self._rest_route = routes.index(proxy)
                 return data
             except urllib.error.HTTPError as exc:
@@ -1431,7 +1566,7 @@ class KlineBot:
         return pts
 
     async def _ratio_loop(self) -> None:
-        for _ in range(30):                                  # espera los primeros tickers
+        for _ in range(30 if TICKER_MODE == "ws" else 0):    # espera los primeros tickers
             if self._tick:
                 break
             await asyncio.sleep(1.0)
@@ -1452,6 +1587,8 @@ class KlineBot:
         return [s for s in syms if ts[s] < ref]
 
     async def _ratio_cycle(self) -> None:
+        if TICKER_MODE != "ws":
+            await self._refresh_tickers()
         self._refresh_watchlist()
         self.ratio_last_cycle_ts = time.time()
         syms = self._ratio_symbols()
@@ -1532,8 +1669,26 @@ class KlineBot:
             return t[1]
         return None
 
+    def _entry_price(self, sym: str) -> Optional[float]:
+        """Precio para abrir: el del WS o el del 24 h si es fresco; si no (el 24 h va por
+        REST cada 5 min), una consulta REST de ~100 bytes del último precio."""
+        px = self._live_price(sym)
+        if px:
+            return px
+        if time.time() < self._rest_block_until:
+            return None
+        try:
+            data = self._rest_get("/fapi/v1/ticker/price", {"symbol": sym}, timeout=5.0)
+            px = float(data["price"])
+        except Exception as exc:
+            self.ratio_last_error = f"{sym}: precio de entrada: {exc}"
+            return None
+        return px if px > 0 else None
+
     def _ratio_check_tp(self, sym: str, pts: List[Tuple[int, float]]) -> None:
         """TP: el ratio recupera el valor que tenía antes del gatillo."""
+        if not self.ratio_cfg.get("ratio_exit", True):
+            return
         eng = self.engines[ENGINE_RATIO]
         with self.lock:
             targets = [p for p in eng.positions.values()
@@ -1551,8 +1706,7 @@ class KlineBot:
                 hit, best = min(after) <= goal, min(after)
             if not hit:
                 continue
-            price = (self._live_price(sym) or (self.price_cache.get_mark_price(sym) if self.price_cache else None)
-                     or p.last_price or p.entry_price)
+            price = self._live_price(sym) or p.last_price or p.entry_price
             self.log(f"[ratio] TP {p.direction} {sym}: ratio {best:g} alcanzó el objetivo {goal:g} "
                      f"(entrada {p.ratio_entry:g}, recupera {abs(p.ratio_change_pct):.1f}%)")
             self._close(p.trade_id, price, "TP_RATIO")
@@ -1604,7 +1758,7 @@ class KlineBot:
             return skip("ya hay una abierta en este par y dirección")
         if until > time.time():
             return skip("ignorada: en pausa tras cierre")
-        price = self._live_price(sym)
+        price = self._entry_price(sym)
         if not price:
             return skip("sin precio en vivo")
         if sym not in self.filters:
@@ -1618,9 +1772,10 @@ class KlineBot:
             return skip(f"saltada: {why}")
         # TP: el ratio recupera el mismo % que cayó (SHORT) / subió (LONG), desde el ratio de entrada.
         target = last[1] * (1 + abs(chg) / 100.0) if side == strategy.SHORT else last[1] * (1 - abs(chg) / 100.0)
+        tp_px, sl_px = self._ratio_exit_prices(price, side)
         pos = Position(
             trade_id=self._next_trade_id(), symbol=sym, direction=side,
-            entry_price=price, qty=qty, notional=eff, tp_price=0.0,
+            entry_price=price, qty=qty, notional=eff, tp_price=tp_px, sl_price=sl_px,
             signal_pct=chg, candle_open=prev[1], candle_close=last[1], candle_time=last[0],
             last_price=price, strategy=eng.name, inverted=False, sent=not self.executor_paused,
             ratio_trigger=prev[1], ratio_entry=last[1], ratio_change_pct=chg, ratio_ts=last[0],
@@ -1629,15 +1784,14 @@ class KlineBot:
         with self.lock:
             eng.positions[pos.trade_id] = pos
             eng.opened_count += 1
-        self._refresh_pos_syms()
-        if self.price_cache is not None:
-            self.price_cache.ensure_symbols([sym])
+        self._refresh_pos_syms()                            # suscribe el precio en vivo del par
         self.store.mark_dirty(True)
         skip(f"abierta #{pos.trade_id}")
+        by_ratio = (f" · TP ratio {'≥' if side == strategy.SHORT else '≤'} {target:g}"
+                    if self.ratio_cfg["ratio_exit"] else "")
         self.log(f"[{eng.label}] ABRE {side} {sym}{'' if pos.sent else ' [SIMULADA: envíos al executor pausados]'} | "
                  f"ratio {prev[1]:g}→{last[1]:g} ({chg:+.1f}%) | 24 h {pct24:+.1f}% | px={price:g} qty={qty:g} "
-                 f"({eff:.2f} USDT) | TP cuando el ratio {'≥' if side == strategy.SHORT else '≤'} {target:g} | "
-                 f"trade #{pos.trade_id}")
+                 f"({eff:.2f} USDT) | TP {tp_px or '—'} · SL {sl_px or '—'}{by_ratio} | trade #{pos.trade_id}")
         if pos.sent:
             self.executor.send({
                 "action": "open", "trade_id": pos.trade_id, "symbol": sym, "direction": side,
@@ -1661,7 +1815,7 @@ class KlineBot:
             in_range = bool(chg is not None and ((side == strategy.SHORT and -dmax <= chg <= -dmin)
                                                  or (side == strategy.LONG and dmin <= chg <= dmax)))
             rows.append({
-                "symbol": sym, "pct24": t[0] if t else None, "price": t[1] if t else None,
+                "symbol": sym, "pct24": t[0] if t else None, "price": self._price(sym) or (t[1] if t else None),
                 "prev": st.get("prev"), "last": st.get("last"), "chg": chg,
                 "data_time": _utc(st["last_ts"] / 1000, "%H:%M") if st.get("last_ts") else "",
                 "side": side, "in_range": in_range, "has_position": sym in open_syms,
@@ -1674,6 +1828,7 @@ class KlineBot:
             "cfg": cfg, "rows": rows, "watch_count": len(self.watch),
             "long_enabled": not eng.blocked[strategy.LONG], "short_enabled": not eng.blocked[strategy.SHORT],
             "ticker_connected": self.ticker_connected, "ticker_symbols": len(self._tick),
+            "ticker_mode": TICKER_MODE,
             "ticker_age_s": (now - self.ticker_last_ts) if self.ticker_last_ts else None,
             "ticker_error": self.ticker_error,
             "watch_updated": _utc(self.watch_ts, "%H:%M:%S") if self.watch_ts else "",
@@ -1771,6 +1926,7 @@ class KlineBot:
             self.target_hits = int(doc.get("target_hits") or 0)
             self.trade_id_seq = max(int(doc.get("trade_id_seq") or 0), *[p.trade_id for p in all_pos], 0)
         self._refresh_pos_syms()
+        self._apply_ratio_exits()                   # TP/SL vigentes también para las recuperadas
         if not self.store.enable_writes():
             self.log("[estado] Perdí el control mientras aplicaba el estado; sigo esperando")
             return
@@ -1812,30 +1968,48 @@ class KlineBot:
             "SHORT": agg([r for r in rows if r.get("direction") == strategy.SHORT]),
         }
 
-    def _engine_snapshot(self, eng: Engine, now: float) -> dict:
+    # Campos que pinta la web (el resto queda en /api/trades y el CSV): menos bytes por consulta.
+    _POS_FIELDS = ("trade_id", "symbol", "direction", "entry_price", "notional", "tp_price", "sl_price",
+                   "signal_pct", "candle_age_s", "inverted", "sent", "mfe_pct", "mae_pct", "mfe_usd",
+                   "mae_usd", "ratio_trigger", "ratio_entry", "ratio_change_pct", "ratio_target")
+    _CLOSED_FIELDS = ("symbol", "direction", "entry_price", "close_price", "move_pct", "pnl", "fees",
+                      "mfe_pct", "mae_pct", "duration_s", "reason", "sent")
+    _SIGNAL_FIELDS = ("time", "symbol", "direction", "candle", "open", "close", "body_pct",
+                      "candle_age_s", "action")
+    WEB_CLOSED_ROWS = 50
+    WEB_SIGNAL_ROWS = 40
+
+    def _engine_snapshot(self, eng: Engine, now: float, detail: bool = True) -> dict:
+        """Estado de un bot para la web. Sin `detail` (bots que no se están viendo) solo
+        van las cifras y las posiciones abiertas, no señales, cierres ni estadísticas."""
         with self.lock:
             positions = []
             for p in sorted(eng.positions.values(), key=lambda p: p.opened_ts, reverse=True):
                 price = self._price(p.symbol) or p.last_price
-                positions.append({
-                    **asdict(p),
-                    "price":    price,
-                    "move_pct": strategy.favorable_move_pct(price, p.entry_price, p.direction),
-                    "pnl":      self._net_pnl(p, price),
-                    "age_s":    now - p.opened_ts,
-                    "opened":   _utc(p.opened_ts, "%m-%d %H:%M:%S"),
-                })
-            closed = [{**t, "closed": _utc(t.get("closed_at_ts", 0), "%m-%d %H:%M:%S")}
-                      for t in eng.closed_trades[:100]]
-            signals = list(eng.signals)[:60]
+                row = {k: getattr(p, k) for k in self._POS_FIELDS}
+                row.update(price=price,
+                           move_pct=strategy.favorable_move_pct(price, p.entry_price, p.direction),
+                           pnl=self._net_pnl(p, price), age_s=round(now - p.opened_ts),
+                           opened=_utc(p.opened_ts, "%m-%d %H:%M:%S"))
+                positions.append(row)
+            if detail:
+                closed = [{**{k: t.get(k) for k in self._CLOSED_FIELDS},
+                           "closed": _utc(t.get("closed_at_ts", 0), "%m-%d %H:%M:%S")}
+                          for t in eng.closed_trades[:self.WEB_CLOSED_ROWS]]
+                signals = [{k: sg.get(k) for k in self._SIGNAL_FIELDS}
+                           for sg in list(eng.signals)[:self.WEB_SIGNAL_ROWS]]
+            else:
+                closed, signals = [], []
             wins = sum(1 for t in eng.closed_trades if t.get("pnl", 0) > 0)
             closed_count = len(eng.closed_trades)
             decide = list(eng._decide_ms)
+        empty_eval = {"total": 0, "minutes": [], "top": [], "top_minute": ""}
         return {
             "name":           eng.name,
             "label":          eng.label,
             "hint":           ENGINE_HINTS[eng.name],
             "config":         eng.settings(),
+            "detail":         detail,
             "signal_count":   eng.signal_count,
             "opened_count":   eng.opened_count,
             "closed_count":   closed_count,
@@ -1846,10 +2020,23 @@ class KlineBot:
             "positions":      positions,
             "closed_trades":  closed,
             "signals":        signals,
-            "excursions":     self.excursion_stats(eng),
-            "evaluations":    (self.evaluations(eng.threshold_pct) if eng.name != ENGINE_RATIO else
-                               {"total": 0, "minutes": [], "top": [], "top_minute": ""}),
+            "excursions":     self.excursion_stats(eng) if detail else None,
+            "evaluations":    (self.evaluations(eng.threshold_pct)
+                               if detail and KLINE_BOTS_ENABLED and eng.name != ENGINE_RATIO else empty_eval),
         }
+
+    def network_stats(self) -> dict:
+        """Bytes recibidos/enviados desde el arranque, para vigilar el ancho de banda."""
+        pc = self.price_cache
+        ks = self.kline_stream.get_stats() if self.kline_stream else {}
+        rx = {"rest": self.rx_rest_bytes, "ticker": self.rx_ticker_bytes,
+              "prices": pc.rx_bytes if pc else 0, "klines": int(ks.get("rx_bytes") or 0)}
+        up = max(time.time() - self.started_at, 1.0)
+        total = sum(rx.values())
+        return {"rx": rx, "rx_total": total, "web_tx": self.tx_web_bytes,
+                "rx_per_hour": total / up * 3600, "web_per_hour": self.tx_web_bytes / up * 3600,
+                "price_stream": PRICE_STREAM, "ticker_mode": TICKER_MODE,
+                "price_symbols": len(pc.symbols) if pc else 0}
 
     def _global_snapshot(self) -> dict:
         realized, unreal = self.session_pnl()
@@ -1862,10 +2049,12 @@ class KlineBot:
             "target_hits": self.target_hits, "last_target": self.last_target,
         }
 
-    def snapshot(self) -> dict:
+    def snapshot(self, detail: Optional[str] = None) -> dict:
+        """Estado para la web. `detail` = bot del que se manda el detalle completo
+        (señales, cierres, MFE/MAE); None = de todos (compatibilidad de la API)."""
         now = time.time()
         with self.lock:
-            events = list(self.events)[:80]
+            events = list(self.events)[:50]
         ks = self.kline_stream.get_stats() if self.kline_stream else {}
         k1 = (ks.get("intervals") or {}).get(KLINE_INTERVAL, {})
         pc = self.price_cache
@@ -1896,7 +2085,9 @@ class KlineBot:
             "eval_total":      self.eval_count,
             "ratio":           self._ratio_snapshot(),
             "global":          self._global_snapshot(),
-            "engines":         {n: self._engine_snapshot(e, now) for n, e in self.engines.items()},
+            "engines":         {n: self._engine_snapshot(e, now, detail is None or n == detail)
+                                for n, e in self.engines.items()},
+            "net":             self.network_stats(),
             "events":          events,
             "last_error":      self.last_error,
             "persistence":     self.store.status(),
@@ -1911,12 +2102,47 @@ bot = KlineBot()
 bot.start()
 atexit.register(bot.shutdown)
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder=None)
+app.json.sort_keys = False
+app.json.compact = True
+
+_GZIP_TYPES = ("application/json", "text/html", "text/csv", "text/plain")
+_GZIP_MIN_BYTES = 1024
+
+
+@app.after_request
+def _compress(resp):
+    """gzip para JSON/HTML/CSV (el estado se comprime ~8-10×) y cuenta los bytes enviados."""
+    try:
+        if (resp.status_code == 200 and not resp.direct_passthrough
+                and "gzip" in (request.headers.get("Accept-Encoding") or "").lower()
+                and "Content-Encoding" not in resp.headers
+                and (resp.mimetype or "") in _GZIP_TYPES):
+            data = resp.get_data()
+            if len(data) >= _GZIP_MIN_BYTES:
+                resp.set_data(gzip.compress(data, compresslevel=6))
+                resp.headers["Content-Encoding"] = "gzip"
+                resp.headers["Content-Length"] = str(len(resp.get_data()))
+            resp.vary.add("Accept-Encoding")
+        if not resp.direct_passthrough:
+            bot.tx_web_bytes += resp.calculate_content_length() or 0
+    except Exception:
+        pass
+    return resp
 
 
 def _no_store(resp):
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     return resp
+
+
+def _load_page() -> Tuple[bytes, str]:
+    with open(os.path.join(WEB_DIR, "index.html"), "rb") as fh:
+        html = fh.read().replace(b"__POLL_MS__", str(STATUS_POLL_MS).encode())
+    return html, hashlib.sha1(html).hexdigest()[:16]
+
+
+PAGE, PAGE_ETAG = _load_page()
 
 
 def _guard():
@@ -1945,12 +2171,24 @@ def _engine_param(data: Optional[dict] = None, default: Optional[str] = ENGINE_C
 
 @app.get("/")
 def index():
-    return _no_store(make_response(HTML.replace("__POLL_MS__", str(STATUS_POLL_MS))))
+    """Panel. Con ETag: al recargar, el navegador recibe un 304 vacío si no cambió."""
+    if PAGE_ETAG in (request.headers.get("If-None-Match") or ""):
+        resp = make_response("", 304)
+    else:
+        resp = make_response(PAGE)
+        resp.mimetype = "text/html"
+    resp.set_etag(PAGE_ETAG)
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
 
 
 @app.get("/api/status")
 def api_status():
-    return _no_store(jsonify(bot.snapshot()))
+    """Estado completo. ?engine=close|live|ratio manda el detalle solo de ese bot (la web lo usa)."""
+    engine = (request.args.get("engine") or "").lower() or None
+    if engine is not None and engine not in bot.engines:
+        engine = None
+    return _no_store(jsonify(bot.snapshot(engine)))
 
 
 @app.get("/api/executor")
@@ -2067,24 +2305,33 @@ def api_ratio_get():
 
 @app.post("/api/ratio")
 def api_ratio_set():
-    """Ajusta el bot de ratio. Body JSON (todo opcional): {"watch_min_pct": 20,
-    "drop_min_pct": 25, "drop_max_pct": 30}. LONG/SHORT se activan con /api/block
-    ({"engine": "ratio", "direction": "LONG", "blocked": false})."""
+    """Ajusta el bot de ratio en caliente. Body JSON (todo opcional): {"watch_min_pct": 20,
+    "drop_min_pct": 25, "drop_max_pct": 30, "tp_pct": 10, "sl_pct": 5, "ratio_exit": true}.
+    tp_pct/sl_pct = TP y SL por precio en % de la entrada (0 = apagado; el SL se puede
+    mandar como -5); también se aplican a las posiciones abiertas. LONG/SHORT se activan
+    con /api/block ({"engine": "ratio", "direction": "LONG", "blocked": false})."""
     busy = _guard()
     if busy:
         return busy
     data = request.get_json(silent=True) or {}
     vals = {}
-    for key, hi in (("watch_min_pct", 1000), ("drop_min_pct", 100), ("drop_max_pct", 100)):
+    for key, lo, hi in (("watch_min_pct", 0, 1000), ("drop_min_pct", 0, 100), ("drop_max_pct", 0, 100),
+                        ("tp_pct", None, 1000), ("sl_pct", None, 99.9)):
         if data.get(key) in (None, ""):
             continue
         try:
             v = float(data[key])
         except (TypeError, ValueError):
             return jsonify({"ok": False, "error": f"{key} inválido"}), 400
-        if not 0 < v <= hi:
+        if lo is None:
+            v = abs(v)                                      # TP/SL: 0 = apagado, el signo da igual
+            if v > hi:
+                return jsonify({"ok": False, "error": f"{key} debe estar entre 0 y {hi:g}"}), 400
+        elif not lo < v <= hi:
             return jsonify({"ok": False, "error": f"{key} debe estar entre 0 y {hi:g}"}), 400
         vals[key] = v
+    if "ratio_exit" in data:
+        vals["ratio_exit"] = bool(data["ratio_exit"])
     if not vals:
         return jsonify({"ok": False, "error": "Nada que cambiar"}), 400
     try:
@@ -2205,7 +2452,7 @@ TRADE_CSV_COLS = [
     "strategy", "trade_id", "symbol", "direction", "reason", "opened_ts", "closed_at_ts", "duration_s",
     "inverted", "signal_pct", "candle_age_s", "entry_price", "close_price", "qty", "notional", "tp_price",
     "sent", "move_pct", "pnl", "pnl_gross", "fees", "pnl_pct", "mfe_pct", "mae_pct", "mfe_usd", "mae_usd", "time_to_mfe_s",
-    "time_to_mae_s", "high_price", "low_price", "ratio_target", "ratio_trigger", "ratio_entry", "ratio_change_pct",
+    "time_to_mae_s", "high_price", "low_price", "sl_price", "ratio_target", "ratio_trigger", "ratio_entry", "ratio_change_pct",
 ]
 
 
@@ -2229,14 +2476,16 @@ def api_trades_csv():
 
 @app.get("/health")
 def health():
-    snap = bot.snapshot()
-    return jsonify({
-        "ok": True, "running": bot.running,
-        "positions": {n: len(e["positions"]) for n, e in snap["engines"].items()},
-        "klines": snap["klines"], "prices_connected": snap["prices_connected"],
-        "executor": snap["executor"]["url"], "persistence": snap["persistence"],
-        "last_error": snap["last_error"],
-    })
+    """Chequeo ligero (no arma el estado completo)."""
+    pc = bot.price_cache
+    with bot.lock:
+        positions = {n: len(e.positions) for n, e in bot.engines.items()}
+    return _no_store(jsonify({
+        "ok": True, "running": bot.running, "positions": positions,
+        "prices_connected": bool(pc and pc.is_connected()), "ticker_ok": bot.ticker_connected,
+        "executor": bot.executor.target.url, "persistence": bot.store.status().get("mode"),
+        "last_error": bot.last_error, "net": bot.network_stats(),
+    }))
 
 
 @app.get("/api/recovery")
@@ -2247,642 +2496,6 @@ def api_recovery():
     return _no_store(jsonify({"status": bot.store.status(), "document": doc}))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# WEB
-# ─────────────────────────────────────────────────────────────────────────────
-
-HTML = r"""<!doctype html>
-<html lang="es">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>BOTKLINE · velas 1m</title>
-<style>
-  :root { --bg:#0b1020; --panel:#121933; --panel2:#0f1630; --line:#26304f; --txt:#e8edf8; --muted:#8e9bbb;
-          --green:#34d399; --red:#f87171; --amber:#fbbf24; --blue:#60a5fa; --radius:14px; }
-  * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--txt); font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
-         font-variant-numeric:tabular-nums; }
-  main { max-width:1240px; margin:0 auto; padding:16px; }
-  .muted { color:var(--muted); } .pos { color:var(--green); } .neg { color:var(--red); } .warn { color:var(--amber); }
-  small { font-size:12px; }
-
-  /* Cabecera */
-  .top { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between; margin-bottom:12px; }
-  .brand { font-size:20px; font-weight:800; letter-spacing:.3px; }
-  .brand small { font-weight:400; color:var(--muted); margin-left:6px; }
-  .pills { display:flex; flex-wrap:wrap; gap:6px; }
-  .pill { border:1px solid var(--line); background:var(--panel2); border-radius:999px; padding:3px 10px; font-size:12px; }
-  .pill.ok { border-color:rgba(52,211,153,.4); color:var(--green); }
-  .pill.bad { border-color:rgba(248,113,113,.4); color:var(--red); }
-  .pill.alert { border-color:rgba(251,191,36,.5); color:var(--amber); }
-  #rules { margin:-4px 0 12px; }
-
-  /* Tarjetas de cifras */
-  .kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:10px; margin-bottom:14px; }
-  .kpi { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:12px 14px; }
-  .kpi .label { color:var(--muted); font-size:12px; }
-  .kpi .v { font-size:20px; font-weight:700; margin-top:2px; }
-  .bar { height:6px; background:var(--panel2); border-radius:99px; overflow:hidden; margin-top:8px; }
-  .bar > i { display:block; height:100%; width:0; background:var(--green); transition:width .4s; }
-
-  /* Secciones plegables */
-  details.panel { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); margin-bottom:12px; }
-  details.panel > summary { list-style:none; cursor:pointer; padding:12px 16px; font-weight:700; font-size:15px;
-                            display:flex; gap:8px; align-items:center; user-select:none; }
-  details.panel > summary::-webkit-details-marker { display:none; }
-  details.panel > summary::before { content:'▸'; color:var(--muted); transition:transform .15s; display:inline-block; width:12px; }
-  details.panel[open] > summary::before { transform:rotate(90deg); }
-  details.panel > summary .hint { font-weight:400; font-size:12px; color:var(--muted); }
-  details.panel > summary .badge { margin-left:auto; }
-  .body { padding:0 16px 14px; }
-  .badge { background:var(--panel2); border:1px solid var(--line); border-radius:999px; padding:1px 9px; font-size:12px; font-weight:600; }
-
-  /* Tarjetas de bots */
-  .bots { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:10px; }
-  .bot { background:var(--panel2); border:1px solid var(--line); border-radius:12px; padding:12px; }
-  .bot.sel { border-color:var(--blue); }
-  .bot.paused { opacity:.8; border-style:dashed; }
-  .bot h3 { margin:0; font-size:15px; display:flex; align-items:center; gap:8px; }
-  .bot .rows { display:grid; grid-template-columns:repeat(4,1fr); gap:6px; margin:10px 0; }
-  .bot .rows div { font-size:12px; color:var(--muted); } .bot .rows b { display:block; color:var(--txt); font-size:14px; }
-  .bot .acts { display:flex; gap:6px; flex-wrap:wrap; }
-
-  /* Tablas */
-  .scroll { overflow:auto; max-height:430px; border:1px solid var(--line); border-radius:10px; }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  th, td { padding:7px 9px; border-bottom:1px solid var(--line); text-align:right; white-space:nowrap; }
-  th:first-child, td:first-child { text-align:left; }
-  thead th { position:sticky; top:0; background:#162043; color:var(--muted); font-weight:600; z-index:1; }
-  tbody tr:hover td { background:rgba(96,165,250,.05); }
-  .tag { padding:2px 8px; border-radius:999px; font-weight:700; font-size:11px; }
-  .LONG { background:rgba(52,211,153,.15); color:var(--green); } .SHORT { background:rgba(248,113,113,.15); color:var(--red); }
-  .st { padding:2px 8px; border-radius:999px; font-size:11px; font-weight:700; }
-  .st.on { background:rgba(52,211,153,.15); color:var(--green); } .st.off { background:rgba(251,191,36,.15); color:var(--amber); }
-
-  /* Formularios y botones */
-  form, .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-  input { flex:1 1 200px; background:var(--panel2); color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:8px 10px; font:inherit; }
-  label.f { flex:1 1 200px; display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--muted); }
-  label.f input { flex:none; }
-  button { background:var(--blue); color:#06101f; border:0; border-radius:8px; padding:8px 14px; font-weight:700; cursor:pointer; font:inherit; font-weight:700; }
-  button:hover { filter:brightness(1.1); }
-  button.ghost { background:#24305a; color:var(--txt); }
-  button.danger { background:var(--red); color:#1a0606; }
-  button.ok { background:var(--green); }
-  button.warnb { background:var(--amber); }
-  button.small { padding:4px 10px; font-size:12px; }
-  .msg { margin-top:8px; min-height:18px; }
-  .sub { font-size:13px; font-weight:700; margin:14px 0 8px; color:var(--muted); }
-
-  /* Pestañas */
-  .tabs { display:flex; gap:8px; flex-wrap:wrap; position:sticky; top:0; z-index:5; background:var(--bg); padding:10px 0; margin:6px 0 4px; }
-  .tabs button { background:#24305a; color:var(--txt); padding:9px 16px; }
-  .tabs button.on { background:var(--blue); color:#06101f; }
-  .tabs button.on .pos, .tabs button.on .neg { color:#06101f; }
-  .tabs button * { pointer-events:none; }
-  #engHint { margin:0 0 10px; }
-  pre { margin:0; max-height:320px; overflow:auto; font-size:12px; color:var(--muted); white-space:pre-wrap; }
-  @media (max-width:640px) { .bot .rows { grid-template-columns:repeat(2,1fr); } }
-</style>
-</head>
-<body>
-<main>
-  <div class="top">
-    <div class="brand">BOTKLINE <small>ratio top traders · short a los que más suben</small></div>
-    <div class="pills" id="pills"></div>
-  </div>
-  <div class="muted" id="rules"></div>
-
-  <section class="kpis">
-    <div class="kpi"><div class="label">PnL de la sesión <span id="sessTarget"></span></div><div class="v" id="sessPnl">—</div>
-      <div class="bar"><i id="sessBar"></i></div><small class="muted" id="sessDetail"></small></div>
-    <div class="kpi"><div class="label">PnL realizado (total)</div><div class="v" id="sRpnlAll">—</div><small class="muted" id="sWins"></small></div>
-    <div class="kpi"><div class="label">PnL abierto (total)</div><div class="v" id="sUpnlAll">—</div></div>
-    <div class="kpi"><div class="label">Posiciones abiertas</div><div class="v" id="sOpen">—</div><small class="muted" id="sOpenLim"></small></div>
-    <div class="kpi"><div class="label" id="kKlLabel">Vigilados (24 h)</div><div class="v" id="sKl">—</div><small class="muted" id="sEval"></small></div>
-  </section>
-
-  <details class="panel" data-key="control" open>
-    <summary>Control <span class="hint">pausar bots, invertir, cerrar todo, objetivo y límite</span></summary>
-    <div class="body">
-      <div class="bots" id="bots"></div>
-
-      <div class="sub">Acciones para los dos bots</div>
-      <div class="row">
-        <button type="button" id="btnInvert">—</button>
-        <button type="button" class="danger" id="btnCloseAll">Cerrar TODAS las posiciones</button>
-        <button type="button" id="btnExPause">—</button>
-        <button type="button" class="ghost" id="btnReset">Poner a cero el PnL de la sesión</button>
-      </div>
-      <div class="muted" id="modeHint" style="margin-top:8px"></div>
-      <div class="muted" id="sessHits" style="margin-top:4px"></div>
-
-      <div class="sub">Ajustes</div>
-      <form id="glbForm">
-        <label class="f">Objetivo en USD para cerrar todo (0 = apagado) <span id="curTarget"></span>
-          <input id="glbTarget" type="number" step="0.01" min="0" placeholder="ej. 12"></label>
-        <label class="f">Límite de posiciones abiertas, los dos bots (0 = sin límite) <span id="curMax"></span>
-          <input id="glbMax" type="number" step="1" min="0" placeholder="ej. 10"></label>
-        <label class="f">Fee % por lado <span id="curFee"></span>
-          <input id="glbFee" type="number" step="0.001" min="0" max="1" placeholder="ej. 0.05"></label>
-        <button type="submit" style="align-self:flex-end">Guardar</button>
-      </form>
-      <div class="row" style="margin-top:8px" id="tokenRow">
-        <input id="exToken" type="password" placeholder="Token admin (si está configurado)" autocomplete="off" style="display:none;max-width:320px">
-      </div>
-      <div id="glbMsg" class="muted msg"></div>
-    </div>
-  </details>
-
-  <details class="panel" data-key="ratio" open>
-    <summary>Ratio top traders <span class="hint" id="rtSum"></span> <span class="badge" id="rtN">0</span></summary>
-    <div class="body">
-      <div class="muted" id="rtInfo"></div>
-      <form id="rtForm" style="margin-top:10px">
-        <label class="f">Vigilar símbolos con 24 h ≥ ±% <span id="rtCurW"></span>
-          <input id="rtWatch" type="number" step="0.1" min="0.1" max="1000" placeholder="ej. 20"></label>
-        <label class="f">Caída MÍNIMA del ratio, % <span id="rtCurMin"></span>
-          <input id="rtMin" type="number" step="0.1" min="0.1" max="100" placeholder="ej. 25"></label>
-        <label class="f">Caída MÁXIMA del ratio, % <span id="rtCurMax"></span>
-          <input id="rtMax" type="number" step="0.1" min="0.1" max="100" placeholder="ej. 30"></label>
-        <button type="submit" style="align-self:flex-end">Guardar</button>
-      </form>
-      <div class="row" style="margin-top:8px">
-        <button type="button" id="rtBtnShort">SHORT</button>
-        <button type="button" id="rtBtnLong">LONG</button>
-        <span class="muted">SHORT: ganadores (24 h ≥ +X %), el ratio cae. LONG (espejo): perdedores (24 h ≤ −X %), el ratio sube.</span>
-      </div>
-      <div id="rtMsg" class="muted msg"></div>
-      <div class="scroll"><table>
-        <thead><tr><th>Símbolo</th><th>24 h</th><th>Precio</th><th>Ratio antes</th><th>Ratio ahora</th><th>Cambio</th><th>Dato</th><th>Lado</th><th>Estado</th></tr></thead>
-        <tbody id="tRt"></tbody></table></div>
-    </div>
-  </details>
-
-  <div class="tabs" id="tabs"></div>
-  <div class="muted" id="engHint"></div>
-
-  <details class="panel" data-key="pos" open>
-    <summary>Posiciones abiertas · <span class="engName"></span> <span class="badge" id="nPos">0</span></summary>
-    <div class="body">
-      <div class="row" style="margin-bottom:8px">
-        <span class="muted" id="engPnl"></span>
-        <button type="button" class="danger small" id="btnCloseEng" style="margin-left:auto">Cerrar todas las de este bot</button>
-      </div>
-      <div class="scroll"><table>
-        <thead><tr><th>Símbolo</th><th>Dir.</th><th>Vela</th><th>Entrada</th><th>Precio</th><th>Avance</th><th>Salida</th><th>Notional</th><th>PnL neto</th><th>MFE</th><th>MAE</th><th>Abierta</th><th></th></tr></thead>
-        <tbody id="tPos"></tbody></table></div>
-    </div>
-  </details>
-
-  <details class="panel" data-key="cfg">
-    <summary>Parámetros · <span class="engName"></span> <span class="hint" id="cfgSum"></span></summary>
-    <div class="body">
-      <div class="muted">Señal actual: <b id="cfgThr">—</b> · <span id="cfgTpLbl">TP</span> actual: <b id="cfgTp">—</b> · <span id="engLat"></span></div>
-      <form id="cfgForm" style="margin-top:10px">
-        <input id="cfgNewThr" type="number" step="0.01" min="0.01" max="100" placeholder="% cuerpo de vela para entrar (ej. 3)">
-        <input id="cfgNewTp" type="number" step="0.01" min="0.01" max="100" placeholder="% take profit (normal) / stop loss (invertido)">
-        <button type="submit">Guardar</button>
-      </form>
-      <div id="cfgMsg" class="muted msg"></div>
-      <div class="row">
-        <button type="button" id="btnLong" data-block="LONG">LONG</button>
-        <button type="button" id="btnShort" data-block="SHORT">SHORT</button>
-        <span class="muted">Solo afecta a este bot. Bloquear frena las entradas nuevas de esa dirección.</span>
-      </div>
-    </div>
-  </details>
-
-  <details class="panel" data-key="sig">
-    <summary>Señales recientes · <span class="engName"></span> <span class="badge" id="nSig">0</span></summary>
-    <div class="body"><div class="scroll"><table>
-      <thead><tr><th>Hora</th><th>Símbolo</th><th>Dir.</th><th id="thSigC">Vela</th><th id="thSigB">Cuerpo</th><th id="thSigS">Segundo</th><th>Acción</th></tr></thead>
-      <tbody id="tSig"></tbody></table></div></div>
-  </details>
-
-  <details class="panel" data-key="closed">
-    <summary>Operaciones cerradas · <span class="engName"></span> <span class="badge" id="nClosed">0</span></summary>
-    <div class="body"><div class="scroll"><table>
-      <thead><tr><th>Cierre</th><th>Símbolo</th><th>Dir.</th><th>Entrada</th><th>Salida</th><th>Avance</th><th>PnL neto</th><th>Fees</th><th>MFE</th><th>MAE</th><th>Duración</th><th>Motivo</th></tr></thead>
-      <tbody id="tClosed"></tbody></table></div></div>
-  </details>
-
-  <details class="panel" data-key="exc">
-    <summary>MFE / MAE de las cerradas · <span class="engName"></span> <a id="csvLink" class="hint" href="/api/trades.csv" onclick="event.stopPropagation()">descargar CSV</a></summary>
-    <div class="body"><div class="scroll"><table>
-      <thead><tr><th>Dirección</th><th>Ops</th><th>Ganadas</th><th>MFE medio</th><th>MAE medio</th><th>Mejor MFE</th><th>Peor MAE</th><th>MAE medio USD</th><th>Hasta MAE</th><th>Duración media</th></tr></thead>
-      <tbody id="tExc"></tbody></table></div></div>
-  </details>
-
-  <details class="panel" data-key="eval">
-    <summary>Evaluaciones <span class="hint">cuerpo al cierre, con el umbral de <span class="engName"></span></span></summary>
-    <div class="body">
-      <div class="sub" style="margin-top:0">Mayores cuerpos de la vela <span id="evMin"></span></div>
-      <div class="scroll"><table>
-        <thead><tr><th>Símbolo</th><th>Apertura</th><th>Cierre</th><th>Cuerpo</th><th>Señal</th></tr></thead>
-        <tbody id="tTop"></tbody></table></div>
-      <div class="sub">Por minuto</div>
-      <div class="scroll"><table>
-        <thead><tr><th>Vela</th><th>Evaluadas</th><th>≥ umbral (LONG)</th><th>≤ −umbral (SHORT)</th><th>Mayor subida</th><th>Mayor caída</th></tr></thead>
-        <tbody id="tMin"></tbody></table></div>
-    </div>
-  </details>
-
-  <details class="panel" data-key="exec">
-    <summary>Executor <span class="hint" id="exSum"></span></summary>
-    <div class="body">
-      <div class="muted">Actual: <b id="exUrl">—</b> · enviadas <span id="exSent">0</span> · errores <span id="exErr">0</span></div>
-      <div class="muted" id="exLat" style="margin-top:4px"></div>
-      <form id="exForm" style="margin-top:10px">
-        <input id="exNew" type="url" placeholder="https://mi-executor.onrender.com" autocomplete="off">
-        <input id="exSecret" type="password" placeholder="Secreto (opcional, vacío = mantener)" autocomplete="off">
-        <button type="submit">Cambiar link</button>
-      </form>
-      <div id="exMsg" class="muted msg"></div>
-    </div>
-  </details>
-
-  <details class="panel" data-key="events">
-    <summary>Eventos <span class="hint">los dos bots</span></summary>
-    <div class="body"><pre id="events"></pre></div>
-  </details>
-</main>
-<script>
-const q = id => document.getElementById(id);
-const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const num = (v, d=4) => (v === null || v === undefined || isNaN(v)) ? '—' : (+v).toLocaleString('es', {maximumFractionDigits:d});
-const pct = v => `<span class="${v >= 0 ? 'pos' : 'neg'}">${v >= 0 ? '+' : ''}${(+v).toFixed(2)}%</span>`;
-const usd = v => `<span class="${v >= 0 ? 'pos' : 'neg'}">${v >= 0 ? '+' : ''}${(+v).toFixed(4)}</span>`;
-const dur = s => { s = Math.floor(s); const h = Math.floor(s/3600), m = Math.floor(s%3600/60);
-                   return h ? `${h}h ${m}m` : m ? `${m}m ${s%60}s` : `${s}s`; };
-const tag = d => `<span class="tag ${esc(d)}">${esc(d)}</span>`;
-const store = {get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } },
-               set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }};
-let cur = store.get('botkline_engine', 'ratio'), last = null;
-q('exToken').value = store.get('botkline_token', '');
-
-// Secciones plegables: se recuerda cuáles están abiertas.
-const folds = JSON.parse(store.get('botkline_folds', '{}') || '{}');
-document.querySelectorAll('details.panel').forEach(d => {
-  const k = d.dataset.key;
-  if (k in folds) d.open = folds[k];
-  d.addEventListener('toggle', () => { folds[k] = d.open; store.set('botkline_folds', JSON.stringify(folds)); });
-});
-
-function headers() {
-  const h = {'Content-Type': 'application/json'};
-  const t = q('exToken').value.trim();
-  if (t) h['X-Admin-Token'] = t;
-  return h;
-}
-async function post(url, body) {
-  store.set('botkline_token', q('exToken').value.trim());
-  const r = await fetch(url, {method: 'POST', headers: headers(), body: JSON.stringify(body || {})});
-  return r.json();
-}
-
-async function refresh() {
-  try { last = await (await fetch('/api/status', {cache: 'no-store'})).json(); } catch (e) { return; }
-  render(last);
-}
-
-function render(d) {
-  const c = d.config, g = d.global, names = Object.keys(d.engines);
-  if (!d.engines[cur]) cur = names[0];
-  const e = d.engines[cur], ec = e.config, xk = g.inverted ? 'SL' : 'TP';
-  const sum = f => names.reduce((s, n) => s + f(d.engines[n]), 0);
-
-  // Cabecera
-  const k = d.klines, p = d.persistence || {}, x = d.executor;
-  q('pills').innerHTML = [
-    `<span class="pill ${g.inverted ? 'alert' : 'ok'}">${g.inverted ? 'Modo INVERTIDO' : 'Modo normal'}</span>`,
-    ...names.map(n => `<span class="pill ${d.engines[n].config.paused ? 'alert' : 'ok'}">${esc(d.engines[n].label)}: ${d.engines[n].config.paused ? 'pausado' : 'en marcha'}</span>`),
-    ...(k.enabled ? [`<span class="pill ${k.active ? 'ok' : 'bad'}">Velas ${k.active ? 'conectadas' : 'desconectadas'}</span>`] : []),
-    ...(d.ratio ? [`<span class="pill ${d.ratio.ticker_connected ? 'ok' : 'bad'}">Ticker 24 h ${d.ratio.ticker_connected ? 'conectado' : 'desconectado'}</span>`,
-                   `<span class="pill ${d.ratio.rest_blocked_s > 0 ? 'bad' : 'ok'}">Ratio REST ${d.ratio.rest_blocked_s > 0 ? 'en pausa' : 'ok'}</span>`] : []),
-    `<span class="pill ${!x.url ? 'bad' : g.executor_paused ? 'alert' : (x.errors && x.last_error ? 'alert' : 'ok')}">Executor ${!x.url ? 'sin link' : g.executor_paused ? 'PAUSADO (prueba)' : 'activo'}</span>`,
-    `<span class="pill ${p.mode === 'ok' || p.mode === 'local' ? 'ok' : 'alert'}">Estado ${esc(p.mode)}</span>`,
-  ].join('');
-  q('rules').textContent = g.inverted
-    ? `Cuerpo de la vela 1m ≥ umbral → entra CONTRA la vela · el % es stop loss, sin TP · ${c.notional} USDT por entrada · fee ${g.fee_pct}% por lado`
-    : `Cuerpo de la vela 1m ≥ umbral → sigue la tendencia · el % es take profit, sin stop loss · ${c.notional} USDT por entrada · fee ${g.fee_pct}% por lado`;
-  if (d.ratio) {
-    const rc = d.ratio.cfg;
-    q('rules').textContent = `Ratio top traders: vigila 24 h ≥ ±${rc.watch_min_pct}% · SHORT si el ratio cae ${rc.drop_min_pct}–${rc.drop_max_pct}% en 5 min · TP cuando el ratio recupera el mismo % que cayó · ${c.notional} USDT por entrada · fee ${g.fee_pct}% por lado`;
-  }
-
-  // Cifras
-  q('sessPnl').innerHTML = usd(g.session_pnl);
-  q('sessTarget').textContent = g.profit_target_usd > 0 ? `· objetivo +${g.profit_target_usd} USD` : '· objetivo apagado';
-  q('sessBar').style.width = g.profit_target_usd > 0 ? `${Math.max(0, Math.min(100, g.session_pnl / g.profit_target_usd * 100))}%` : '0';
-  q('sessDetail').innerHTML = `realizado ${usd(g.session_realized)} + abierto ${usd(g.session_unrealized)} · desde ${esc(g.session_since)}`;
-  q('sRpnlAll').innerHTML = usd(sum(n => n.realized_pnl));
-  q('sWins').textContent = `${sum(n => n.wins)}/${sum(n => n.closed_count)} ganadas · netas de fees`;
-  q('sUpnlAll').innerHTML = usd(sum(n => n.unrealized_pnl));
-  q('sOpen').textContent = g.open_count;
-  q('sOpenLim').textContent = g.max_open > 0 ? `límite ${g.max_open}` : 'sin límite';
-  if (d.ratio) {
-    q('sKl').innerHTML = `${d.ratio.watch_count}`;
-    q('sEval').textContent = `de ${d.ratio.ticker_symbols} símbolos · lista de ${d.ratio.watch_updated || '—'}`;
-  } else {
-    q('sKl').innerHTML = `${k.with_data}/${k.symbols}`;
-    q('sEval').textContent = `${k.active}/${k.connections} conexiones · ${d.eval_total.toLocaleString('es')} velas evaluadas`;
-  }
-
-  // Control
-  const rcfg = (d.ratio || {}).cfg || {};
-  q('bots').innerHTML = names.map(n => { const b = d.engines[n], bc = b.config;
-    const bl = [bc.block_long && 'LONG', bc.block_short && 'SHORT'].filter(Boolean).join(', ');
-    return `<div class="bot ${n === cur ? 'sel' : ''} ${bc.paused ? 'paused' : ''}">
-      <h3>${esc(b.label)} <span class="st ${bc.paused ? 'off' : 'on'}">${bc.paused ? 'PAUSADO' : 'EN MARCHA'}</span></h3>
-      <div class="muted" style="font-size:12px;margin-top:2px">${esc(b.hint)}</div>
-      <div class="rows">
-        ${n === 'ratio' ? `<div>Caída ratio<b>${rcfg.drop_min_pct}–${rcfg.drop_max_pct}%</b></div><div>TP<b>ratio recupera %</b></div>`
-                        : `<div>Señal<b>±${bc.threshold_pct}%</b></div><div>${xk}<b>${bc.tp_pct}%</b></div>`}
-        <div>Abiertas<b>${b.positions.length}</b></div><div>Bloqueados<b class="${bl ? 'neg' : ''}">${bl || '—'}</b></div>
-        <div>Señales / abiertas<b>${b.signal_count} / ${b.opened_count}</b></div><div>Cerradas<b>${b.closed_count} (${b.wins} gan.)</b></div>
-        <div>PnL abierto<b>${usd(b.unrealized_pnl)}</b></div><div>PnL realizado<b>${usd(b.realized_pnl)}</b></div>
-      </div>
-      <div class="acts">
-        <button type="button" class="small ${bc.paused ? 'ok' : 'warnb'}" data-pause="${esc(n)}" data-paused="${bc.paused ? '1' : ''}">${bc.paused ? 'Reanudar' : 'Pausar'}</button>
-        <button type="button" class="small ghost" data-engine="${esc(n)}">Ver detalle</button>
-      </div></div>`; }).join('');
-  const bi = q('btnInvert');
-  bi.dataset.inverted = g.inverted ? '1' : '';
-  bi.textContent = g.inverted ? 'Modo INVERTIDO · volver a normal' : 'Modo normal · invertir';
-  bi.className = g.inverted ? 'warnb' : 'ok';
-  const bx = q('btnExPause');
-  bx.dataset.paused = g.executor_paused ? '1' : '';
-  bx.textContent = g.executor_paused ? 'Envíos al executor PAUSADOS · reanudar' : 'Pausar entradas al executor (prueba)';
-  bx.className = g.executor_paused ? 'warnb' : 'ghost';
-  q('modeHint').textContent = (g.executor_paused ? 'MODO PRUEBA: las entradas nuevas solo se simulan aquí, no se mandan al executor. ' : '') + (g.inverted
-    ? 'Invertido: vela verde → SHORT, roja → LONG. El % de cada bot es stop loss; no hay TP.'
-    : 'Normal: vela verde → LONG, roja → SHORT. El % de cada bot es take profit; no hay stop loss.');
-  q('sessHits').textContent = g.target_hits ? `Objetivo alcanzado ${g.target_hits} vez/veces · último: ${g.last_target || '—'}` : 'Al llegar al objetivo se cierran todas las posiciones de los dos bots y el contador vuelve a cero.';
-  q('curTarget').textContent = `(ahora ${g.profit_target_usd > 0 ? '+' + g.profit_target_usd : 'apagado'})`;
-  q('curMax').textContent = `(ahora ${g.max_open > 0 ? g.max_open : 'sin límite'})`;
-  q('curFee').textContent = `(ahora ${g.fee_pct}%)`;
-  q('exToken').style.display = c.admin_token ? '' : 'none';
-  q('tokenRow').style.display = c.admin_token ? '' : 'none';
-
-  // Pestañas
-  q('tabs').innerHTML = names.map(n => { const b = d.engines[n];
-    return `<button type="button" data-engine="${esc(n)}" class="${n === cur ? 'on' : ''}">${esc(b.label)}${b.config.paused ? ' (pausado)' : ''} <span>· ${b.positions.length} abiertas · </span>${usd(b.realized_pnl)}</button>`; }).join('');
-  q('engHint').textContent = `${e.label}: ${e.hint}.`;
-  document.querySelectorAll('.engName').forEach(el => el.textContent = e.label);
-  q('csvLink').href = '/api/trades.csv?engine=' + encodeURIComponent(cur);
-
-  // Posiciones
-  q('nPos').textContent = e.positions.length;
-  q('engPnl').innerHTML = `PnL abierto ${usd(e.unrealized_pnl)} · realizado ${usd(e.realized_pnl)} (${e.wins}/${e.closed_count} ganadas)`;
-  const rn = {}; ((d.ratio || {}).rows || []).forEach(x => rn[x.symbol] = x);
-  q('tPos').innerHTML = e.positions.map(r => `<tr>
-    <td><b>${esc(r.symbol)}</b> <span class="muted">#${r.trade_id}</span>${r.sent === false ? ' <span class="st off">SIMULADA</span>' : ''}</td><td>${tag(r.direction)}</td>
-    <td>${cur === 'ratio' ? `${num(r.ratio_trigger, 4)}→${num(r.ratio_entry, 4)} ${pct(r.ratio_change_pct || 0)}` : pct(r.signal_pct) + (cur === 'live' ? ` <span class="muted">${Math.round(r.candle_age_s || 0)}s</span>` : '')}</td><td>${num(r.entry_price, 8)}</td><td>${num(r.price, 8)}</td>
-    <td>${pct(r.move_pct)}</td><td>${cur === 'ratio' ? `<span class="muted">TP ratio ${r.direction === 'SHORT' ? '≥' : '≤'}</span> ${num(r.ratio_target || r.ratio_trigger, 4)} <span class="muted">(ahora ${rn[r.symbol] && rn[r.symbol].last != null ? num(rn[r.symbol].last, 4) : '—'})</span>` : `<span class="muted">${r.inverted ? 'SL' : 'TP'}</span> ${num(r.tp_price, 8)}`}</td><td>${num(r.notional, 2)}</td><td>${usd(r.pnl)}</td>
-    <td>${pct(r.mfe_pct)} <span class="muted">${usd(r.mfe_usd)}</span></td><td>${pct(r.mae_pct)} <span class="muted">${usd(r.mae_usd)}</span></td>
-    <td>${esc(r.opened)} <span class="muted">(${dur(r.age_s)})</span></td>
-    <td><button class="small ghost" data-close="${r.trade_id}" data-label="${esc(r.direction)} ${esc(r.symbol)} #${r.trade_id}">Cerrar</button></td></tr>`).join('')
-    || '<tr><td colspan="13" class="muted">Sin posiciones abiertas</td></tr>';
-
-  // Parámetros (el bot de ratio se ajusta en su propio panel)
-  const isRatio = cur === 'ratio';
-  document.querySelector('details[data-key="cfg"]').style.display = isRatio ? 'none' : '';
-  document.querySelector('details[data-key="eval"]').style.display = isRatio ? 'none' : '';
-  q('thSigC').textContent = isRatio ? 'Ratio' : 'Vela';
-  q('thSigB').textContent = isRatio ? 'Cambio' : 'Cuerpo';
-  q('thSigS').textContent = isRatio ? '' : 'Segundo';
-  q('cfgThr').textContent = `±${ec.threshold_pct}%`;
-  q('cfgTp').textContent = `${ec.tp_pct}%`;
-  q('cfgTpLbl').textContent = xk;
-  q('cfgSum').textContent = `señal ±${ec.threshold_pct}% · ${xk} ${ec.tp_pct}%`;
-  q('engLat').textContent = e.decide_ms === null ? 'decisión: sin entradas aún' : `decisión media ${e.decide_ms} ms`;
-  for (const [id, dir, blocked] of [['btnLong', 'LONG', ec.block_long], ['btnShort', 'SHORT', ec.block_short]]) {
-    const b = q(id);
-    b.dataset.blocked = blocked ? '1' : '';
-    b.textContent = blocked ? `${dir} bloqueados · desbloquear` : `${dir} activos · bloquear`;
-    b.className = blocked ? 'danger' : 'ok';
-  }
-
-  // Señales y cerradas
-  q('nSig').textContent = e.signal_count;
-  q('tSig').innerHTML = e.signals.map(s => `<tr><td>${esc(s.time)}</td><td>${esc(s.symbol)}</td><td>${tag(s.direction)}</td>
-    <td>${esc(s.candle)} <span class="muted">${num(s.open, 8)}→${num(s.close, 8)}</span></td><td>${pct(s.body_pct)}</td>
-    <td class="muted">${isRatio ? '' : Math.round(s.candle_age_s || 0) + 's'}</td>
-    <td class="${s.action.startsWith('abierta') ? 'pos' : 'muted'}">${esc(s.action)}</td></tr>`).join('')
-    || `<tr><td colspan="7" class="muted">${isRatio ? 'Esperando una caída del ratio dentro del rango' : 'Esperando velas con cuerpo ≥ ±' + ec.threshold_pct + '%'}</td></tr>`;
-  q('nClosed').textContent = e.closed_count;
-  q('tClosed').innerHTML = e.closed_trades.map(t => `<tr><td>${esc(t.closed)}</td><td>${esc(t.symbol)}</td><td>${tag(t.direction)}</td>
-    <td>${num(t.entry_price, 8)}</td><td>${num(t.close_price, 8)}</td><td>${pct(t.move_pct)}</td><td>${usd(t.pnl)}</td>
-    <td class="muted">${num(t.fees || 0, 4)}</td><td>${pct(t.mfe_pct || 0)}</td><td>${pct(t.mae_pct || 0)}</td>
-    <td>${dur(t.duration_s || 0)}</td><td>${esc(t.reason)}${t.sent === false ? ' <span class="st off">SIMULADA</span>' : ''}</td></tr>`).join('')
-    || '<tr><td colspan="12" class="muted">Aún no hay cierres</td></tr>';
-
-  const exc = e.excursions;
-  q('tExc').innerHTML = ['all', 'LONG', 'SHORT'].map(kk => {
-    const r = exc[kk], label = kk === 'all' ? 'Todas' : tag(kk);
-    if (!r.n) return `<tr><td>${label}</td><td>0</td><td colspan="8" class="muted">—</td></tr>`;
-    return `<tr><td>${label}</td><td>${r.n}</td><td>${r.wins}</td><td>${pct(r.avg_mfe_pct)}</td><td>${pct(r.avg_mae_pct)}</td>
-      <td>${pct(r.best_mfe_pct)}</td><td>${pct(r.worst_mae_pct)}</td><td>${usd(r.avg_mae_usd)}</td>
-      <td>${dur(r.avg_time_to_mae_s)}</td><td>${dur(r.avg_duration_s)}</td></tr>`;
-  }).join('');
-
-  // Evaluaciones
-  const ev = e.evaluations;
-  q('evMin').textContent = ev.top_minute;
-  q('tTop').innerHTML = ev.top.map(r => `<tr><td>${esc(r.symbol)}</td><td>${num(r.open, 8)}</td><td>${num(r.close, 8)}</td>
-    <td>${pct(r.body_pct)}</td><td>${r.signal ? tag(r.signal) : '<span class="muted">—</span>'}</td></tr>`).join('')
-    || '<tr><td colspan="5" class="muted">Esperando el primer cierre de vela</td></tr>';
-  q('tMin').innerHTML = ev.minutes.map(m => `<tr><td>${esc(m.minute)}</td><td>${m.evaluated}</td><td>${m.long}</td><td>${m.short}</td>
-    <td>${pct(m.max_up)}</td><td>${pct(m.max_down)}</td></tr>`).join('')
-    || '<tr><td colspan="6" class="muted">Sin evaluaciones todavía</td></tr>';
-
-  // Executor y eventos
-  q('exUrl').textContent = x.url || '(vacío: sin señales)';
-  q('exSum').textContent = x.url ? `${x.url} · ${x.sent} enviadas · ${x.errors} errores` : 'sin link: no se mandan señales';
-  q('exSent').textContent = x.sent;
-  q('exErr').textContent = x.errors;
-  q('exLat').textContent = x.last_ok
-    ? `Última señal (${x.last_ok}): HTTP al executor ${x.http_ms} ms · total desde el mensaje de Binance ${x.total_ms} ms`
-    : 'Latencia: aún no hay señales enviadas';
-  renderRatio(d);
-  q('events').textContent = d.events.join('\n');
-}
-
-q('exForm').addEventListener('submit', async ev => {
-  ev.preventDefault();
-  const body = {url: q('exNew').value.trim()};
-  const secret = q('exSecret').value;
-  if (secret) body.secret = secret;
-  if (!body.url && !confirm('Link vacío: los dos bots dejarán de mandar señales. ¿Seguir?')) return;
-  q('exMsg').textContent = 'Guardando…';
-  try {
-    const r = await post('/api/executor', body);
-    q('exMsg').innerHTML = r.ok
-      ? `<span class="pos">Link cambiado.</span> ${r.url ? (r.reachable ? 'El executor responde (' + esc(r.detail) + ').' : '<span class="warn">No responde: ' + esc(r.detail) + '</span>') : esc(r.detail)}`
-      : `<span class="neg">${esc(r.error)}</span>`;
-    if (r.ok) { q('exNew').value = ''; q('exSecret').value = ''; }
-  } catch (e) { q('exMsg').innerHTML = `<span class="neg">${esc(e)}</span>`; }
-  refresh();
-});
-
-q('cfgForm').addEventListener('submit', async ev => {
-  ev.preventDefault();
-  q('cfgMsg').textContent = 'Guardando…';
-  try {
-    const r = await post('/api/config', {engine: cur, threshold_pct: q('cfgNewThr').value, tp_pct: q('cfgNewTp').value});
-    q('cfgMsg').innerHTML = r.ok
-      ? `<span class="pos">Guardado en ${esc(last && last.engines[r.engine] ? last.engines[r.engine].label : r.engine)}.</span> Señal ±${r.threshold_pct}% · ${last && last.global.inverted ? 'SL' : 'TP'} ${r.tp_pct}%`
-      : `<span class="neg">${esc(r.error)}</span>`;
-    if (r.ok) { q('cfgNewThr').value = ''; q('cfgNewTp').value = ''; }
-  } catch (e) { q('cfgMsg').innerHTML = `<span class="neg">${esc(e)}</span>`; }
-  refresh();
-});
-
-async function glb(body, url = '/api/global') {
-  q('glbMsg').textContent = 'Guardando…';
-  try {
-    const r = await post(url, body);
-    q('glbMsg').innerHTML = r.ok
-      ? `<span class="pos">Guardado.</span> ${r.executor_paused ? 'Envíos al executor pausados · ' : ''}${r.inverted ? 'Modo invertido' : 'Modo normal'} · objetivo ${r.profit_target_usd > 0 ? '+' + r.profit_target_usd + ' USD' : 'apagado'} · límite ${r.max_open > 0 ? r.max_open + ' abiertas' : 'sin límite'} · fee ${r.fee_pct}% por lado`
-      : `<span class="neg">${esc(r.error)}</span>`;
-    return r.ok;
-  } catch (e) { q('glbMsg').innerHTML = `<span class="neg">${esc(e)}</span>`; }
-  finally { refresh(); }
-}
-
-q('glbForm').addEventListener('submit', async ev => {
-  ev.preventDefault();
-  if (await glb({profit_target_usd: q('glbTarget').value, max_open: q('glbMax').value, fee_pct: q('glbFee').value})) {
-    q('glbTarget').value = ''; q('glbMax').value = ''; q('glbFee').value = '';
-  }
-});
-
-q('btnInvert').addEventListener('click', () => {
-  const inv = !q('btnInvert').dataset.inverted;
-  const msg = inv
-    ? '¿Invertir los dos bots? Las entradas nuevas irán CONTRA la vela y el % será stop loss, sin TP. Las posiciones abiertas siguen con su TP.'
-    : '¿Volver al modo normal? Las entradas nuevas seguirán la vela con TP. Las posiciones abiertas invertidas siguen con su SL.';
-  if (confirm(msg)) glb({inverted: inv});
-});
-
-q('btnExPause').addEventListener('click', () => {
-  const p = !q('btnExPause').dataset.paused;
-  const msg = p
-    ? '¿Pausar las entradas al executor? Los bots seguirán operando en simulación (verás posiciones SIMULADAS) pero no se mandará ninguna apertura. Los cierres de lo ya enviado sí se mandan.'
-    : '¿Reanudar los envíos al executor? Las entradas nuevas volverán a abrirse de verdad. Las simuladas que sigan abiertas no se mandan.';
-  if (confirm(msg)) glb({executor_paused: p});
-});
-
-q('btnReset').addEventListener('click', () => {
-  if (confirm('¿Poner a cero el PnL de la sesión? El objetivo se contará desde ahora.')) glb({}, '/api/session/reset');
-});
-
-async function closeAll(engine) {
-  const n = engine ? last.engines[engine].positions.length : last.global.open_count;
-  const who = engine ? `del ${last.engines[engine].label}` : 'de los dos bots';
-  if (!n) { alert(`No hay posiciones abiertas ${who}.`); return; }
-  if (!confirm(`¿Cerrar a mercado las ${n} posiciones abiertas ${who}?`)) return;
-  try {
-    const r = await post('/api/close-all', engine ? {engine} : {});
-    alert(r.ok ? r.msg : r.error);
-  } catch (e) { alert(e); }
-  refresh();
-}
-q('btnCloseAll').addEventListener('click', () => closeAll(null));
-q('btnCloseEng').addEventListener('click', () => closeAll(cur));
-
-document.addEventListener('click', async ev => {
-  const t = ev.target, ds = t.dataset || {};
-  if (ds.pause) {
-    const paused = !ds.paused, label = last ? last.engines[ds.pause].label : ds.pause;
-    if (!confirm(paused ? `¿Pausar el ${label}? No abrirá entradas nuevas; sus posiciones abiertas siguen hasta su TP/SL.` : `¿Reanudar el ${label}?`)) return;
-    try { const r = await post('/api/pause', {engine: ds.pause, paused}); if (!r.ok) alert(r.error); } catch (e) { alert(e); }
-    refresh();
-    return;
-  }
-  const tab = t.closest && t.closest('[data-engine]');
-  if (tab) {
-    cur = tab.dataset.engine;
-    store.set('botkline_engine', cur);
-    q('cfgMsg').textContent = '';
-    if (last) render(last);
-    if (tab.closest('#bots')) q('tabs').scrollIntoView({behavior: 'smooth'});
-    return;
-  }
-  if (ds.block) {
-    try { const r = await post('/api/block', {engine: cur, direction: ds.block, blocked: !ds.blocked}); if (!r.ok) alert(r.error); } catch (e) { alert(e); }
-    refresh();
-    return;
-  }
-  if (!ds.close || !confirm(`¿Cerrar ${ds.label || ds.close} a mercado?`)) return;
-  try {
-    const r = await post('/api/close/' + encodeURIComponent(ds.close), {});
-    alert(r.ok ? r.msg : (r.error || r.msg));
-  } catch (e) { alert(e); }
-  refresh();
-});
-
-function renderRatio(d) {
-  const r = d.ratio; if (!r) return;
-  const c = r.cfg;
-  q('rtSum').textContent = `24 h ≥ ±${c.watch_min_pct}% · caída del ratio ${c.drop_min_pct}–${c.drop_max_pct}%`;
-  q('rtN').textContent = r.rows.length;
-  q('rtCurW').textContent = `(ahora ${c.watch_min_pct}%)`;
-  q('rtCurMin').textContent = `(ahora ${c.drop_min_pct}%)`;
-  q('rtCurMax').textContent = `(ahora ${c.drop_max_pct}%)`;
-  q('rtInfo').innerHTML = `Ticker 24 h ${r.ticker_connected ? '<span class="pos">conectado</span>' : '<span class="neg">desconectado</span>'}`
-    + ` (${r.ticker_symbols} símbolos, último mensaje ${r.ticker_age_s === null ? '—' : 'hace ' + dur(r.ticker_age_s)})`
-    + ` · lista actualizada ${esc(r.watch_updated || '—')} · próxima consulta en ${r.next_cycle_in > 0 ? dur(r.next_cycle_in) : '—'}`
-    + ` · consultas ${r.polls} · errores ${r.errors}`
-    + (r.filters === 0 ? ` · <span class="neg">sin exchangeInfo (proxy/región): no se puede operar ni consultar el ratio</span>` : '')
-    + (r.ticker_error && !r.ticker_connected ? ` · <span class="warn">ticker: ${esc(r.ticker_error)}</span>` : '')
-    + (r.rest_blocked_s > 0 ? ` · <span class="neg">REST en pausa ${dur(r.rest_blocked_s)} (límite de peticiones)</span>` : '')
-    + (r.last_error ? ` · <span class="warn">${esc(r.last_error)}</span>` : '');
-  for (const [id, dir, on] of [['rtBtnShort', 'SHORT', r.short_enabled], ['rtBtnLong', 'LONG', r.long_enabled]]) {
-    const b = q(id);
-    b.dataset.on = on ? '1' : '';
-    b.textContent = on ? `${dir} activo · desactivar` : `${dir} desactivado · activar`;
-    b.className = on ? 'ok' : 'danger';
-  }
-  q('tRt').innerHTML = r.rows.map(x => `<tr>
-    <td><b>${esc(x.symbol)}</b></td><td>${x.pct24 === null ? '—' : pct(x.pct24)}</td><td>${num(x.price, 8)}</td>
-    <td>${num(x.prev, 4)}</td><td>${num(x.last, 4)}</td><td>${x.chg === null ? '<span class="muted">—</span>' : pct(x.chg)}</td>
-    <td class="${x.lag ? 'warn' : 'muted'}" title="${x.lag ? 'Binance aún no publicó el punto más nuevo de este símbolo' : ''}">${esc(x.data_time || '—')}${x.lag ? ' ⏳' : ''}</td><td>${x.side ? tag(x.side) : '<span class="muted">—</span>'}</td>
-    <td>${x.has_position ? '<span class="st on">POSICIÓN</span>' : x.in_range ? '<span class="st off">EN RANGO</span>' : '<span class="muted">—</span>'}</td></tr>`).join('')
-    || '<tr><td colspan="9" class="muted">Ningún símbolo cumple el % de 24 h todavía</td></tr>';
-}
-
-q('rtForm').addEventListener('submit', async ev => {
-  ev.preventDefault();
-  q('rtMsg').textContent = 'Guardando…';
-  try {
-    const r = await post('/api/ratio', {watch_min_pct: q('rtWatch').value, drop_min_pct: q('rtMin').value, drop_max_pct: q('rtMax').value});
-    q('rtMsg').innerHTML = r.ok
-      ? `<span class="pos">Guardado.</span> 24 h ≥ ±${r.watch_min_pct}% · caída del ratio ${r.drop_min_pct}–${r.drop_max_pct}% (la lista de vigilados se recalcula en la próxima consulta de 5 min)`
-      : `<span class="neg">${esc(r.error)}</span>`;
-    if (r.ok) { q('rtWatch').value = ''; q('rtMin').value = ''; q('rtMax').value = ''; }
-  } catch (e) { q('rtMsg').innerHTML = `<span class="neg">${esc(e)}</span>`; }
-  refresh();
-});
-
-for (const [id, dir] of [['rtBtnShort', 'SHORT'], ['rtBtnLong', 'LONG']]) {
-  q(id).addEventListener('click', async () => {
-    const on = !!q(id).dataset.on;                       // activo ahora → se va a bloquear
-    const msg = on ? `¿Desactivar ${dir} en el bot de ratio? No abrirá entradas nuevas de ese lado (las abiertas siguen hasta su TP).`
-                   : `¿Activar ${dir} en el bot de ratio?` + (dir === 'LONG' ? ' Pasará a vigilar también los símbolos con 24 h ≤ −X % (perdedores).' : '');
-    if (!confirm(msg)) return;
-    try { const r = await post('/api/block', {engine: 'ratio', direction: dir, blocked: on}); if (!r.ok) alert(r.error); } catch (e) { alert(e); }
-    refresh();
-  });
-}
-
-refresh();
-setInterval(refresh, __POLL_MS__);
-</script>
-</body>
-</html>"""
 
 
 if __name__ == "__main__":

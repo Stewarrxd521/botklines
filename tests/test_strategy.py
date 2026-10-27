@@ -80,3 +80,27 @@ def test_net_pnl_counts_entry_and_exit_fees():
     assert abs(fees_usd(1.0, 1.02, 5, 0.05) - 0.00505) < 1e-12
     assert abs(net_pnl_usd(1.02, 1.0, 5, "LONG", 0.05) - (0.10 - 0.00505)) < 1e-12
     assert abs(net_pnl_usd(1.02, 1.0, 5, "SHORT", 0.05) - (-0.10 - 0.00505)) < 1e-12
+
+
+def test_tp_sl_prices_defaults_ratio_bot():
+    # TP +10 % / SL -5 % (valores por defecto del bot de ratio)
+    tp, sl = st.tp_sl_prices(100, st.SHORT, 10, 5)
+    assert tp == pytest.approx(90) and sl == pytest.approx(105)
+    tp, sl = st.tp_sl_prices(100, st.LONG, 10, 5)
+    assert tp == pytest.approx(110) and sl == pytest.approx(95)
+    assert st.tp_sl_prices(100, st.LONG, 0, 0) == (0.0, 0.0)     # 0 = apagado
+
+
+@pytest.mark.parametrize("price,direction,expected", [
+    (89.9, st.SHORT, "TP"), (95, st.SHORT, None), (105, st.SHORT, "SL"),
+    (110.5, st.LONG, "TP"), (100, st.LONG, None), (95, st.LONG, "SL"),
+])
+def test_price_exit(price, direction, expected):
+    tp, sl = st.tp_sl_prices(100, direction, 10, 5)
+    assert st.price_exit(price, direction, tp, sl) == expected
+
+
+def test_price_exit_disabled_legs():
+    assert st.price_exit(200, st.LONG, 0, 0) is None
+    assert st.price_exit(50, st.LONG, 110, 0) is None
+    assert st.price_exit(50, st.LONG, 0, 95) == "SL"

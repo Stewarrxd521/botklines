@@ -1,8 +1,56 @@
-# BOTKLINE · velas 1m que siguen la tendencia (Binance USDⓈ-M Futures)
+# BOTKLINE · bot de ratio de top traders (Binance USDⓈ-M Futures)
 
-Aplicación web para Render que vigila las velas de 1 minuto de **todos** los perpetuos USDT por WebSocket y manda señales de apertura y cierre al **Executor** externo, que es quien abre las órdenes en Binance.
+Servicio web para Render que vigila los perpetuos USDT que más se mueven en 24 h, consulta el *Top Trader Long/Short Ratio* y manda señales de apertura y cierre al **Executor** externo, que es quien abre las órdenes en Binance. En el mismo proceso viven además dos bots de velas 1m, apagados por defecto (`KLINE_BOTS_ENABLED=false`).
 
-## Dos bots en paralelo
+## Estructura
+
+| Archivo | Qué hace |
+| --- | --- |
+| `app.py` | Bots, API Flask y persistencia de ajustes. |
+| `web/index.html` | Panel web (tema claro / oscuro / automático). |
+| `strategy.py` | Reglas puras (señal, TP/SL, PnL, tamaño), con pruebas en `tests/`. |
+| `WS.py` | Precio en vivo por WebSocket, solo de los símbolos con posición abierta. |
+| `kline_ws.py` | Velas 1m por WebSocket (solo si los bots de velas están activos). |
+| `state_store.py` | Copia en disco de posiciones e historial para recuperarse tras un reinicio. |
+
+## Bot de ratio de top traders
+
+1. **Vigilados**: perpetuos con variación 24 h ≥ +20 % (`RATIO_WATCH_MIN_PCT`). Con LONG activo, también los ≤ −20 %.
+2. **Entrada**: cada 5 min se consulta el ratio de cuentas de los top traders de cada vigilado. Si cae entre 25 % y 30 % de un punto de 5 min al siguiente → **SHORT** (LONG es el espejo: el ratio sube en un perdedor).
+3. **Salida** (lo que llegue antes):
+   - **Take profit por precio**: **+10 %** a favor desde la entrada (`RATIO_TP_PCT`).
+   - **Stop loss por precio**: **−5 %** en contra desde la entrada (`RATIO_SL_PCT`).
+   - **TP por ratio** (desactivable): el ratio recupera el mismo % que cayó.
+
+El TP, el SL y la salida por ratio se cambian **en caliente** desde el bloque *Ratio top traders → Salida de las operaciones* de la web, o con:
+
+```bash
+curl -X POST https://<bot>/api/ratio -H 'Content-Type: application/json' \
+     -d '{"tp_pct": 10, "sl_pct": -5, "ratio_exit": true}'
+```
+
+`0` apaga el TP o el SL; el SL se puede mandar como `5` o `-5`. Los niveles nuevos se aplican también a las posiciones abiertas del bot de ratio (se recalculan desde su precio de entrada) y se guardan en `SETTINGS_FILE`. El cierre sale con motivo `TP`, `SL` o `TP_RATIO`.
+
+## Ancho de banda
+
+El tráfico de red venía casi todo de streams de *todo el mercado* abiertos las 24 h y del panel pidiendo el estado completo cada 1,5 s. Ahora:
+
+| Antes | Ahora |
+| --- | --- |
+| `!markPrice@arr@1s` + `!ticker@arr` en `WS.py` (~250 KB/s siempre) | Apagados por defecto (`WS_ALL_MARKET`, `WS_ALL_TICKER`). |
+| `!miniTicker@arr` abierto siempre para el 24 h (~80 KB/s) | Una petición REST gzip a `/fapi/v1/ticker/24hr` por ciclo de 5 min (`TICKER_MODE=rest`). Si falla, una foto de 4 s por WebSocket. |
+| `bookTicker` de cada vigilado, sin darlo de baja nunca | Precio en vivo **solo** de los símbolos con posición, con `markPrice@1s` (1 msg/s); se da de baja al cerrar. Los bots de velas usan `bookTicker`. |
+| REST sin comprimir (`exchangeInfo` ≈ 1,5 MB en cada arranque) | Todo el REST pide gzip (~5-10× menos). |
+| Panel: estado completo de los 3 bots cada 1,5 s, sin comprimir | Cada 3 s, gzip, solo el detalle del bot que se ve, y pausa con la pestaña oculta. La página tiene ETag (recarga = 304). |
+| Executor: `GET /api/state` cada 20 s por hilo | `HEAD` (sin cuerpo). |
+
+El bloque *Red* de la web (y `GET /health`) muestra los bytes recibidos y enviados desde el arranque y el ritmo por hora.
+
+## Bots de velas 1m (opcionales)
+
+Se activan con `KLINE_BOTS_ENABLED=true`.
+
+### Dos bots en paralelo
 
 En el mismo proceso y la misma web corren dos bots con la misma estrategia y distinto momento de entrada:
 
@@ -15,7 +63,7 @@ Cada bot tiene su umbral, su TP, sus bloqueos LONG/SHORT, sus posiciones, sus se
 
 En la web, las pestañas *Bot al cierre* / *Bot en vivo* eligen qué bot se ve y se configura; la tabla *Los dos bots* los compara. El executor y los eventos son comunes.
 
-## Estrategia
+### Estrategia de velas
 
 1. **Velas por WebSocket** (`kline_ws.py`): una conexión con `<símbolo>@kline_1m` de todos los perpetuos. Se guardan las dos últimas velas cerradas de cada símbolo. Sin REST.
 2. **Señal**: se mide el cuerpo de la vela, `(cierre o último precio − apertura) / apertura` (al cierre para el bot al cierre; en cada actualización para el bot en vivo).
@@ -89,7 +137,7 @@ Cada apertura y cierre se manda con `POST <EXECUTOR_URL>/signal` y la cabecera `
 
 ### Latencia
 
-Las señales salen por conexiones HTTP persistentes (keep-alive): `EXECUTOR_WORKERS` hilos (4 por defecto) mantienen abierta su conexión con el executor y la refrescan con un `GET /api/state` cada `EXECUTOR_WARM_S` segundos (20) si no hay señales. Así cada señal paga solo el viaje de red, sin abrir TCP+TLS de nuevo. La entrada usa el último precio de la vela. La web muestra los ms de decisión de cada bot y, para la última señal, los ms del HTTP al executor y el total desde que llegó el mensaje de Binance.
+Las señales salen por conexiones HTTP persistentes (keep-alive): `EXECUTOR_WORKERS` hilos (4 por defecto) mantienen abierta su conexión con el executor y la refrescan con un `HEAD /api/state` cada `EXECUTOR_WARM_S` segundos (20) si no hay señales. Así cada señal paga solo el viaje de red, sin abrir TCP+TLS de nuevo. La entrada usa el último precio de la vela. La web muestra los ms de decisión de cada bot y, para la última señal, los ms del HTTP al executor y el total desde que llegó el mensaje de Binance.
 
 ### Cambiar el link en caliente
 
@@ -128,6 +176,14 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 | `KLINE_HISTORY` | `2` | Velas cerradas guardadas por símbolo. |
 | `REST_PROXY_URL` | — | Proxy para la única petición REST (`exchangeInfo`, al arrancar). |
 | `SYMBOL_REFRESH_HOURS` | `12` | Antigüedad máxima del caché de `exchangeInfo` en disco. |
+| `RATIO_TP_PCT` | `10` | Bot de ratio: take profit por precio, % a favor (0 = sin TP). |
+| `RATIO_SL_PCT` | `5` | Bot de ratio: stop loss por precio, % en contra (0 = sin SL). |
+| `RATIO_EXIT_BY_RATIO` | `true` | Bot de ratio: cerrar también cuando el ratio recupera el % que cayó. |
+| `KLINE_BOTS_ENABLED` | `false` | Activa los dos bots de velas 1m (abre el stream de velas). |
+| `TICKER_MODE` | `rest` | 24 h por REST cada 5 min (`rest`) o WebSocket continuo (`ws`). |
+| `WS_SYMBOL_STREAM` | auto | Stream de precio por posición: `markPrice@1s` (solo ratio) o `bookTicker` (con velas). |
+| `WS_ALL_MARKET` / `WS_ALL_TICKER` | `false` | Streams de todo el mercado en `WS.py` (mucho tráfico). |
+| `STATUS_POLL_MS` | `3000` | Intervalo de consulta del panel. |
 | `RECOVERY_FILE` | `/tmp/botkline_recovery.json` | Copia local de posiciones abiertas e historial. Upstash está desactivado por ahora: en Render free las posiciones abiertas se pierden al reiniciar. |
 
 ## Endpoints
@@ -135,18 +191,20 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 | Ruta | Uso |
 | --- | --- |
 | `GET /` | Panel con los dos bots: posiciones, señales, cierres, eventos y link del executor. |
-| `GET /api/status` | Estado completo en JSON (`engines.close` y `engines.live`). |
+| `GET /api/status` | Estado en JSON. `?engine=ratio` manda el detalle (señales, cierres, MFE/MAE) solo de ese bot. |
 | `GET/POST /api/executor` | Ver o cambiar el link del Executor (común). |
 | `GET/POST /api/config` | Ver o cambiar el % de la señal y del TP de un bot (`engine`). |
 | `POST /api/close/<trade_id>` | Cierre manual de una posición (`/api/close/<SÍMBOLO>?engine=live` cierra todas las del par en ese bot). |
 | `GET /api/trades?engine=` | Historial de cierres de un bot, o de los dos. |
 | `GET /api/trades.csv?engine=` | Historial con MFE/MAE en CSV. |
 | `POST /api/block` | Bloquear o permitir LONG o SHORT en un bot. |
+| `GET/POST /api/ratio` | Ver o cambiar el bot de ratio: vigilancia, rango, `tp_pct`, `sl_pct`, `ratio_exit`. |
 | `GET/POST /api/global` | Modo invertido, objetivo en USD y fee (común a los dos bots). |
 | `POST /api/pause` | Pausar o reanudar un bot. |
 | `POST /api/close-all` | Cerrar todas las posiciones (de un bot con `engine`). |
 | `POST /api/session/reset` | Poner a cero el contador del objetivo. |
-| `GET /health`, `GET /api/recovery` | Diagnóstico. |
+| `GET /health` | Chequeo ligero con el tráfico de red. |
+| `GET /api/recovery` | Diagnóstico de la persistencia. |
 
 ## Ejecutar local
 
@@ -158,4 +216,4 @@ python -m pytest tests
 
 ## Deploy en Render
 
-`render.yaml` define el servicio y las variables. El código de la estrategia está en `strategy.py` (funciones puras, con pruebas en `tests/test_strategy.py`) y los dos bots en `app.py`.
+`render.yaml` define el servicio y las variables. El código de la estrategia está en `strategy.py` (funciones puras, con pruebas en `tests/test_strategy.py`), los bots y la API en `app.py` y el panel en `web/index.html`.
