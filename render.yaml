@@ -78,7 +78,7 @@ services:
       - key: REST_PROXY_URL
         sync: false
       - key: SYMBOL_REFRESH_HOURS
-        value: "12"
+        value: "240"          # exchangeInfo (filtros de cantidad) cada 10 días
       - key: BASE_URL
         value: "https://fapi.binance.com"
       - key: QUOTE_ASSET

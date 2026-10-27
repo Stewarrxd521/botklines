@@ -107,7 +107,9 @@ REST_PROXY_URL = os.getenv("REST_PROXY_URL", "").strip()   # http://usuario:clav
 INITIAL_SYMBOLS = [s.strip().upper() for s in os.getenv("INITIAL_SYMBOLS", "").split(",") if s.strip()]
 SYMBOLS_CACHE_FILE = os.getenv(
     "SYMBOLS_CACHE_FILE", os.path.join(tempfile.gettempdir(), "futures_symbols_cache.json"))
-SYMBOL_REFRESH_HOURS = float(os.getenv("SYMBOL_REFRESH_HOURS", "12"))
+# exchangeInfo (filtros de cantidad) se pide cada 10 días como mucho; los nombres de los
+# símbolos se descubren por WebSocket (ver SYMBOL_SCAN_HOURS).
+SYMBOL_REFRESH_HOURS = float(os.getenv("SYMBOL_REFRESH_HOURS", "240"))
 
 # ── Estrategia ────────────────────────────────────────────────────────────────
 SIGNAL_THRESHOLD_PCT = float(os.getenv("SIGNAL_THRESHOLD_PCT", "3"))    # cuerpo mínimo de la vela
@@ -740,8 +742,7 @@ class KlineBot:
         self._rest_route = 0
         self._rest_times: Deque[float] = deque()      # peticiones de los últimos 5 min
         self._scan_seen: Optional[set] = None         # símbolos vistos en la exploración en curso
-        self._filters_stale = False                   # un símbolo nuevo no tiene filtros todavía
-        self._filters_ts = 0.0
+        self._filters_ts = 0.0                        # cuándo se obtuvieron los filtros de cantidad
         self._load_known_symbols()
         # Tráfico de entrada propio (bytes): REST a Binance y snapshots/stream del 24 h.
         self.rx_rest_bytes = 0
@@ -1118,11 +1119,9 @@ class KlineBot:
             out[s["symbol"]] = row
         return out
 
-    async def _init_symbols(self, force: bool = False) -> None:
+    async def _init_symbols(self) -> None:
         """Filtros de cantidad (stepSize, mínimos) de exchangeInfo, cacheados en disco
-        SYMBOL_REFRESH_HOURS. Es la única petición REST aparte de la del ratio."""
-        self._filters_ts = time.time()
-        self._filters_stale = False
+        SYMBOL_REFRESH_HOURS (10 días). Es la única petición REST aparte de la del ratio."""
         cached = None
         try:
             with open(SYMBOLS_CACHE_FILE, "r", encoding="utf-8") as fh:
@@ -1130,12 +1129,14 @@ class KlineBot:
         except Exception:
             pass
         age_h = (time.time() - float(cached.get("saved_at", 0))) / 3600 if cached else None
-        if not force and cached and cached.get("filters") and age_h is not None and age_h < SYMBOL_REFRESH_HOURS:
+        if cached and cached.get("filters") and age_h is not None and age_h < SYMBOL_REFRESH_HOURS:
             self.filters = dict(cached["filters"])
-            self.log(f"Símbolos desde caché en disco: {len(self.filters)} (hace {age_h:.1f} h)")
+            self._filters_ts = float(cached.get("saved_at", 0))
+            self.log(f"Filtros de cantidad desde caché en disco: {len(self.filters)} (hace {age_h / 24:.1f} días)")
         else:
             try:
                 self.filters = await asyncio.to_thread(self._fetch_exchange_info)
+                self._filters_ts = time.time()
                 tmp = f"{SYMBOLS_CACHE_FILE}.tmp"
                 with open(tmp, "w", encoding="utf-8") as fh:
                     json.dump({"symbols": sorted(self.filters), "filters": self.filters,
@@ -1145,6 +1146,7 @@ class KlineBot:
                 self.last_error = str(exc)
                 if cached and cached.get("filters"):
                     self.filters = dict(cached["filters"])
+                    self._filters_ts = time.time() - max(SYMBOL_REFRESH_HOURS - 1, 0) * 3600   # reintento en 1 h
                     self.log(f"Usando caché viejo de símbolos ({len(self.filters)})")
                 elif self.known_symbols:
                     self.log(f"Sin filtros de cantidad: uso los {len(self.known_symbols)} símbolos "
@@ -1604,8 +1606,6 @@ class KlineBot:
             self.known_symbols |= new
             self._save_known_symbols()
             self.log(f"[símbolos] nuevos: {', '.join(sorted(new)[:10])}")
-        if self.filters and (seen - set(self.filters)):
-            self._filters_stale = True          # hay símbolos sin filtros de cantidad: se recargan
         if not self.symbols and self.known_symbols:
             self.symbols = sorted(self.known_symbols)
 
@@ -1652,16 +1652,15 @@ class KlineBot:
             backoff *= 2
 
     async def _symbols_retry_loop(self) -> None:
-        """Si exchangeInfo falló al arrancar (proxy/región), reintenta cada 60 s. Si la
-        exploración descubre un símbolo sin filtros, los recarga (como mucho 1 vez por hora)."""
+        """Si exchangeInfo falló al arrancar (proxy/región), reintenta cada 60 s; luego lo
+        renueva cada SYMBOL_REFRESH_HOURS (10 días)."""
         while self.running:
             await asyncio.sleep(60.0)
             if not self.filters:
                 self.log("[REST] reintentando exchangeInfo…")
                 await self._init_symbols()
-            elif self._filters_stale and time.time() - self._filters_ts >= 3600:
-                self.log("[REST] símbolos nuevos sin filtros de cantidad: recargo exchangeInfo")
-                await self._init_symbols(force=True)
+            elif time.time() - self._filters_ts >= SYMBOL_REFRESH_HOURS * 3600:
+                await self._init_symbols()
 
     def _on_tickers(self, raw) -> None:
         data = json.loads(raw)

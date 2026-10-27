@@ -40,7 +40,7 @@ El tráfico de red venía casi todo de streams de *todo el mercado* abiertos las
 | `!markPrice@arr@1s` + `!ticker@arr` en `WS.py` (~250 KB/s siempre) | Apagados por defecto (`WS_ALL_MARKET`, `WS_ALL_TICKER`). |
 | `!miniTicker@arr` abierto siempre para el 24 h (~80 KB/s) | Exploración de 30 s por WebSocket en cada ciclo de 5 min (`TICKER_MODE=scan`, ~10 % del tráfico; `ws` = abierto siempre). |
 | `bookTicker` de cada vigilado, sin darlo de baja nunca | Precio en vivo **solo** de los símbolos con posición, con `markPrice@1s` (1 msg/s); se da de baja al cerrar. Los bots de velas usan `bookTicker`. |
-| REST sin comprimir (`exchangeInfo` ≈ 1,5 MB en cada arranque) | Solo queda REST para el ratio (no existe por WebSocket) y para los filtros de cantidad de `exchangeInfo` (al arrancar, caché de 12 h, o si aparece un símbolo nuevo), todo con gzip. |
+| REST sin comprimir (`exchangeInfo` ≈ 1,5 MB en cada arranque) | Solo queda REST para el ratio (no existe por WebSocket) y para los filtros de cantidad de `exchangeInfo` (al arrancar si no hay caché, y luego cada 10 días), todo con gzip. |
 | Panel: estado completo de los 3 bots cada 1,5 s, sin comprimir | Cada 3 s, gzip, solo el detalle del bot que se ve, y pausa con la pestaña oculta. La página tiene ETag (recarga = 304). |
 | Executor: `GET /api/state` cada 20 s por hilo | `HEAD` (sin cuerpo). |
 
@@ -175,7 +175,7 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 | `ADMIN_TOKEN` | vacío | Si se define, cambiar el executor y cerrar desde la web lo exige. |
 | `KLINE_HISTORY` | `2` | Velas cerradas guardadas por símbolo. |
 | `REST_PROXY_URL` | — | Proxy para la única petición REST (`exchangeInfo`, al arrancar). |
-| `SYMBOL_REFRESH_HOURS` | `12` | Antigüedad máxima del caché de `exchangeInfo` en disco. |
+| `SYMBOL_REFRESH_HOURS` | `240` | Cada cuánto se renueva `exchangeInfo` (filtros de cantidad): 10 días. |
 | `RATIO_TP_PCT` | `10` | Bot de ratio: take profit por precio, % a favor (0 = sin TP). |
 | `RATIO_SL_PCT` | `5` | Bot de ratio: stop loss por precio, % en contra (0 = sin SL). |
 | `RATIO_EXIT_BY_RATIO` | `true` | Bot de ratio: cerrar también cuando el ratio recupera el % que cayó. |
