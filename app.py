@@ -412,7 +412,10 @@ class ExecutorBridge:
         self.last_ok_ts = 0.0
         self.last_http_ms = 0.0
         self.last_total_ms = 0.0
-        self._queue: "queue.Queue[tuple]" = queue.Queue()
+        # Una cola por hilo y cada símbolo siempre a la misma: las señales de un par llegan al
+        # executor en el orden en que se mandaron (parcial antes que total, cierre antes que
+        # la venganza en el mismo par); pares distintos siguen saliendo en paralelo.
+        self._queues: List["queue.Queue[tuple]"] = [queue.Queue() for _ in range(EXECUTOR_WORKERS)]
         self._workers: List[threading.Thread] = []
         self._start_lock = threading.Lock()
 
@@ -442,8 +445,8 @@ class ExecutorBridge:
         with self._start_lock:
             if self._workers:
                 return
-            for i in range(EXECUTOR_WORKERS):
-                t = threading.Thread(target=self._worker, daemon=True, name=f"executor-{i}")
+            for i, q in enumerate(self._queues):
+                t = threading.Thread(target=self._worker, args=(q,), daemon=True, name=f"executor-{i}")
                 t.start()
                 self._workers.append(t)
 
@@ -457,12 +460,12 @@ class ExecutorBridge:
         except Exception:
             pass                        # la próxima señal abrirá una conexión nueva
 
-    def _worker(self) -> None:
+    def _worker(self, q: "queue.Queue[tuple]") -> None:
         conns: Dict[Tuple[str, str], http.client.HTTPConnection] = {}
         self._warm_conn(conns)          # conexión lista antes de la primera señal
         while True:
             try:
-                item = self._queue.get(timeout=EXECUTOR_WARM_S)
+                item = q.get(timeout=EXECUTOR_WARM_S)
             except queue.Empty:
                 self._warm_conn(conns)
                 continue
@@ -530,7 +533,7 @@ class ExecutorBridge:
             self._log(f"[executor] sin URL: no se envía {payload.get('action')} {payload.get('symbol')}")
             return
         self._ensure_workers()
-        self._queue.put((payload, target, t0))
+        self._queues[hash(payload.get("symbol") or "") % len(self._queues)].put((payload, target, t0))
 
     def warm(self) -> None:
         """Arranca los hilos y abre las conexiones antes de la primera señal."""

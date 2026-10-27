@@ -1,3 +1,5 @@
+import random
+import threading
 import time
 import pytest
 
@@ -237,3 +239,26 @@ def test_solo_se_consulta_el_ratio_de_las_abiertas_que_esperan_tp_por_ratio(tmp_
 ])
 def test_flag(value, expected):
     assert st._flag(value) is expected
+
+
+def test_las_senales_de_un_par_llegan_al_executor_en_orden():
+    # Varios hilos de envío: un cierre total no puede adelantar al parcial del mismo par.
+    bridge = st.ExecutorBridge("http://executor.test", "s", logger=lambda m: None)
+    bridge._request = lambda *a, **k: (200, b"")
+    got, lock, done, n = [], threading.Lock(), threading.Event(), 60
+
+    def deliver(conns, payload, target, t0):
+        time.sleep(random.random() * 0.004)
+        with lock:
+            got.append((payload["symbol"], payload["i"]))
+            if len(got) == n:
+                done.set()
+        return True
+
+    bridge._deliver = deliver
+    for i in range(n):
+        bridge.send({"action": "close", "symbol": f"S{i % 3}USDT", "i": i})
+    assert done.wait(10)
+    for sym in {s for s, _ in got}:
+        seq = [i for s, i in got if s == sym]
+        assert seq == sorted(seq)
