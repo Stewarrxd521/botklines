@@ -1,4 +1,4 @@
-# BOTKLINE · bot de ratio de top traders (Binance USDⓈ-M Futures)
+# BOTKLINE · bots de ratio de top traders (Binance USDⓈ-M Futures)
 
 Servicio web para Render que vigila los perpetuos USDT que más se mueven en 24 h, consulta el *Top Trader Long/Short Ratio* y manda señales de apertura y cierre al **Executor** externo, que es quien abre las órdenes en Binance. En el mismo proceso viven además dos bots de velas 1m, apagados por defecto (`KLINE_BOTS_ENABLED=false`).
 
@@ -12,7 +12,15 @@ Servicio web para Render que vigila los perpetuos USDT que más se mueven en 24 
 | `kline_ws.py` | Velas 1m por WebSocket (solo si los bots de velas están activos). |
 | `state_store.py` | Copia en disco de posiciones e historial para recuperarse tras un reinicio. |
 
-## Bot de ratio de top traders
+## Bots de ratio de top traders
+
+Tres bots de ratio operan en paralelo con **la misma entrada** y salidas distintas. Con cada señal, cada uno abre su propia operación (si no está pausado ni tiene esa dirección bloqueada):
+
+| Bot | Salida |
+| --- | --- |
+| **Ratio TP/SL** (`ratio`) | TP y SL por precio + TP por ratio, todo configurable. |
+| **Ratio solo TP ratio** (`ratio_tp`) | Sin TP ni SL de precio: cierra solo cuando el ratio recupera el % que se movió. |
+| **Ratio + venganza** (`ratio_rev`) | TP/SL propios (independientes del primero) + trade de venganza. |
 
 1. **Exploración por WebSocket**: en cada ciclo de 5 min se abre `!miniTicker@arr` durante 30 s (`TICKER_SCAN_S`) y se lee el 24 h de todo el mercado. La misma exploración descubre los símbolos: una vez al día la lista se rehace (salen los deslistados) y entre medias se añaden los nuevos; se guarda en `KNOWN_SYMBOLS_FILE`.
    **Vigilados**: los perpetuos con variación 24 h ≥ +20 % (`RATIO_WATCH_MIN_PCT`, editable en la web). Con LONG activo, también los ≤ −20 %.
@@ -22,14 +30,32 @@ Servicio web para Render que vigila los perpetuos USDT que más se mueven en 24 
    - **Stop loss por precio**: **−5 %** en contra desde la entrada (`RATIO_SL_PCT`).
    - **TP por ratio** (desactivable): el ratio recupera el mismo % que cayó.
 
-El TP, el SL y la salida por ratio se cambian **en caliente** desde el bloque *Ratio top traders → Salida de las operaciones* de la web, o con:
+El TP, el SL y la salida por ratio del bot **Ratio TP/SL** se cambian **en caliente** desde la web (*Bots → Bot ratio TP/SL*), o con:
 
 ```bash
 curl -X POST https://<bot>/api/ratio -H 'Content-Type: application/json' \
      -d '{"tp_pct": 10, "sl_pct": -5, "ratio_exit": true}'
 ```
 
-`0` apaga el TP o el SL; el SL se puede mandar como `5` o `-5`. Los niveles nuevos se aplican también a las posiciones abiertas del bot de ratio (se recalculan desde su precio de entrada) y se guardan en `SETTINGS_FILE`. El cierre sale con motivo `TP`, `SL` o `TP_RATIO`.
+`0` apaga el TP o el SL; el SL se puede mandar como `5` o `-5`. Los niveles nuevos se aplican también a las posiciones abiertas de ese bot (se recalculan desde su precio de entrada) y se guardan en `SETTINGS_FILE`. El cierre sale con motivo `TP`, `SL` o `TP_RATIO`.
+
+### Trade de venganza (bot `ratio_rev`)
+
+Cuando una operación de este bot cierra **en pérdida** por cualquier motivo (SL, TP por ratio, cierre manual…), abre otra en el mismo par para recuperarla:
+
+- **Notional**: el de la operación cerrada **× `rev_mult`** (×1, ×2, ×3, ×4 o ×10 desde la web).
+- **Dirección**: `opposite` (contraria a la perdedora, por defecto) o `same`.
+- **TP**: `rev_recover_pct` % de la pérdida, en USD netos de fees (65 % por defecto).
+- **SL**: `rev_sl_pct` % de (pérdida × `rev_mult`), en USD (100 % por defecto).
+- Si la venganza pierde, **no se encadena otra**. Tampoco se dispara al alcanzar el objetivo global ni con «Cerrar todas».
+
+Su salida y su venganza se ajustan en *Bots → Bot ratio + venganza*, o con:
+
+```bash
+curl -X POST https://<bot>/api/ratio -H 'Content-Type: application/json' \
+     -d '{"engine": "ratio_rev", "tp_pct": 10, "sl_pct": -5, "ratio_exit": true,
+          "revenge": true, "rev_mult": 10, "rev_recover_pct": 65, "rev_sl_pct": 100, "rev_dir": "opposite"}'
+```
 
 ## Ancho de banda
 
@@ -54,8 +80,8 @@ Menú con seis secciones; cada una tiene paneles desplegables (se recuerda cuál
 | --- | --- |
 | **Resumen** | Cifras de la sesión, una tarjeta por bot (estado, parámetros, pausar), acciones generales (invertir, pausar el executor, poner a cero, cerrar todo) y las operaciones activas en tarjetas. |
 | **Operaciones** | Tarjetas de las posiciones abiertas, filtrables por bot, con PnL, barra SL → TP, MFE/MAE y botón de cierre; vista en tabla y señales recientes. |
-| **Bots** | Ajustes de cada bot: TP/SL y entrada del bot de ratio; umbral, TP, bloqueos y pausa de los bots de velas; encender/apagar las velas y el modo invertido. |
-| **Mercado** | Vigilados del bot de ratio y evaluaciones de velas. |
+| **Bots** | Un panel por bot: entrada común de los de ratio, salida de cada uno, tarjeta de la venganza, umbral/TP/bloqueos de los de velas, encender las velas y el modo invertido. |
+| **Mercado** | Vigilados de los bots de ratio y evaluaciones de velas. |
 | **Historial** | Cierres y MFE/MAE por bot, CSV. |
 | **Sistema** | Objetivo, límite de abiertas, fee, executor, tráfico de red y eventos. |
 
@@ -191,9 +217,14 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 | `KLINE_HISTORY` | `2` | Velas cerradas guardadas por símbolo. |
 | `REST_PROXY_URL` | — | Proxy para la única petición REST (`exchangeInfo`, al arrancar). |
 | `SYMBOL_REFRESH_HOURS` | `240` | Cada cuánto se renueva `exchangeInfo` (filtros de cantidad): 10 días. |
-| `RATIO_TP_PCT` | `10` | Bot de ratio: take profit por precio, % a favor (0 = sin TP). |
-| `RATIO_SL_PCT` | `5` | Bot de ratio: stop loss por precio, % en contra (0 = sin SL). |
-| `RATIO_EXIT_BY_RATIO` | `true` | Bot de ratio: cerrar también cuando el ratio recupera el % que cayó. |
+| `RATIO_TP_PCT` | `10` | Bots `ratio` y `ratio_rev`: take profit por precio, % a favor (0 = sin TP). |
+| `RATIO_SL_PCT` | `5` | Bots `ratio` y `ratio_rev`: stop loss por precio, % en contra (0 = sin SL). |
+| `RATIO_EXIT_BY_RATIO` | `true` | Cerrar también cuando el ratio recupera el % que cayó. |
+| `REVENGE_ENABLED` | `true` | Bot `ratio_rev`: trade de venganza activo al arrancar. |
+| `REVENGE_MULT` | `10` | Venganza: multiplicador del notional de la operación perdedora. |
+| `REVENGE_RECOVER_PCT` | `65` | Venganza: % de la pérdida que busca recuperar (TP en USD). |
+| `REVENGE_SL_PCT` | `100` | Venganza: SL en % de (pérdida × multiplicador). |
+| `REVENGE_DIR` | `opposite` | Venganza: `opposite` (contraria) o `same`. |
 | `KLINE_BOTS_ENABLED` | `false` | Activa los dos bots de velas 1m (abre el stream de velas). |
 | `TICKER_MODE` | `scan` | 24 h por WebSocket: exploración cada 5 min (`scan`) o abierto siempre (`ws`). |
 | `TICKER_SCAN_S` | `30` | Segundos de cada exploración del mercado. |
@@ -208,14 +239,14 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 | Ruta | Uso |
 | --- | --- |
 | `GET /` | Panel con los dos bots: posiciones, señales, cierres, eventos y link del executor. |
-| `GET /api/status` | Estado en JSON. `?engine=ratio` manda el detalle (señales, cierres, MFE/MAE) solo de ese bot. |
+| `GET /api/status` | Estado en JSON. `?engine=ratio|ratio_tp|ratio_rev|close|live` manda el detalle (señales, cierres, MFE/MAE) solo de ese bot. |
 | `GET/POST /api/executor` | Ver o cambiar el link del Executor (común). |
 | `GET/POST /api/config` | Ver o cambiar el % de la señal y del TP de un bot (`engine`). |
 | `POST /api/close/<trade_id>` | Cierre manual de una posición (`/api/close/<SÍMBOLO>?engine=live` cierra todas las del par en ese bot). |
 | `GET /api/trades?engine=` | Historial de cierres de un bot, o de los dos. |
 | `GET /api/trades.csv?engine=` | Historial con MFE/MAE en CSV. |
 | `POST /api/block` | Bloquear o permitir LONG o SHORT en un bot. |
-| `GET/POST /api/ratio` | Ver o cambiar el bot de ratio: vigilancia, rango, `tp_pct`, `sl_pct`, `ratio_exit`. |
+| `GET/POST /api/ratio` | Ver o cambiar los bots de ratio: vigilancia y rango (comunes), `tp_pct`, `sl_pct`, `ratio_exit`; con `"engine": "ratio_rev"`, la salida y la venganza de ese bot. |
 | `GET/POST /api/global` | Modo invertido, objetivo en USD y fee (común a los dos bots). |
 | `POST /api/pause` | Pausar o reanudar un bot. |
 | `POST /api/close-all` | Cerrar todas las posiciones (de un bot con `engine`). |

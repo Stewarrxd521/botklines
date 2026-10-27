@@ -31,7 +31,15 @@ Los dos bots
   (POST <executor>/signal) con "strategy": "close" | "live". El link del
   Executor se puede cambiar en caliente desde la web o con POST /api/executor.
 
-Bot de ratio de top traders (tercer bot, "ratio")
+Bots de ratio de top traders (tres bots con la MISMA entrada y salidas distintas)
+  "ratio"      → TP y SL por precio + TP por ratio (configurables en caliente).
+  "ratio_tp"   → sin TP/SL de precio: sale SOLO cuando el ratio recupera el % que se movió.
+  "ratio_rev"  → TP/SL propios + TRADE DE VENGANZA: cuando una de sus operaciones cierra en
+                 pérdida (por SL, TP por ratio, cierre manual…), abre otra en el mismo par con
+                 el notional cerrado × REVENGE_MULT para recuperarla. TP = REVENGE_RECOVER_PCT %
+                 de la pérdida y SL = REVENGE_SL_PCT % de (pérdida × mult), ambos en USD netos.
+                 La venganza no encadena otra venganza, y no se dispara con el objetivo global
+                 ni con «Cerrar todas».
   • Vigila SOLO los perpetuos con variación 24 h ≥ +RATIO_WATCH_MIN_PCT (20 %). El 24 h se
     lee por WebSocket (!miniTicker@arr) con una exploración de TICKER_SCAN_S (30 s) de todo
     el mercado en cada ciclo de 5 min, en vez de tener el stream abierto todo el día. Esa
@@ -45,7 +53,7 @@ Bot de ratio de top traders (tercer bot, "ratio")
       - SL por precio: -RATIO_SL_PCT % en contra (5 %).
       - TP por ratio (desactivable): el ratio RECUPERA el mismo % que cayó, medido desde
         el ratio de entrada (cae 27,1 % de 1,18 a 0,86 → TP cuando sube 27,1 % desde 0,86).
-  • LONG (apagado por defecto, se activa desde la web): espejo para los PERDEDORES
+  • LONG (activo por defecto, RATIO_LONG_DEFAULT=false lo bloquea): espejo para los PERDEDORES
     (24 h ≤ -20 %): el ratio SUBE entre drop_min % y drop_max % → LONG; TP cuando el
     ratio baja ese mismo % desde el ratio de entrada.
 
@@ -166,6 +174,13 @@ RATIO_CONCURRENCY   = max(1, int(os.getenv("RATIO_CONCURRENCY", "4")))
 RATIO_TP_PCT        = float(os.getenv("RATIO_TP_PCT", "10"))           # take profit: +10 % a favor
 RATIO_SL_PCT        = abs(float(os.getenv("RATIO_SL_PCT", "5")))       # stop loss: -5 % en contra
 RATIO_EXIT_BY_RATIO = os.getenv("RATIO_EXIT_BY_RATIO", "true").lower() in ("1", "true", "yes")
+# Trade de venganza (bot "ratio + venganza"): tras cerrar en pérdida abre otra operación para recuperarla.
+REVENGE_ENABLED     = os.getenv("REVENGE_ENABLED", "true").lower() in ("1", "true", "yes")
+REVENGE_MULT        = float(os.getenv("REVENGE_MULT", "10"))          # notional = notional cerrado × N
+REVENGE_RECOVER_PCT = float(os.getenv("REVENGE_RECOVER_PCT", "65"))   # TP = este % de la pérdida (USD)
+REVENGE_SL_PCT      = float(os.getenv("REVENGE_SL_PCT", "100"))       # SL = este % de (pérdida × N) en USD
+REVENGE_DIR         = os.getenv("REVENGE_DIR", "opposite")            # opposite | same (respecto a la perdedora)
+REVENGE_SKIP_REASONS = ("OBJETIVO", "CERRAR_TODAS")                   # cierres que no disparan venganza
 # Fuente del 24 h, siempre por WebSocket: "scan" = exploración de TICKER_SCAN_S por ciclo de
 # 5 min (~10 % del tiempo conectado); "ws" = !miniTicker@arr abierto siempre (~80 KB/s).
 TICKER_MODE         = os.getenv("TICKER_MODE", "scan").strip().lower()
@@ -572,6 +587,10 @@ class Position:
     ratio_ts:      int = 0      # timestamp (ms) del punto de ratio que disparó
     ratio_target:  float = 0.0  # ratio de salida (TP): recupera el mismo % que cayó/subió
     sl_price:      float = 0.0  # stop loss por precio (bot de ratio). 0 = sin SL
+    revenge:       bool = False # trade de venganza (sale solo por TP/SL en USD; si pierde no encadena otro)
+    rev_parent:    int = 0      # trade_id de la operación perdedora que la disparó
+    rev_tp_usd:    float = 0.0  # objetivo de la venganza en USD (neto) y su stop en USD
+    rev_sl_usd:    float = 0.0
 
     def update(self, price: float) -> float:
         """Actualiza precio y excursiones. Llamar con el lock del bot tomado."""
@@ -594,11 +613,18 @@ class Position:
 ENGINE_CLOSE = "close"
 ENGINE_LIVE  = "live"
 ENGINE_RATIO = "ratio"
+ENGINE_RATIO_TP = "ratio_tp"       # mismas entradas; sale SOLO por el TP del ratio (sin TP/SL de precio)
+ENGINE_RATIO_REV = "ratio_rev"     # mismas entradas; TP/SL propios + trade de venganza tras una pérdida
+RATIO_ENGINES = (ENGINE_RATIO, ENGINE_RATIO_TP, ENGINE_RATIO_REV)
 ENGINE_LABELS = {ENGINE_CLOSE: "Bot al cierre", ENGINE_LIVE: "Bot en vivo",
-                 ENGINE_RATIO: "Bot ratio top traders"}
+                 ENGINE_RATIO: "Bot ratio TP/SL", ENGINE_RATIO_TP: "Bot ratio solo TP ratio",
+                 ENGINE_RATIO_REV: "Bot ratio + venganza"}
+_RATIO_ENTRY_HINT = ("SHORT cuando el ratio de los top traders CAE en un ganador (24 h ≥ +X %); LONG cuando SUBE en "
+                     "un perdedor (24 h ≤ −X %)")
 ENGINE_HINTS = {
-    ENGINE_RATIO: "SHORT cuando el ratio de los top traders CAE en un ganador (24 h ≥ +X %); LONG cuando SUBE en "
-                  "un perdedor (24 h ≤ −X %). Sale por TP/SL de precio o cuando el ratio recupera el % que se movió",
+    ENGINE_RATIO: _RATIO_ENTRY_HINT + ". Sale por TP/SL de precio o cuando el ratio recupera el % que se movió",
+    ENGINE_RATIO_TP: _RATIO_ENTRY_HINT + ". Sale SOLO cuando el ratio recupera el % que se movió (sin TP/SL de precio)",
+    ENGINE_RATIO_REV: _RATIO_ENTRY_HINT + ". TP/SL propios; si cierra en pérdida abre un trade de venganza para recuperarla",
     ENGINE_CLOSE: "entra cuando la vela 1m CIERRA con cuerpo ≥ umbral",
     ENGINE_LIVE:  "entra en cuanto la vela 1m EN CURSO supera el umbral, sin esperar al cierre",
 }
@@ -709,8 +735,8 @@ class KlineBot:
         }
         self.live = self.engines[ENGINE_LIVE]
         # Bot de ratio: SHORT y LONG activos por defecto (RATIO_LONG_DEFAULT=false bloquea el LONG).
-        self.engines[ENGINE_RATIO] = Engine(ENGINE_RATIO, saved.get(ENGINE_RATIO) or {"block_long": not RATIO_LONG_DEFAULT},
-                                            1.0, 1.0)
+        for name in RATIO_ENGINES:
+            self.engines[name] = Engine(name, saved.get(name) or {"block_long": not RATIO_LONG_DEFAULT}, 1.0, 1.0)
         rs = settings.get("ratio") if isinstance(settings.get("ratio"), dict) else {}
 
         def _pos(v, d):
@@ -732,6 +758,18 @@ class KlineBot:
                           "ratio_exit":    bool(rs.get("ratio_exit", RATIO_EXIT_BY_RATIO))}
         if self.ratio_cfg["drop_min_pct"] >= self.ratio_cfg["drop_max_pct"]:
             self.ratio_cfg["drop_min_pct"], self.ratio_cfg["drop_max_pct"] = RATIO_DROP_MIN_PCT, RATIO_DROP_MAX_PCT
+        # Bot ratio + venganza: su salida (TP/SL/ratio) y la venganza; la entrada es la común (ratio_cfg).
+        rv = settings.get("ratio_rev") if isinstance(settings.get("ratio_rev"), dict) else {}
+        self.rev_cfg = {"tp_pct":          _nonneg(rv.get("tp_pct"), RATIO_TP_PCT),
+                        "sl_pct":          _nonneg(rv.get("sl_pct"), RATIO_SL_PCT),
+                        "ratio_exit":      bool(rv.get("ratio_exit", RATIO_EXIT_BY_RATIO)),
+                        "revenge":         bool(rv.get("revenge", REVENGE_ENABLED)),
+                        "rev_mult":        _pos(rv.get("rev_mult"), REVENGE_MULT),
+                        "rev_recover_pct": _pos(rv.get("rev_recover_pct"), REVENGE_RECOVER_PCT),
+                        "rev_sl_pct":      _pos(rv.get("rev_sl_pct"), REVENGE_SL_PCT),
+                        "rev_dir":         rv.get("rev_dir") if rv.get("rev_dir") in ("opposite", "same") else
+                                           (REVENGE_DIR if REVENGE_DIR in ("opposite", "same") else "opposite")}
+        self.revenge_count = 0
         # Estado del bot de ratio (se toca solo desde el loop del bot).
         self._tick: Dict[str, Tuple[float, float, float]] = {}     # símbolo → (24 h %, último precio, ts)
         self.ticker_connected = False
@@ -844,7 +882,7 @@ class KlineBot:
                 "engines": {n: e.settings() for n, e in self.engines.items()},
                 "inverted": self.inverted, "fee_pct": self.fee_pct,
                 "profit_target_usd": self.profit_target_usd, "max_open": self.max_open,
-                "executor_paused": self.executor_paused, "ratio": self.ratio_cfg,
+                "executor_paused": self.executor_paused, "ratio": self.ratio_cfg, "ratio_rev": self.rev_cfg,
                 "klines_enabled": self.klines_enabled}
         tmp = f"{SETTINGS_FILE}.tmp"
         try:
@@ -1017,7 +1055,7 @@ class KlineBot:
             self.log(f"[config] {eng.label}: {'PAUSADO' if paused else 'en marcha'}")
         return {"engine": eng.name, "paused": eng.paused}
 
-    def close_all(self, eng: Optional[Engine] = None, reason: str = "MANUAL") -> Tuple[int, int]:
+    def close_all(self, eng: Optional[Engine] = None, reason: str = "CERRAR_TODAS") -> Tuple[int, int]:
         """Cierra todas las posiciones (de un bot o de los dos). (cerradas, total)."""
         engines = [eng] if eng is not None else list(self.engines.values())
         with self.lock:
@@ -1075,7 +1113,7 @@ class KlineBot:
 
     async def _main(self) -> None:
         for eng in self.engines.values():
-            if eng.name == ENGINE_RATIO or not self.klines_enabled:
+            if eng.name in RATIO_ENGINES or not self.klines_enabled:
                 continue
             self.log(f"{eng.label} | {ENGINE_HINTS[eng.name]} | señal ≥ {eng.threshold_pct:g}% | "
                      f"{'SL' if self.inverted else 'TP'} {eng.tp_pct:g}% | {NOTIONAL_USDT:g} USDT")
@@ -1090,6 +1128,8 @@ class KlineBot:
                  f"{'bloqueado' if self.engines[ENGINE_RATIO].blocked[LONG] else 'activo'} | "
                  f"{NOTIONAL_USDT:g} USDT | TP +{rc['tp_pct']:g}% · SL -{rc['sl_pct']:g}% por precio"
                  f"{' · TP por ratio (recupera el % que se movió)' if rc['ratio_exit'] else ''}")
+        self.log(f"{ENGINE_LABELS[ENGINE_RATIO_TP]} | sale solo por el TP del ratio")
+        self.log(f"{ENGINE_LABELS[ENGINE_RATIO_REV]} | {self._rev_desc()}")
         self.log(f"Red: 24 h por {f'WebSocket, exploración de {TICKER_SCAN_S:g} s cada 5 min' if TICKER_MODE != 'ws' else 'WebSocket continuo'} · "
                  f"precio en vivo solo de símbolos con posición ({price_stream_for(self.klines_enabled)})")
         self.log(f"[estado] Persistencia: {self._store_desc}")
@@ -1313,7 +1353,7 @@ class KlineBot:
                        arrived: float, t0: float = 0.0, inverted: bool = False) -> None:
         """Corre en el loop del bot. Decide si `eng` abre y lanza la apertura.
         `direction` ya viene invertida si `inverted` (modo con el que se decidió)."""
-        if eng.name == ENGINE_RATIO or eng._last_candle.get(symbol, -1) >= candle.open_time:
+        if eng.name in RATIO_ENGINES or eng._last_candle.get(symbol, -1) >= candle.open_time:
             return                                          # duplicado tras reconexión
         eng._last_candle[symbol] = candle.open_time
         eng.signal_count += 1
@@ -1437,7 +1477,7 @@ class KlineBot:
                     if pos.symbol != symbol:
                         continue
                     pos.update(price)
-                    if pos.strategy == ENGINE_RATIO:
+                    if pos.strategy in RATIO_ENGINES:
                         # TP/SL fijos por precio (la salida por ratio se revisa en el ciclo de 5 min)
                         reason = price_exit(price, pos.direction, pos.tp_price, pos.sl_price)
                         if reason:
@@ -1492,18 +1532,19 @@ class KlineBot:
             self.store.mark_dirty(True)
             self.log(f"[{eng.label}] CIERRA {pos.direction} {symbol} ({reason}) | entrada {pos.entry_price:g} → "
                      f"{price:g} ({rec['move_pct']:+.2f}%) | PnL neto {pnl:+.4f} USDT (fees {fees:.4f}) | trade #{pos.trade_id}")
-            if not pos.sent:
-                return True                     # simulada: el executor nunca la abrió
-            self.executor.send({
-                "action":      "close",
-                "trade_id":    pos.trade_id,
-                "symbol":      symbol,
-                "direction":   pos.direction,
-                "reason":      reason,
-                "close_price": price,
-                "pnl":         round(pnl, 6),
-                "strategy":    eng.name,
-            })
+            if pos.sent:                        # simulada: el executor nunca la abrió
+                self.executor.send({
+                    "action":      "close",
+                    "trade_id":    pos.trade_id,
+                    "symbol":      symbol,
+                    "direction":   pos.direction,
+                    "reason":      reason,
+                    "close_price": price,
+                    "pnl":         round(pnl, 6),
+                    "strategy":    eng.name,
+                })
+            if pnl < 0 and eng.name == ENGINE_RATIO_REV and not pos.revenge and reason not in REVENGE_SKIP_REASONS:
+                self._open_revenge(eng, pos, price, -pnl, reason)
             return True
         finally:
             with self.lock:
@@ -1567,20 +1608,133 @@ class KlineBot:
         self.log("[config] ratio: " + " | ".join(changes))
         return dict(self.ratio_cfg)
 
-    def _ratio_exit_prices(self, entry: float, direction: str) -> Tuple[float, float]:
-        cfg = self.ratio_cfg
+    def _exit_cfg(self, name: str) -> dict:
+        """TP/SL de precio y salida por ratio de cada bot de ratio."""
+        if name == ENGINE_RATIO_TP:
+            return {"tp_pct": 0.0, "sl_pct": 0.0, "ratio_exit": True}
+        c = self.rev_cfg if name == ENGINE_RATIO_REV else self.ratio_cfg
+        return {"tp_pct": c["tp_pct"], "sl_pct": c["sl_pct"], "ratio_exit": c["ratio_exit"]}
+
+    def _ratio_exit_prices(self, entry: float, direction: str, name: str = ENGINE_RATIO) -> Tuple[float, float]:
+        cfg = self._exit_cfg(name)
         return tp_sl_prices(entry, direction, cfg["tp_pct"], cfg["sl_pct"])
 
-    def _apply_ratio_exits(self) -> None:
-        """Recalcula TP/SL por precio de las posiciones abiertas del bot de ratio con la
-        configuración vigente y las revisa ya (por si el nivel nuevo ya se tocó)."""
-        eng = self.engines[ENGINE_RATIO]
+    def _apply_ratio_exits(self, names: Tuple[str, ...] = RATIO_ENGINES) -> None:
+        """Recalcula TP/SL por precio de las posiciones abiertas de los bots de ratio con la
+        configuración vigente y las revisa ya (por si el nivel nuevo ya se tocó). Las de
+        venganza conservan su TP/SL en USD."""
+        syms = set()
         with self.lock:
-            for p in eng.positions.values():
-                p.tp_price, p.sl_price = self._ratio_exit_prices(p.entry_price, p.direction)
-            syms = {p.symbol for p in eng.positions.values()}
+            for name in names:
+                for p in self.engines[name].positions.values():
+                    if not p.revenge:
+                        p.tp_price, p.sl_price = self._ratio_exit_prices(p.entry_price, p.direction, name)
+                        syms.add(p.symbol)
         for sym in syms:
             self._on_price_event(sym, "config")
+
+    def _rev_desc(self, c: Optional[dict] = None) -> str:
+        c = c or self.rev_cfg
+        return (f"TP +{c['tp_pct']:g}% · SL -{c['sl_pct']:g}% por precio{' · TP por ratio' if c['ratio_exit'] else ''} | "
+                f"venganza {'ON' if c['revenge'] else 'OFF'}: ×{c['rev_mult']:g} notional, "
+                f"{'contraria' if c['rev_dir'] == 'opposite' else 'misma dirección'}, TP {c['rev_recover_pct']:g}% "
+                f"de la pérdida, SL {c['rev_sl_pct']:g}% de (pérdida × {c['rev_mult']:g})")
+
+    def set_rev_config(self, **kw) -> dict:
+        """Ajusta en caliente el bot ratio + venganza: TP/SL de precio (también a sus abiertas),
+        salida por ratio y la venganza (activa, multiplicador, % a recuperar, SL, dirección)."""
+        old = self.rev_cfg
+        new = dict(old)
+        for key in ("tp_pct", "sl_pct", "rev_mult", "rev_recover_pct", "rev_sl_pct"):
+            if kw.get(key) is not None:
+                new[key] = abs(float(kw[key]))
+        for key in ("ratio_exit", "revenge"):
+            if kw.get(key) is not None:
+                new[key] = bool(kw[key])
+        if kw.get("rev_dir") is not None:
+            if kw["rev_dir"] not in ("opposite", "same"):
+                raise ValueError("rev_dir debe ser opposite o same")
+            new["rev_dir"] = kw["rev_dir"]
+        if new["sl_pct"] >= 100:
+            raise ValueError("el stop loss debe ser menor que 100 %")
+        if not 0 < new["rev_mult"] <= 100:
+            raise ValueError("el multiplicador de la venganza debe estar entre 0 y 100")
+        if not 0 < new["rev_recover_pct"] <= 1000 or not 0 < new["rev_sl_pct"] <= 1000:
+            raise ValueError("los % de la venganza deben estar entre 0 y 1000")
+        if new == old:
+            return dict(old)
+        self.rev_cfg = new
+        if new["tp_pct"] != old["tp_pct"] or new["sl_pct"] != old["sl_pct"]:
+            self._apply_ratio_exits((ENGINE_RATIO_REV,))
+        self._save_settings()
+        self.store.mark_dirty(True)
+        self.log(f"[config] {ENGINE_LABELS[ENGINE_RATIO_REV]}: {self._rev_desc()}")
+        return dict(self.rev_cfg)
+
+    def _open_revenge(self, eng: Engine, lost: Position, price: float, loss: float, reason: str) -> None:
+        """Trade de venganza: tras cerrar `lost` con pérdida `loss` (USD, > 0) abre otra operación
+        con notional × N. TP = rev_recover_pct % de la pérdida; SL = rev_sl_pct % de (pérdida × N),
+        ambos en USD netos de fees. Si la venganza pierde no se encadena otra."""
+        c = self.rev_cfg
+        if not c["revenge"]:
+            return
+        sym = lost.symbol
+        side = (SHORT if lost.direction == LONG else LONG) if c["rev_dir"] == "opposite" else lost.direction
+        now = time.time()
+
+        def note(action: str) -> None:
+            with self.lock:
+                eng.signals.appendleft({
+                    "ts": now, "time": _utc(now, "%H:%M:%S"), "symbol": sym, "direction": side,
+                    "body_pct": -loss, "open": lost.entry_price, "close": price,
+                    "candle": f"#{lost.trade_id}", "candle_age_s": 0.0, "action": action,
+                })
+
+        if eng.paused:
+            return note("venganza: bot pausado")
+        if self.max_open > 0 and self.open_count() >= self.max_open:
+            return note(f"venganza ignorada: límite de {self.max_open} abiertas")
+        if not self.store.can_open():
+            return note("venganza ignorada: estado sin confirmar")
+        px = self._price(sym) or price
+        f = self.filters.get(sym, {})
+        qty, eff, why = size_order(
+            lost.notional * c["rev_mult"], px, f.get("stepSize", 0.001), f.get("minQty", 0.0),
+            f.get("minNotional", 5.0), MAX_NOTIONAL_OVER)
+        if qty <= 0:
+            return note(f"venganza saltada: {why}")
+        tp_usd = loss * c["rev_recover_pct"] / 100.0
+        sl_usd = loss * c["rev_mult"] * c["rev_sl_pct"] / 100.0
+        fees = 2 * eff * self.fee_pct / 100.0                 # entrada + salida (aprox.)
+        tp_move = (tp_usd + fees) / qty
+        sl_move = max(sl_usd - fees, sl_usd * 0.1) / qty
+        if side == LONG:
+            tp_px, sl_px = px + tp_move, max(px - sl_move, 0.0)
+        else:
+            tp_px, sl_px = max(px - tp_move, 0.0), px + sl_move
+        pos = Position(
+            trade_id=self._next_trade_id(), symbol=sym, direction=side,
+            entry_price=px, qty=qty, notional=eff, tp_price=tp_px, sl_price=sl_px,
+            signal_pct=-loss, candle_open=lost.entry_price, candle_close=price, candle_time=int(now * 1000),
+            last_price=px, strategy=eng.name, inverted=False, sent=not self.executor_paused,
+            revenge=True, rev_parent=lost.trade_id, rev_tp_usd=tp_usd, rev_sl_usd=sl_usd,
+        )
+        with self.lock:
+            eng.positions[pos.trade_id] = pos
+            eng.opened_count += 1
+            self.revenge_count += 1
+        self._refresh_pos_syms()
+        self.store.mark_dirty(True)
+        note(f"venganza abierta #{pos.trade_id}")
+        self.log(f"[{eng.label}] VENGANZA {side} {sym}{'' if pos.sent else ' [SIMULADA]'} tras #{lost.trade_id} "
+                 f"({reason}, {-loss:+.4f} USDT) | px={px:g} qty={qty:g} ({eff:.2f} USDT, ×{c['rev_mult']:g}) | "
+                 f"TP {tp_px:g} (+{tp_usd:.4f} USD) · SL {sl_px:g} (-{sl_usd:.4f} USD) | trade #{pos.trade_id}")
+        if pos.sent:
+            self.executor.send({
+                "action": "open", "trade_id": pos.trade_id, "symbol": sym, "direction": side,
+                "price": px, "quantity": qty, "notional": round(eff, 4),
+                "level": round(-loss, 4), "strategy": eng.name,
+            }, time.perf_counter())
 
     async def _refresh_tickers(self) -> None:
         """Exploración de todo el mercado por WebSocket (TICKER_SCAN_S segundos): 24 h de cada
@@ -1756,9 +1910,9 @@ class KlineBot:
         """Recalcula la lista de vigilados (24 h ≥ +X %; con LONG activo, también ≤ -X %)
         y suscribe los nuevos a precios en vivo."""
         wmin = self.ratio_cfg["watch_min_pct"]
-        eng = self.engines[ENGINE_RATIO]
-        want_short = not eng.blocked[SHORT]
-        want_long = not eng.blocked[LONG]
+        engs = [self.engines[n] for n in RATIO_ENGINES]
+        want_short = any(not e.blocked[SHORT] for e in engs)
+        want_long = any(not e.blocked[LONG] for e in engs)
         picked = []
         for sym, (pct, _px, _ts) in list(self._tick.items()):
             if pct >= wmin and want_short:
@@ -1779,10 +1933,12 @@ class KlineBot:
         # Los vigilados NO se suscriben a precio en vivo (era el mayor consumo de tráfico):
         # solo los símbolos con posición abierta, ver _refresh_pos_syms.
 
-    def _ratio_symbols(self) -> List[str]:
-        eng = self.engines[ENGINE_RATIO]
+    def _ratio_open_syms(self) -> set:
         with self.lock:
-            open_syms = {p.symbol for p in eng.positions.values()}
+            return {p.symbol for n in RATIO_ENGINES for p in self.engines[n].positions.values()}
+
+    def _ratio_symbols(self) -> List[str]:
+        open_syms = self._ratio_open_syms()
         return list(dict.fromkeys(list(self.watch) + sorted(open_syms)))
 
     def _rest_get(self, path: str, params: Optional[dict] = None, timeout: float = 15.0):
@@ -1953,13 +2109,11 @@ class KlineBot:
         await asyncio.to_thread(pc.wait_for_price, sym, 5.0, PRICE_MAX_AGE_S)
 
     def _ratio_check_tp(self, sym: str, pts: List[Tuple[int, float]]) -> None:
-        """TP: el ratio recupera el valor que tenía antes del gatillo."""
-        if not self.ratio_cfg.get("ratio_exit", True):
-            return
-        eng = self.engines[ENGINE_RATIO]
+        """TP por ratio: el ratio recupera el % que se movió (en los bots que lo tienen activo)."""
+        names = [n for n in RATIO_ENGINES if self._exit_cfg(n)["ratio_exit"]]
         with self.lock:
-            targets = [p for p in eng.positions.values()
-                       if p.symbol == sym and (p.ratio_target or p.ratio_trigger) > 0]
+            targets = [p for n in names for p in self.engines[n].positions.values()
+                       if p.symbol == sym and not p.revenge and (p.ratio_target or p.ratio_trigger) > 0]
         if not targets or not self.store.can_act():
             return
         for p in targets:
@@ -1974,8 +2128,8 @@ class KlineBot:
             if not hit:
                 continue
             price = self._live_price(sym) or p.last_price or p.entry_price
-            self.log(f"[ratio] TP {p.direction} {sym}: ratio {best:g} alcanzó el objetivo {goal:g} "
-                     f"(entrada {p.ratio_entry:g}, recupera {abs(p.ratio_change_pct):.1f}%)")
+            self.log(f"[ratio] TP {p.direction} {sym} ({ENGINE_LABELS[p.strategy]}): ratio {best:g} alcanzó el objetivo "
+                     f"{goal:g} (entrada {p.ratio_entry:g}, recupera {abs(p.ratio_change_pct):.1f}%)")
             self._close(p.trade_id, price, "TP_RATIO")
 
     def _record_ratio_signal(self, eng: Engine, sym: str, direction: str, prev: Tuple[int, float],
@@ -1989,6 +2143,7 @@ class KlineBot:
             })
 
     def _ratio_check_entry(self, sym: str, prev: Tuple[int, float], last: Tuple[int, float], chg: float) -> None:
+        """Señal común a los bots de ratio: cada uno decide y abre su propia posición."""
         cfg = self.ratio_cfg
         dmin, dmax, wmin = cfg["drop_min_pct"], cfg["drop_max_pct"], cfg["watch_min_pct"]
         if -dmax <= chg <= -dmin:
@@ -2001,13 +2156,18 @@ class KlineBot:
         pct24 = t[0] if t else None
         if pct24 is None or (side == SHORT and pct24 < wmin) or (side == LONG and pct24 > -wmin):
             return                                  # solo se opera lo que está en la lista de vigilados
-        eng = self.engines[ENGINE_RATIO]
+        age_s = time.time() - last[0] / 1000
+        price = self._live_price(sym)
+        for name in RATIO_ENGINES:
+            self._ratio_open(self.engines[name], sym, side, prev, last, chg, pct24, age_s, price)
+
+    def _ratio_open(self, eng: Engine, sym: str, side: str, prev: Tuple[int, float], last: Tuple[int, float],
+                    chg: float, pct24: float, age_s: float, price: Optional[float]) -> None:
         eng.signal_count += 1
 
         def skip(action: str) -> None:
             self._record_ratio_signal(eng, sym, side, prev, last, chg, action)
 
-        age_s = time.time() - last[0] / 1000
         if age_s > RATIO_MAX_AGE_S:
             return skip(f"ignorada: dato de ratio de hace {age_s:.0f}s")
         if eng.paused:
@@ -2019,13 +2179,12 @@ class KlineBot:
         if not self.store.can_open():
             return skip("ignorada: estado sin confirmar")
         with self.lock:
-            dup = any(p.symbol == sym and p.direction == side for p in eng.positions.values())
+            dup = any(p.symbol == sym and p.direction == side and not p.revenge for p in eng.positions.values())
             until = eng.cooldown.get(sym, 0.0)
         if dup:
             return skip("ya hay una abierta en este par y dirección")
         if until > time.time():
             return skip("ignorada: en pausa tras cierre")
-        price = self._live_price(sym)
         if not price:
             return skip("sin precio en vivo")
         if sym not in self.filters:
@@ -2039,7 +2198,7 @@ class KlineBot:
             return skip(f"saltada: {why}")
         # TP: el ratio recupera el mismo % que cayó (SHORT) / subió (LONG), desde el ratio de entrada.
         target = last[1] * (1 + abs(chg) / 100.0) if side == SHORT else last[1] * (1 - abs(chg) / 100.0)
-        tp_px, sl_px = self._ratio_exit_prices(price, side)
+        tp_px, sl_px = self._ratio_exit_prices(price, side, eng.name)
         pos = Position(
             trade_id=self._next_trade_id(), symbol=sym, direction=side,
             entry_price=price, qty=qty, notional=eff, tp_price=tp_px, sl_price=sl_px,
@@ -2055,7 +2214,7 @@ class KlineBot:
         self.store.mark_dirty(True)
         skip(f"abierta #{pos.trade_id}")
         by_ratio = (f" · TP ratio {'≥' if side == SHORT else '≤'} {target:g}"
-                    if self.ratio_cfg["ratio_exit"] else "")
+                    if self._exit_cfg(eng.name)["ratio_exit"] else "")
         self.log(f"[{eng.label}] ABRE {side} {sym}{'' if pos.sent else ' [SIMULADA: envíos al executor pausados]'} | "
                  f"ratio {prev[1]:g}→{last[1]:g} ({chg:+.1f}%) | 24 h {pct24:+.1f}% | px={price:g} qty={qty:g} "
                  f"({eff:.2f} USDT) | TP {tp_px or '—'} · SL {sl_px or '—'}{by_ratio} | trade #{pos.trade_id}")
@@ -2070,8 +2229,7 @@ class KlineBot:
         eng = self.engines[ENGINE_RATIO]
         cfg = dict(self.ratio_cfg)
         dmin, dmax = cfg["drop_min_pct"], cfg["drop_max_pct"]
-        with self.lock:
-            open_syms = {p.symbol for p in eng.positions.values()}
+        open_syms = self._ratio_open_syms()
         now = time.time()
         rows = []
         listed = list(dict.fromkeys(list(self.watch) + sorted(open_syms))) if all_rows else sorted(open_syms)
@@ -2093,7 +2251,8 @@ class KlineBot:
             r["lag"] = bool(r["data_time"] and (self._ratio.get(r["symbol"]) or {}).get("last_ts", 0) < newest)
         rows.sort(key=lambda r: abs(r["pct24"] or 0), reverse=True)
         return {
-            "cfg": cfg, "rows": rows, "watch_count": len(self.watch),
+            "cfg": cfg, "rev": dict(self.rev_cfg), "revenge_count": self.revenge_count,
+            "rows": rows, "watch_count": len(self.watch),
             "long_enabled": not eng.blocked[LONG], "short_enabled": not eng.blocked[SHORT],
             "ticker_connected": self.ticker_connected, "ticker_symbols": len(self._tick),
             "ticker_mode": TICKER_MODE, "scan_s": TICKER_SCAN_S,
@@ -2241,9 +2400,10 @@ class KlineBot:
     # Campos que pinta la web (el resto queda en /api/trades y el CSV): menos bytes por consulta.
     _POS_FIELDS = ("trade_id", "symbol", "direction", "entry_price", "notional", "tp_price", "sl_price",
                    "signal_pct", "candle_age_s", "inverted", "sent", "mfe_pct", "mae_pct", "mfe_usd",
-                   "mae_usd", "ratio_trigger", "ratio_entry", "ratio_change_pct", "ratio_target")
+                   "mae_usd", "ratio_trigger", "ratio_entry", "ratio_change_pct", "ratio_target", "revenge",
+                   "rev_parent", "rev_tp_usd", "rev_sl_usd")
     _CLOSED_FIELDS = ("symbol", "direction", "entry_price", "close_price", "move_pct", "pnl", "fees",
-                      "mfe_pct", "mae_pct", "duration_s", "reason", "sent")
+                      "mfe_pct", "mae_pct", "duration_s", "reason", "sent", "revenge")
     _SIGNAL_FIELDS = ("time", "symbol", "direction", "candle", "open", "close", "body_pct",
                       "candle_age_s", "action")
     WEB_CLOSED_ROWS = 100
@@ -2300,7 +2460,7 @@ class KlineBot:
             "signals":        signals,
             "excursions":     self.excursion_stats(eng) if "exc" in parts else None,
             "evaluations":    (self.evaluations(eng.threshold_pct)
-                               if "eval" in parts and eng.name != ENGINE_RATIO else empty_eval),
+                               if "eval" in parts and eng.name not in RATIO_ENGINES else empty_eval),
         }
 
     def network_stats(self) -> dict:
@@ -2515,8 +2675,8 @@ def api_config_set():
     eng, err = _engine_param(data)
     if err:
         return err
-    if eng.name == ENGINE_RATIO:
-        return jsonify({"ok": False, "error": "El bot de ratio se ajusta en /api/ratio"}), 400
+    if eng.name in RATIO_ENGINES:
+        return jsonify({"ok": False, "error": "Los bots de ratio se ajustan en /api/ratio"}), 400
     vals = {}
     for key in ("threshold_pct", "tp_pct"):
         if data.get(key) in (None, ""):
@@ -2597,6 +2757,8 @@ def api_ratio_set():
     if busy:
         return busy
     data = request.get_json(silent=True) or {}
+    if data.get("engine") == ENGINE_RATIO_REV:
+        return _rev_set(data)
     vals = {}
     for key, lo, hi in (("watch_min_pct", 0, 1000), ("drop_min_pct", 0, 100), ("drop_max_pct", 0, 100),
                         ("tp_pct", None, 1000), ("sl_pct", None, 99.9)):
@@ -2619,6 +2781,31 @@ def api_ratio_set():
         return jsonify({"ok": False, "error": "Nada que cambiar"}), 400
     try:
         cfg = bot.set_ratio_config(**vals)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, **cfg})
+
+
+def _rev_set(data: dict):
+    """Bot ratio + venganza: {"engine": "ratio_rev", "tp_pct": 10, "sl_pct": 5, "ratio_exit": true,
+    "revenge": true, "rev_mult": 10, "rev_recover_pct": 65, "rev_sl_pct": 100, "rev_dir": "opposite"|"same"}."""
+    vals = {}
+    for key in ("tp_pct", "sl_pct", "rev_mult", "rev_recover_pct", "rev_sl_pct"):
+        if data.get(key) in (None, ""):
+            continue
+        try:
+            vals[key] = abs(float(data[key]))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": f"{key} inválido"}), 400
+    for key in ("ratio_exit", "revenge"):
+        if key in data:
+            vals[key] = bool(data[key])
+    if data.get("rev_dir"):
+        vals["rev_dir"] = str(data["rev_dir"])
+    if not vals:
+        return jsonify({"ok": False, "error": "Nada que cambiar"}), 400
+    try:
+        cfg = bot.set_rev_config(**vals)
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     return jsonify({"ok": True, **cfg})
@@ -2736,6 +2923,7 @@ TRADE_CSV_COLS = [
     "inverted", "signal_pct", "candle_age_s", "entry_price", "close_price", "qty", "notional", "tp_price",
     "sent", "move_pct", "pnl", "pnl_gross", "fees", "pnl_pct", "mfe_pct", "mae_pct", "mfe_usd", "mae_usd", "time_to_mfe_s",
     "time_to_mae_s", "high_price", "low_price", "sl_price", "ratio_target", "ratio_trigger", "ratio_entry", "ratio_change_pct",
+    "revenge", "rev_parent", "rev_tp_usd", "rev_sl_usd",
 ]
 
 
@@ -2974,6 +3162,16 @@ HTML = r"""<!doctype html>
   .cols2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:14px; }
   .box { background:var(--surface-2); border:1px solid var(--line); border-radius:14px; padding:14px; }
   .box h4 { margin:0 0 10px; font-size:13px; }
+  .rev { display:flex; flex-direction:column; gap:12px; border-color:var(--accent); }
+  .rev-h { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+  .rev-row { display:flex; align-items:center; flex-wrap:wrap; gap:8px; font-size:13px; }
+  .rev-row > span:first-child { color:var(--muted); min-width:170px; }
+  input.mini { flex:none; width:84px; padding:6px 8px; text-align:center; font-weight:700; }
+  .switch { width:46px; height:26px; border-radius:99px; padding:0; position:relative; background:var(--line-strong); border:0; }
+  .switch i { position:absolute; top:3px; left:3px; width:20px; height:20px; border-radius:50%; background:#fff; transition:left .15s; }
+  .switch.on { background:var(--accent); }
+  .switch.on i { left:23px; }
+  .tag.REV { background:var(--amber-soft); color:var(--amber); }
   pre { margin:0; max-height:420px; overflow:auto; font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; color:var(--muted);
         white-space:pre-wrap; background:var(--surface-2); border:1px solid var(--line); border-radius:var(--radius-sm); padding:12px; }
   .netgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:8px; }
@@ -3067,11 +3265,42 @@ HTML = r"""<!doctype html>
     <div class="view-h"><div><h2>Bots</h2><p>Parámetros de cada bot. Todo se aplica en caliente, sin reiniciar.</p></div></div>
 
     <details class="panel" data-key="b_ratio" open>
-      <summary>Bot ratio top traders <span class="hint" id="rtSum"></span><span class="right" id="rtState"></span></summary>
+      <summary>Bots de ratio · entrada común <span class="hint" id="rtSum"></span></summary>
       <div class="body">
         <div class="cols2">
           <div class="box">
-            <h4>Salida de las operaciones <span class="muted" style="font-weight:400">· también para las abiertas</span></h4>
+            <h4>Entrada <span class="muted" style="font-weight:400">· la usan los tres bots de ratio</span></h4>
+            <form id="rtForm">
+              <label class="f">Vigilar 24 h ≥ ±% <span id="rtCurW"></span>
+                <input id="rtWatch" type="number" step="0.1" min="0.1" max="1000" placeholder="ej. 20"></label>
+              <label class="f">Cambio mín. del ratio (caída o subida), % <span id="rtCurMin"></span>
+                <input id="rtMin" type="number" step="0.1" min="0.1" max="100" placeholder="ej. 25"></label>
+              <label class="f">Cambio máx. del ratio (caída o subida), % <span id="rtCurMax"></span>
+                <input id="rtMax" type="number" step="0.1" min="0.1" max="100" placeholder="ej. 30"></label>
+              <button type="submit">Guardar</button>
+            </form>
+          </div>
+          <div class="box">
+            <h4>Cómo funcionan</h4>
+            <div class="note" style="margin-top:0"><b>Caída del ratio → SHORT</b> en ganadores (24 h ≥ +X %). <b>Subida del ratio → LONG</b> en perdedores (24 h ≤ −X %).
+              Con cada señal, cada bot de ratio abre su propia operación (si no está pausado ni tiene esa dirección bloqueada) y la gestiona con su salida:</div>
+            <ul class="note" style="padding-left:18px">
+              <li><b>Ratio TP/SL</b>: TP y SL por precio + TP por ratio opcional.</li>
+              <li><b>Ratio solo TP ratio</b>: sale solo cuando el ratio recupera el % que se movió.</li>
+              <li><b>Ratio + venganza</b>: su propio TP/SL; si cierra en pérdida abre un trade de venganza.</li>
+            </ul>
+          </div>
+        </div>
+        <div id="rtMsg" class="muted msg"></div>
+      </div>
+    </details>
+
+    <details class="panel" data-key="b_ratio1" open>
+      <summary>Bot ratio TP/SL <span class="hint" id="r1Sum"></span><span class="right" id="r1State"></span></summary>
+      <div class="body">
+        <div class="cols2">
+          <div class="box">
+            <h4>Salida <span class="muted" style="font-weight:400">· también para las abiertas</span></h4>
             <form id="rtExitForm">
               <label class="f">Take profit, % a favor <span id="rtCurTp"></span>
                 <input id="rtTp" type="number" step="0.1" min="0" max="1000" placeholder="ej. 10 (0 = sin TP)"></label>
@@ -3084,26 +3313,56 @@ HTML = r"""<!doctype html>
               <span class="muted" style="font-size:12px">TP por ratio: cierra cuando el ratio recupera el mismo % que cayó (SHORT) o subió (LONG).</span>
             </div>
           </div>
+          <div class="box"><h4>Direcciones y estado</h4><div class="row c" id="rb_ratio"></div></div>
+        </div>
+      </div>
+    </details>
+
+    <details class="panel" data-key="b_ratio_tp" open>
+      <summary>Bot ratio solo TP ratio <span class="hint">sin TP/SL de precio</span><span class="right" id="r2State"></span></summary>
+      <div class="body">
+        <div class="cols2">
+          <div class="box"><h4>Salida</h4>
+            <div class="note" style="margin-top:0">Cierra solo cuando el ratio recupera el mismo % que cayó (SHORT) o subió (LONG), medido desde el ratio de entrada. No tiene take profit ni stop loss por precio.</div></div>
+          <div class="box"><h4>Direcciones y estado</h4><div class="row c" id="rb_ratio_tp"></div></div>
+        </div>
+      </div>
+    </details>
+
+    <details class="panel" data-key="b_ratio_rev" open>
+      <summary>Bot ratio + venganza <span class="hint" id="r3Sum"></span><span class="right" id="r3State"></span></summary>
+      <div class="body">
+        <div class="cols2">
           <div class="box">
-            <h4>Entrada</h4>
-            <form id="rtForm">
-              <label class="f">Vigilar 24 h ≥ ±% <span id="rtCurW"></span>
-                <input id="rtWatch" type="number" step="0.1" min="0.1" max="1000" placeholder="ej. 20"></label>
-              <label class="f">Cambio mín. del ratio (caída o subida), % <span id="rtCurMin"></span>
-                <input id="rtMin" type="number" step="0.1" min="0.1" max="100" placeholder="ej. 25"></label>
-              <label class="f">Cambio máx. del ratio (caída o subida), % <span id="rtCurMax"></span>
-                <input id="rtMax" type="number" step="0.1" min="0.1" max="100" placeholder="ej. 30"></label>
+            <h4>Salida <span class="muted" style="font-weight:400">· también para las abiertas (no las de venganza)</span></h4>
+            <form id="rvExitForm">
+              <label class="f">Take profit, % a favor <span id="rvCurTp"></span>
+                <input id="rvTp" type="number" step="0.1" min="0" max="1000" placeholder="ej. 10 (0 = sin TP)"></label>
+              <label class="f">Stop loss, % en contra <span id="rvCurSl"></span>
+                <input id="rvSl" type="number" step="0.1" min="-99.9" max="99.9" placeholder="ej. -5 (0 = sin SL)"></label>
               <button type="submit">Guardar</button>
             </form>
             <div class="row c" style="margin-top:10px">
-              <button type="button" data-ratio-dir="SHORT" id="rtBtnShort">SHORT</button>
-              <button type="button" data-ratio-dir="LONG" id="rtBtnLong">LONG</button>
-              <button type="button" class="small" data-pause="ratio" id="rtBtnPause">—</button>
+              <button type="button" class="small" data-act="revRatioExit" id="rvBtnExit">—</button>
             </div>
-            <div class="note"><b>Caída del ratio → SHORT</b> en ganadores (24 h ≥ +X %). <b>Subida del ratio → LONG</b> en perdedores (24 h ≤ −X %). Cada botón activa o bloquea su dirección.</div>
+            <h4 style="margin-top:16px">Direcciones y estado</h4><div class="row c" id="rb_ratio_rev"></div>
+          </div>
+          <div class="box rev" id="revBox">
+            <div class="rev-h"><h4 style="margin:0">⚔️ Venganza <span class="st" id="revState">—</span></h4>
+              <button type="button" class="switch" data-act="revToggle" id="revSwitch" aria-label="Activar o desactivar la venganza"><i></i></button></div>
+            <div class="rev-row"><span>Notional de la venganza</span>
+              <span class="seg" id="revMultSeg"></span>
+              <input id="revMult" class="mini" type="number" step="0.5" min="0.5" max="100" title="Multiplicador personalizado"></div>
+            <div class="rev-row"><span>Recuperar de la pérdida</span>
+              <input id="revRecover" class="mini" type="number" step="1" min="1" max="1000"><span class="muted">%</span></div>
+            <div class="rev-row"><span>Stop loss de la venganza</span>
+              <span class="seg" id="revSlSeg"></span>
+              <input id="revSl" class="mini" type="number" step="1" min="1" max="1000"><span class="muted">%</span></div>
+            <div class="rev-row"><span>Dirección</span><span class="seg" id="revDirSeg"></span></div>
+            <div class="note" id="revNote"></div>
+            <div id="revMsg" class="muted msg"></div>
           </div>
         </div>
-        <div id="rtMsg" class="muted msg"></div>
       </div>
     </details>
 
@@ -3230,8 +3489,13 @@ const bytes = b => b >= 1073741824 ? (b/1073741824).toFixed(2) + ' GB' : b >= 10
 const tag = d => `<span class="tag ${esc(d)}">${esc(d)}</span>`;
 const store = {get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } },
                set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }};
-const ENGINES = ['ratio', 'close', 'live'];
-const SHORT_LABEL = {ratio: 'Ratio', close: 'Al cierre', live: 'En vivo'};
+const ENGINES = ['ratio', 'ratio_tp', 'ratio_rev', 'close', 'live'];
+const RATIO = ['ratio', 'ratio_tp', 'ratio_rev'];
+const SHORT_LABEL = {ratio: 'Ratio TP/SL', ratio_tp: 'Ratio solo TP', ratio_rev: 'Ratio venganza', close: 'Al cierre', live: 'En vivo'};
+const PANEL_OF = {ratio: 'b_ratio1', ratio_tp: 'b_ratio_tp', ratio_rev: 'b_ratio_rev', close: 'b_klines', live: 'b_klines'};
+// Salida de cada bot de ratio: {tp_pct, sl_pct, ratio_exit}.
+const exitOf = (d, n) => n === 'ratio_tp' ? {tp_pct: 0, sl_pct: 0, ratio_exit: true} : ((n === 'ratio_rev' ? (d.ratio || {}).rev : (d.ratio || {}).cfg) || {});
+const tpsl = c => `TP ${c.tp_pct > 0 ? '+' + c.tp_pct + '%' : 'off'} · SL ${c.sl_pct > 0 ? '−' + c.sl_pct + '%' : 'off'}${c.ratio_exit ? ' · TP ratio' : ''}`;
 const VIEWS = ['resumen', 'operaciones', 'bots', 'mercado', 'historial', 'sistema'];
 let cur = store.get('botkline_engine', 'ratio'); if (!ENGINES.includes(cur)) cur = 'ratio';
 let opFilter = store.get('botkline_opfilter', 'all');
@@ -3309,7 +3573,7 @@ const allPositions = d => ENGINES.flatMap(n => (d.engines[n] ? d.engines[n].posi
                                   .sort((a, b) => a.age_s - b.age_s);
 const exitLevels = (p, d) => {
   // [sl, tp] para la barra de progreso; null si no hay ese lado.
-  if (p._eng === 'ratio') return [p.sl_price > 0 ? p.sl_price : null, p.tp_price > 0 ? p.tp_price : null];
+  if (RATIO.includes(p._eng)) return [p.sl_price > 0 ? p.sl_price : null, p.tp_price > 0 ? p.tp_price : null];
   return p.inverted ? [p.tp_price, null] : [null, p.tp_price];
 };
 function rangeBar(p) {
@@ -3323,18 +3587,19 @@ function rangeBar(p) {
     <div class="range-l"><span>${sl ? `SL ${num(sl, 8)} (−${toMove(sl).toFixed(1)}%)` : 'sin SL'}</span><span>${tp ? `TP ${num(tp, 8)} (+${toMove(tp).toFixed(1)}%)` : 'sin TP'}</span></div></div>`;
 }
 function tradeCard(p, d, compact) {
-  const rc = (d.ratio || {}).cfg || {}, isR = p._eng === 'ratio';
-  const sig = isR ? `ratio ${num(p.ratio_trigger, 4)}→${num(p.ratio_entry, 4)} ${pct(p.ratio_change_pct || 0)}`
+  const isR = RATIO.includes(p._eng), xc = exitOf(d, p._eng);
+  const sig = p.revenge ? `venganza de #${p.rev_parent} · TP +${num(p.rev_tp_usd, 4)} / SL −${num(p.rev_sl_usd, 4)} USD`
+            : isR ? `ratio ${num(p.ratio_trigger, 4)}→${num(p.ratio_entry, 4)} ${pct(p.ratio_change_pct || 0)}`
                   : `vela ${pct(p.signal_pct)}${p._eng === 'live' ? ` a los ${Math.round(p.candle_age_s || 0)}s` : ''}`;
-  const ratioExit = isR && rc.ratio_exit ? `<span>TP ratio<b>${p.direction === 'SHORT' ? '≥' : '≤'} ${num(p.ratio_target || p.ratio_trigger, 4)}</b></span>` : '';
+  const ratioExit = isR && !p.revenge && xc.ratio_exit ? `<span>TP ratio<b>${p.direction === 'SHORT' ? '≥' : '≤'} ${num(p.ratio_target || p.ratio_trigger, 4)}</b></span>` : '';
   return `<div class="trade ${p.pnl >= 0 ? 'win' : 'loss'}">
-    <div class="h"><span class="sym">${esc(p.symbol)}</span>${tag(p.direction)}${p.sent === false ? '<span class="st off">SIMULADA</span>' : ''}
+    <div class="h"><span class="sym">${esc(p.symbol)}</span>${tag(p.direction)}${p.revenge ? '<span class="tag REV">VENGANZA</span>' : ''}${p.sent === false ? '<span class="st off">SIMULADA</span>' : ''}
       <span class="bl">${esc(SHORT_LABEL[p._eng])} · #${p.trade_id}</span></div>
     <div class="pnl"><b>${usd(p.pnl)}</b><span>${pct(p.move_pct)}</span><span class="muted" style="margin-left:auto;font-size:12px">${esc(p.opened)} · ${dur(p.age_s)}</span></div>
     ${rangeBar(p)}
     ${compact ? '' : `<div class="grid">
       <span>Entrada<b>${num(p.entry_price, 8)}</b></span><span>Precio<b>${num(p.price, 8)}</b></span><span>Notional<b>${num(p.notional, 2)} USDT</b></span>
-      <span>MFE<b>${pct(p.mfe_pct)}</b></span><span>MAE<b>${pct(p.mae_pct)}</b></span>${ratioExit || `<span>Señal<b>${sig}</b></span>`}
+      <span>MFE<b>${pct(p.mfe_pct)}</b></span><span>MAE<b>${pct(p.mae_pct)}</b></span>${p.revenge ? `<span>Venganza de<b>#${p.rev_parent}</b></span>` : ratioExit || `<span>Señal<b>${sig}</b></span>`}
     </div>`}
     <div class="f"><span>${compact ? sig : `${num(p.notional, 2)} USDT · ${p.sent === false ? 'simulada' : 'enviada al executor'}`}</span><button type="button" class="small ghost" data-close="${p.trade_id}" data-label="${esc(p.direction)} ${esc(p.symbol)} #${p.trade_id}">Cerrar</button></div>
   </div>`;
@@ -3380,7 +3645,7 @@ function render(d) {
   q('sWatch').textContent = r.watch_count ?? '—';
   q('sWatchInfo').textContent = `de ${r.ticker_symbols} símbolos · lista de ${r.watch_updated || '—'}`;
 
-  q('botCards').innerHTML = ENGINES.map(n => { const b = E[n], bc = b.config, isR = n === 'ratio';
+  q('botCards').innerHTML = ENGINES.map(n => { const b = E[n], bc = b.config, isR = RATIO.includes(n), xc = exitOf(d, n);
     const bl = [bc.block_long && 'LONG', bc.block_short && 'SHORT'].filter(Boolean).join(', ');
     const off = !isR && !k.running;
     const state = bc.paused ? ['off', 'PAUSADO'] : off ? ['idle', 'SIN VELAS'] : ['on', 'EN MARCHA'];
@@ -3388,7 +3653,7 @@ function render(d) {
       <div class="top"><h3>${esc(b.label)}</h3><span class="st ${state[0]}">${state[1]}</span></div>
       <div class="hint">${esc(b.hint)}</div>
       <div class="kv">
-        ${isR ? `<div>TP / SL<b>${rc.tp_pct > 0 ? '+' + rc.tp_pct + '%' : '—'} / ${rc.sl_pct > 0 ? '−' + rc.sl_pct + '%' : '—'}</b></div><div>Ratio ↓ SHORT / ↑ LONG<b>${rc.drop_min_pct}–${rc.drop_max_pct}%</b></div>`
+        ${isR ? `<div>Salida<b>${n === 'ratio_tp' ? 'solo TP ratio' : tpsl(xc)}</b></div><div>${n === 'ratio_rev' ? 'Venganza' : 'Ratio ↓ SHORT / ↑ LONG'}<b>${n === 'ratio_rev' ? ((r.rev || {}).revenge ? `ON ×${r.rev.rev_mult} · ${r.revenge_count || 0} disparadas` : 'OFF') : rc.drop_min_pct + '–' + rc.drop_max_pct + '%'}</b></div>`
               : `<div>Señal<b>±${bc.threshold_pct}%</b></div><div>${xk}<b>${bc.tp_pct}%</b></div>`}
         <div>Bloqueados<b class="${bl ? 'neg' : ''}">${bl || '—'}</b></div>
         <div>Abiertas<b>${b.positions.length}</b></div><div>Señales / entradas<b>${b.signal_count} / ${b.opened_count}</b></div><div>Cerradas<b>${b.closed_count} (${b.wins} gan.)</b></div>
@@ -3427,13 +3692,13 @@ function render(d) {
   q('opTrades').innerHTML = shown.map(pp => tradeCard(pp, d, false)).join('') || '<div class="empty">Sin operaciones abiertas</div>';
   const rn = {}; (r.rows || []).forEach(z => rn[z.symbol] = z);
   q('tPos').innerHTML = shown.map(row => {
-    const isR = row._eng === 'ratio';
+    const isR = RATIO.includes(row._eng);
     const exits = isR ? [row.tp_price > 0 ? `<span class="pos">TP</span> ${num(row.tp_price, 8)}` : '', row.sl_price > 0 ? `<span class="neg">SL</span> ${num(row.sl_price, 8)}` : '',
-                         rc.ratio_exit ? `<span class="muted">ratio ${row.direction === 'SHORT' ? '≥' : '≤'}</span> ${num(row.ratio_target || row.ratio_trigger, 4)}${rn[row.symbol] && rn[row.symbol].last != null ? ` <span class="muted">(ahora ${num(rn[row.symbol].last, 4)})</span>` : ''}` : ''].filter(Boolean).join(' · ')
+                         !row.revenge && exitOf(d, row._eng).ratio_exit ? `<span class="muted">ratio ${row.direction === 'SHORT' ? '≥' : '≤'}</span> ${num(row.ratio_target || row.ratio_trigger, 4)}${rn[row.symbol] && rn[row.symbol].last != null ? ` <span class="muted">(ahora ${num(rn[row.symbol].last, 4)})</span>` : ''}` : ''].filter(Boolean).join(' · ')
                       : `<span class="muted">${row.inverted ? 'SL' : 'TP'}</span> ${num(row.tp_price, 8)}`;
     return `<tr><td><b>${esc(row.symbol)}</b> <span class="muted">#${row.trade_id}</span>${row.sent === false ? ' <span class="st off">SIMULADA</span>' : ''}</td>
-      <td>${esc(SHORT_LABEL[row._eng])}</td><td>${tag(row.direction)}</td>
-      <td>${isR ? `${num(row.ratio_trigger, 4)}→${num(row.ratio_entry, 4)} ${pct(row.ratio_change_pct || 0)}` : pct(row.signal_pct)}</td>
+      <td>${esc(SHORT_LABEL[row._eng])}</td><td>${tag(row.direction)}${row.revenge ? ' <span class="tag REV">VENGANZA</span>' : ''}</td>
+      <td>${row.revenge ? `venganza de #${row.rev_parent}` : isR ? `${num(row.ratio_trigger, 4)}→${num(row.ratio_entry, 4)} ${pct(row.ratio_change_pct || 0)}` : pct(row.signal_pct)}</td>
       <td>${num(row.entry_price, 8)}</td><td>${num(row.price, 8)}</td><td>${pct(row.move_pct)}</td><td>${exits || '—'}</td>
       <td>${num(row.notional, 2)}</td><td>${usd(row.pnl)}</td>
       <td>${pct(row.mfe_pct)} <span class="muted">${usd(row.mfe_usd)}</span></td><td>${pct(row.mae_pct)} <span class="muted">${usd(row.mae_usd)}</span></td>
@@ -3441,7 +3706,7 @@ function render(d) {
       <td><button class="small ghost" data-close="${row.trade_id}" data-label="${esc(row.direction)} ${esc(row.symbol)} #${row.trade_id}">Cerrar</button></td></tr>`; }).join('')
     || '<tr><td colspan="14" class="muted">Sin posiciones abiertas</td></tr>';
 
-  const e = E[cur], ec = e.config, isRatio = cur === 'ratio';
+  const e = E[cur], ec = e.config, isRatio = RATIO.includes(cur);
   document.querySelectorAll('.engName').forEach(el => el.textContent = e.label);
   q('sigSeg').innerHTML = seg(ENGINES.map(n => [n, SHORT_LABEL[n]]), cur, 'eng');
   q('nSig').textContent = e.signal_count;
@@ -3455,9 +3720,39 @@ function render(d) {
     || `<tr><td colspan="7" class="muted">${isRatio ? 'Esperando una caída (SHORT) o subida (LONG) del ratio dentro del rango' : (k.running ? 'Esperando velas con cuerpo ≥ ±' + ec.threshold_pct + '%' : 'Las velas están apagadas (Bots → Encender velas)')}</td></tr>`;
 
   // ── Bots ──
-  q('rtSum').textContent = `24 h ≥ ±${rc.watch_min_pct}% · ratio ↓ SHORT / ↑ LONG ${rc.drop_min_pct}–${rc.drop_max_pct}% · TP ${rc.tp_pct > 0 ? '+' + rc.tp_pct + '%' : 'off'} · SL ${rc.sl_pct > 0 ? '−' + rc.sl_pct + '%' : 'off'}`;
-  const rb = E.ratio.config;
-  q('rtState').innerHTML = `<span class="st ${rb.paused ? 'off' : 'on'}">${rb.paused ? 'PAUSADO' : 'EN MARCHA'}</span>`;
+  q('rtSum').textContent = `24 h ≥ ±${rc.watch_min_pct}% · ratio ↓ SHORT / ↑ LONG ${rc.drop_min_pct}–${rc.drop_max_pct}%`;
+  const stateOf = n => `<span class="st ${E[n].config.paused ? 'off' : 'on'}">${E[n].config.paused ? 'PAUSADO' : 'EN MARCHA'}</span>`;
+  q('r1State').innerHTML = stateOf('ratio'); q('r2State').innerHTML = stateOf('ratio_tp'); q('r3State').innerHTML = stateOf('ratio_rev');
+  q('r1Sum').textContent = tpsl(rc);
+  const dirBtns = n => { const bc = E[n].config;
+    return ['SHORT', 'LONG'].map(dir => { const bl = dir === 'LONG' ? bc.block_long : bc.block_short;
+      return `<button type="button" class="small ${bl ? 'danger' : 'ok'}" data-block="${dir}" data-eng="${n}" data-on="${bl ? '1' : ''}">${dir} ${bl ? 'desactivado · activar' : 'activo · desactivar'}</button>`; }).join('')
+      + `<button type="button" class="small ${bc.paused ? 'ok' : 'warnb'}" data-pause="${n}">${bc.paused ? 'Reanudar bot' : 'Pausar bot'}</button>`; };
+  for (const n of RATIO) q('rb_' + n).innerHTML = dirBtns(n);
+  const rv = r.rev || {};
+  q('r3Sum').textContent = `${tpsl(rv)} · venganza ${rv.revenge ? 'ON ×' + rv.rev_mult : 'OFF'}`;
+  q('rvCurTp').textContent = `(ahora ${rv.tp_pct > 0 ? '+' + rv.tp_pct + '%' : 'apagado'})`;
+  q('rvCurSl').textContent = `(ahora ${rv.sl_pct > 0 ? '−' + rv.sl_pct + '%' : 'apagado'})`;
+  const bre = q('rvBtnExit');
+  bre.dataset.on = rv.ratio_exit ? '1' : '';
+  bre.textContent = rv.ratio_exit ? 'TP por ratio activo · desactivar' : 'TP por ratio desactivado · activar';
+  bre.className = 'small ' + (rv.ratio_exit ? 'ok' : 'ghost');
+  const sw = q('revSwitch');
+  sw.dataset.on = rv.revenge ? '1' : ''; sw.classList.toggle('on', !!rv.revenge);
+  q('revState').className = 'st ' + (rv.revenge ? 'on' : 'off'); q('revState').textContent = rv.revenge ? 'ON' : 'OFF';
+  q('revMultSeg').innerHTML = seg([1, 2, 3, 4, 10].map(m => [m, '×' + m]), rv.rev_mult, 'rev-mult');
+  q('revSlSeg').innerHTML = seg([50, 100, 120, 150].map(m => [m, m + '%']), rv.rev_sl_pct, 'rev-sl');
+  q('revDirSeg').innerHTML = seg([['opposite', 'Contraria'], ['same', 'Misma']], rv.rev_dir, 'rev-dir');
+  const revBox = q('revBox');
+  if (!revBox.contains(document.activeElement)) {
+    q('revMult').value = rv.rev_mult; q('revRecover').value = rv.rev_recover_pct; q('revSl').value = rv.rev_sl_pct;
+  }
+  if (rv.rev_mult) {
+    const loss = c.notional * (rv.sl_pct > 0 ? rv.sl_pct : 5) / 100, tpU = loss * rv.rev_recover_pct / 100, slU = loss * rv.rev_mult * rv.rev_sl_pct / 100;
+    q('revNote').innerHTML = `Si una operación de este bot cierra en pérdida (SL, TP por ratio, cierre manual…), abre un trade de venganza en la dirección <b>${rv.rev_dir === 'opposite' ? 'contraria' : 'misma'}</b> con el notional cerrado <b>×${rv.rev_mult}</b>. `
+      + `TP = ${rv.rev_recover_pct}% de la pérdida; SL = ${rv.rev_sl_pct}% de (pérdida × ${rv.rev_mult}). Ejemplo: pérdida −${loss.toFixed(2)} → TP +${tpU.toFixed(2)} · SL −${slU.toFixed(2)} USD. `
+      + `Si la venganza pierde, no se encadena otra. No se dispara con el objetivo global ni con «Cerrar todas».`;
+  }
   q('rtCurW').textContent = `(ahora ${rc.watch_min_pct}%)`;
   q('rtCurMin').textContent = `(ahora ${rc.drop_min_pct}%)`;
   q('rtCurMax').textContent = `(ahora ${rc.drop_max_pct}%)`;
@@ -3467,15 +3762,6 @@ function render(d) {
   be.dataset.on = rc.ratio_exit ? '1' : '';
   be.textContent = rc.ratio_exit ? 'TP por ratio activo · desactivar' : 'TP por ratio desactivado · activar';
   be.className = 'small ' + (rc.ratio_exit ? 'ok' : 'ghost');
-  for (const [id, dir, on] of [['rtBtnShort', 'SHORT', r.short_enabled], ['rtBtnLong', 'LONG', r.long_enabled]]) {
-    const b = q(id);
-    b.dataset.on = on ? '1' : '';
-    b.textContent = on ? `${dir} activo · desactivar` : `${dir} desactivado · activar`;
-    b.className = on ? 'ok' : 'danger';
-  }
-  const rp = q('rtBtnPause');
-  rp.textContent = rb.paused ? 'Reanudar bot' : 'Pausar bot';
-  rp.className = 'small ' + (rb.paused ? 'ok' : 'warnb');
 
   q('klState').innerHTML = `<span class="st ${k.running ? 'on' : 'idle'}">${k.running ? 'VELAS ENCENDIDAS' : 'VELAS APAGADAS'}</span>`;
   const bk = q('btnKlines');
@@ -3602,6 +3888,16 @@ async function ratioPost(body, okMsg) {
   } catch (e) { q('rtMsg').innerHTML = `<span class="neg">${esc(e)}</span>`; }
   finally { refresh(); }
 }
+async function revPost(body, okMsg, box = 'revMsg') {
+  q(box).textContent = 'Guardando…';
+  try {
+    const r = await post('/api/ratio', {engine: 'ratio_rev', ...body});
+    q(box).innerHTML = r.ok ? `<span class="pos">Guardado.</span> ${okMsg(r)}` : `<span class="neg">${esc(r.error)}</span>`;
+    return r.ok;
+  } catch (e) { q(box).innerHTML = `<span class="neg">${esc(e)}</span>`; }
+  finally { refresh(); }
+}
+const revMsg = r => `Venganza ${r.revenge ? 'ON' : 'OFF'} · ×${r.rev_mult} · TP ${r.rev_recover_pct}% de la pérdida · SL ${r.rev_sl_pct}% · ${r.rev_dir === 'opposite' ? 'contraria' : 'misma dirección'}`;
 async function closeAll(engine) {
   const n = engine ? last.engines[engine].positions.length : last.global.open_count;
   const who = engine ? `del ${last.engines[engine].label}` : 'de todos los bots';
@@ -3633,6 +3929,11 @@ const ACTIONS = {
       glb({klines_enabled: on}, '/api/global', 'cfgMsg', r => r.klines_enabled ? 'Velas encendidas.' : 'Velas apagadas.');
   },
   ratioExit(b) { ratioPost({ratio_exit: !b.dataset.on}, r => `TP por ratio ${r.ratio_exit ? 'activado' : 'desactivado'}`); },
+  revRatioExit(b) { revPost({ratio_exit: !b.dataset.on}, r => `TP por ratio ${r.ratio_exit ? 'activado' : 'desactivado'} en el bot ratio + venganza`, 'rtMsg'); },
+  revToggle(b) {
+    const on = !b.dataset.on;
+    if (on || confirm('¿Desactivar la venganza? Las venganzas ya abiertas siguen hasta su TP/SL.')) revPost({revenge: on}, r => `Venganza ${r.revenge ? 'activada' : 'desactivada'}`);
+  },
 };
 
 document.addEventListener('click', async ev => {
@@ -3642,7 +3943,7 @@ document.addEventListener('click', async ev => {
   if (ds.act && ACTIONS[ds.act]) return ACTIONS[ds.act](t);
   if (ds.goto) {
     if (ds.eng) { cur = ds.eng; store.set('botkline_engine', cur); if (ds.goto === 'operaciones') { opFilter = ds.eng; store.set('botkline_opfilter', opFilter); } }
-    if (ds.goto === 'bots') { const p = document.querySelector(`details[data-key="${ds.eng === 'ratio' ? 'b_ratio' : 'b_klines'}"]`); if (p) p.open = true; }
+    if (ds.goto === 'bots') { const p = document.querySelector(`details[data-key="${PANEL_OF[ds.eng] || 'b_klines'}"]`); if (p) { p.open = true; setTimeout(() => p.scrollIntoView({block: 'start'}), 50); } }
     location.hash = ds.goto;
     if (location.hash.slice(1) === view) refresh();
     return;
@@ -3650,6 +3951,9 @@ document.addEventListener('click', async ev => {
   if (ds.opf) { opFilter = ds.opf; store.set('botkline_opfilter', opFilter); if (ENGINES.includes(opFilter)) { cur = opFilter; store.set('botkline_engine', cur); } return refresh(); }
   if (ds.eng && !ds.block) { cur = ds.eng; store.set('botkline_engine', cur); return refresh(); }
   if (ds.ev) { evEngine = ds.ev; store.set('botkline_evengine', evEngine); return refresh(); }
+  if (ds.revMult) return revPost({rev_mult: +ds.revMult}, revMsg);
+  if (ds.revSl) return revPost({rev_sl_pct: +ds.revSl}, revMsg);
+  if (ds.revDir) return revPost({rev_dir: ds.revDir}, revMsg);
   if (ds.pause) {
     const b = last && last.engines[ds.pause]; if (!b) return;
     const paused = !b.config.paused;
@@ -3659,14 +3963,6 @@ document.addEventListener('click', async ev => {
   }
   if (ds.block) {
     try { const r = await post('/api/block', {engine: ds.eng, direction: ds.block, blocked: !ds.on}); if (!r.ok) alert(r.error); } catch (e) { alert(e); }
-    return refresh();
-  }
-  if (ds.ratioDir) {
-    const on = !!ds.on, dir = ds.ratioDir;
-    const msg = on ? `¿Desactivar ${dir} en el bot de ratio? No abrirá entradas nuevas de ese lado (las abiertas siguen hasta su TP/SL).`
-                   : `¿Activar ${dir} en el bot de ratio?` + (dir === 'LONG' ? ' Pasará a vigilar también los símbolos con 24 h ≤ −X % (perdedores).' : '');
-    if (!confirm(msg)) return;
-    try { const r = await post('/api/block', {engine: 'ratio', direction: dir, blocked: on}); if (!r.ok) alert(r.error); } catch (e) { alert(e); }
     return refresh();
   }
   if (ds.close) {
@@ -3705,6 +4001,16 @@ q('rtExitForm').addEventListener('submit', async ev => {
     q('rtTp').value = ''; q('rtSl').value = '';
   }
 });
+q('rvExitForm').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  if (await revPost({tp_pct: q('rvTp').value, sl_pct: q('rvSl').value},
+      r => `TP ${r.tp_pct > 0 ? '+' + r.tp_pct + '%' : 'apagado'} · SL ${r.sl_pct > 0 ? '−' + r.sl_pct + '%' : 'apagado'} en el bot ratio + venganza`, 'rtMsg')) {
+    q('rvTp').value = ''; q('rvSl').value = '';
+  }
+});
+for (const [id, key] of [['revMult', 'rev_mult'], ['revRecover', 'rev_recover_pct'], ['revSl', 'rev_sl_pct']]) {
+  q(id).addEventListener('change', ev => { if (ev.target.value) revPost({[key]: ev.target.value}, revMsg).then(() => ev.target.blur()); });
+}
 q('glbForm').addEventListener('submit', async ev => {
   ev.preventDefault();
   if (await glb({profit_target_usd: q('glbTarget').value, max_open: q('glbMax').value, fee_pct: q('glbFee').value})) {

@@ -1,3 +1,4 @@
+import time
 import pytest
 
 import os
@@ -107,3 +108,71 @@ def test_price_exit_disabled_legs():
     assert st.price_exit(200, st.LONG, 0, 0) is None
     assert st.price_exit(50, st.LONG, 110, 0) is None
     assert st.price_exit(50, st.LONG, 0, 95) == "SL"
+
+
+# ── Bots de ratio en paralelo y trade de venganza ────────────────────────────
+
+def _bot_sin_red(tmp_path, monkeypatch):
+    """Instancia limpia del bot, sin WebSockets ni REST: solo la lógica."""
+    monkeypatch.setattr(st, "SETTINGS_FILE", str(tmp_path / "s.json"))
+    bot = st.KlineBot()
+    bot.store.can_open = lambda: True
+    bot.store.can_act = lambda: True
+    bot.store.mark_dirty = lambda *a, **k: None
+    bot.store.append_trade = lambda *a, **k: None
+    bot.executor.send = lambda *a, **k: None
+    bot.filters = {"AUSDT": {"stepSize": 1, "minQty": 0, "minNotional": 5}}
+    bot.fee_pct = 0.0
+    return bot
+
+
+def test_los_tres_bots_de_ratio_abren_con_la_misma_senal(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    now = time.time()
+    bot._tick = {"AUSDT": (25.0, 1.0, now)}
+    bot._price = lambda sym: 1.0
+    ts = int(now * 1000)
+    bot._on_ratio_points("AUSDT", [(ts - 300_000, 1.18), (ts, 0.86)])
+    abiertas = {n: list(bot.engines[n].positions.values()) for n in st.RATIO_ENGINES}
+    assert all(len(ps) == 1 and ps[0].direction == st.SHORT for ps in abiertas.values())
+    # El bot "solo TP ratio" no lleva TP/SL de precio; los otros dos sí.
+    assert abiertas[st.ENGINE_RATIO_TP][0].tp_price == 0 and abiertas[st.ENGINE_RATIO_TP][0].sl_price == 0
+    for name in (st.ENGINE_RATIO, st.ENGINE_RATIO_REV):
+        assert abiertas[name][0].tp_price > 0 and abiertas[name][0].sl_price > 0
+
+
+def test_la_venganza_recupera_la_perdida_y_no_se_encadena(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    bot.rev_cfg.update(revenge=True, rev_mult=10, rev_recover_pct=65, rev_sl_pct=100, rev_dir="opposite")
+    eng = bot.engines[st.ENGINE_RATIO_REV]
+    perdedora = st.Position(trade_id=1, symbol="AUSDT", direction=st.SHORT, entry_price=1.0, qty=5,
+                            notional=5.0, tp_price=0.9, sl_price=1.05, signal_pct=-27, candle_open=1.18,
+                            candle_close=0.86, candle_time=0, last_price=1.0, strategy=st.ENGINE_RATIO_REV)
+    eng.positions[1] = perdedora
+    bot._price = lambda sym: 1.05
+    bot._close(1, 1.05, "SL")                       # pierde 0,25 USDT (sin fees)
+    venganzas = [p for p in eng.positions.values() if p.revenge]
+    assert len(venganzas) == 1
+    v = venganzas[0]
+    assert v.direction == st.LONG                   # contraria a la perdedora
+    assert v.rev_parent == 1
+    assert v.notional == pytest.approx(5.0 * 10, rel=0.25)     # ×10, redondeado al stepSize
+    assert v.rev_tp_usd == pytest.approx(0.25 * 0.65)
+    assert v.rev_sl_usd == pytest.approx(0.25 * 10)
+    # El TP de la venganza deja el beneficio pedido, y su SL la pérdida tope.
+    assert st.pnl_usd(v.tp_price, v.entry_price, v.qty, v.direction) == pytest.approx(v.rev_tp_usd, rel=0.02)
+    assert st.pnl_usd(v.sl_price, v.entry_price, v.qty, v.direction) == pytest.approx(-v.rev_sl_usd, rel=0.02)
+    # Si la venganza pierde, NO se abre otra.
+    bot._close(v.trade_id, v.sl_price, "SL")
+    assert not eng.positions
+
+
+def test_la_venganza_no_se_dispara_al_cerrar_todas(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    eng = bot.engines[st.ENGINE_RATIO_REV]
+    eng.positions[2] = st.Position(trade_id=2, symbol="AUSDT", direction=st.SHORT, entry_price=1.0, qty=5,
+                                   notional=5.0, tp_price=0.9, sl_price=1.05, signal_pct=-27, candle_open=1.18,
+                                   candle_close=0.86, candle_time=0, last_price=1.0, strategy=st.ENGINE_RATIO_REV)
+    bot._price = lambda sym: 1.05
+    bot.close_all(eng)
+    assert not eng.positions
