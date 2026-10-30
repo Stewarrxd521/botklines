@@ -920,6 +920,9 @@ class KlineBot:
                 for p in eng.positions.values():
                     p.tp_price = exit_price(p.entry_price, p.direction, tp_pct, p.inverted)
                 syms = {p.symbol for p in eng.positions.values()}
+                moved = list(eng.positions.values())
+            for p in moved:
+                self._sync_executor_tp(p)                 # el TP puesto en Binance, también
             for sym in syms:
                 self._on_price_event(sym, "config")      # revisa ya el TP nuevo
         if changes:
@@ -1673,7 +1676,7 @@ class KlineBot:
         viejo si ya comparte posición (desde entonces la cierra la señal del bot)."""
         if not pos.sent or not SEND_TP:
             return
-        tp = pos.tp_price if self._alone_in_executor(pos) else 0.0
+        tp = pos.tp_price if not pos.inverted and self._alone_in_executor(pos) else 0.0
         if tp == pos.ex_tp:
             return
         base = {"trade_id": pos.trade_id, "symbol": pos.symbol, "direction": pos.direction, "strategy": pos.strategy}

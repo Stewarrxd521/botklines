@@ -343,3 +343,13 @@ def test_con_varios_bots_en_el_mismo_par_no_se_pone_tp_en_binance(tmp_path, monk
     bot._on_ratio_points("AUSDT", [(ts - 300_000, 1.18), (ts, 0.86)])
     assert [e["action"] for e in enviados] == ["open", "open", "open"]
     assert all("tp" not in e for e in enviados)
+
+
+def test_cambiar_el_tp_de_un_bot_de_velas_lo_mueve_en_binance(tmp_path, monkeypatch):
+    bot, enviados, _ = _bot_con_envios(tmp_path, monkeypatch)
+    eng = bot.engines[st.ENGINE_CLOSE]
+    eng.positions[9] = st.Position(trade_id=9, symbol="AUSDT", direction=st.LONG, entry_price=1.0, qty=5,
+                                   notional=5.0, tp_price=1.02, signal_pct=3, candle_open=0.97, candle_close=1.0,
+                                   candle_time=0, last_price=1.0, strategy=st.ENGINE_CLOSE, ex_tp=1.02)
+    bot.set_config(eng, tp_pct=3)
+    assert enviados[-1]["action"] == "open_tp" and enviados[-1]["trigger_price"] == pytest.approx(1.03)
