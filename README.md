@@ -22,12 +22,12 @@ Tres bots de ratio operan en paralelo con **la misma entrada** y salidas distint
 | **Ratio solo TP ratio** (`ratio_tp`) | Sin TP ni SL de precio: cierra solo cuando el ratio recupera el % que se movió. |
 | **Ratio + venganza** (`ratio_rev`) | TP/SL propios (independientes del primero) + trade de venganza. |
 
-1. **Exploración por WebSocket**: en cada ciclo de 5 min se abre `!miniTicker@arr` durante 30 s (`TICKER_SCAN_S`) y se lee el 24 h de todo el mercado. La misma exploración descubre los símbolos: una vez al día la lista se rehace (salen los deslistados) y entre medias se añaden los nuevos; se guarda en `KNOWN_SYMBOLS_FILE`.
-   **Vigilados**: los perpetuos con variación 24 h ≥ +20 % (`RATIO_WATCH_MIN_PCT`, editable en la web). Con LONG activo, también los ≤ −20 %.
-2. **Entrada**: cada 5 min se consulta el ratio de cuentas de los top traders de cada vigilado. Si **cae** entre 25 % y 30 % de un punto de 5 min al siguiente en un ganador (24 h ≥ +X %) → **SHORT**. Si **sube** entre 25 % y 30 % en un perdedor (24 h ≤ −X %) → **LONG**. Las dos direcciones están activas por defecto (`RATIO_LONG_DEFAULT=false` deja el LONG bloqueado al arrancar) y cada una se bloquea desde la web.
+1. **Exploración por WebSocket**: en cada ciclo de 5 min se abre `!miniTicker@arr` y se lee el 24 h de todo el mercado; se cierra en cuanto un mensaje ya casi no trae símbolos nuevos (2-4 s). Solo la exploración diaria dura los 30 s completos (`TICKER_SCAN_S`). La misma exploración descubre los símbolos: una vez al día la lista se rehace (salen los deslistados) y entre medias se añaden los nuevos; se guarda en `KNOWN_SYMBOLS_FILE`.
+   **Vigilados**: los perpetuos con variación 24 h ≥ +10 % (`RATIO_WATCH_MIN_PCT`, editable en la web). Con LONG activo, también los ≤ −10 %.
+2. **Entrada**: cada 5 min se consulta el ratio de cuentas de los top traders de cada vigilado. Si **cae** entre 13 % y 100 % de un punto de 5 min al siguiente en un ganador (24 h ≥ +X %) → **SHORT**. Si **sube** entre 13 % y 100 % en un perdedor (24 h ≤ −X %) → **LONG**. Las dos direcciones están activas por defecto (`RATIO_LONG_DEFAULT=false` deja el LONG bloqueado al arrancar) y cada una se bloquea desde la web.
 3. **Salida** (lo que llegue antes):
    - **Take profit por precio**: **+10 %** a favor desde la entrada (`RATIO_TP_PCT`).
-   - **Stop loss por precio**: **−5 %** en contra desde la entrada (`RATIO_SL_PCT`).
+   - **Stop loss por precio**: **−4,8 %** en contra desde la entrada (`RATIO_SL_PCT`).
    - **TP por ratio** (desactivable): el ratio recupera el mismo % que cayó.
 
 El TP, el SL y la salida por ratio del bot **Ratio TP/SL** se cambian **en caliente** desde la web (*Bots → Bot ratio TP/SL*), o con:
@@ -45,8 +45,8 @@ Cuando una operación de este bot cierra **en pérdida** por cualquier motivo (S
 
 - **Notional**: el de la operación cerrada **× `rev_mult`** (×1, ×2, ×3, ×4 o ×10 desde la web).
 - **Dirección**: `opposite` (contraria a la perdedora, por defecto) o `same`.
-- **TP**: `rev_recover_pct` % de la pérdida, en USD netos de fees (65 % por defecto).
-- **SL**: `rev_sl_pct` % de (pérdida × `rev_mult`), en USD (100 % por defecto).
+- **TP**: `rev_recover_pct` % de la pérdida, en USD netos de fees (64 % por defecto).
+- **SL**: `rev_sl_pct` % de (pérdida × `rev_mult`), en USD (150 % por defecto).
 - Si la venganza pierde, **no se encadena otra**. Tampoco se dispara al alcanzar el objetivo global ni con «Cerrar todas».
 
 Su salida y su venganza se ajustan en *Bots → Bot ratio + venganza*, o con:
@@ -65,7 +65,7 @@ El tráfico de red venía casi todo de streams de *todo el mercado* abiertos las
 | --- | --- |
 | `!markPrice@arr@1s` + `!ticker@arr` en `WS.py` (~250 KB/s siempre) | Apagados por defecto (`WS_ALL_MARKET`, `WS_ALL_TICKER`). |
 | `!miniTicker@arr` abierto siempre para el 24 h (~80 KB/s) | Exploración de 30 s por WebSocket en cada ciclo de 5 min (`TICKER_MODE=scan`, ~10 % del tráfico; `ws` = abierto siempre). |
-| `bookTicker` de cada vigilado, sin darlo de baja nunca | Precio en vivo **solo** de los símbolos con posición, con `markPrice@1s` (1 msg/s); se da de baja al cerrar. Los bots de velas usan `bookTicker`. |
+| `bookTicker` de cada vigilado, sin darlo de baja nunca | Precio en vivo **solo** de los símbolos con posición, con `aggTrade` (último precio operado, cada 100 ms como máximo) + `markPrice@1s` de respaldo; se da de baja al cerrar. Los bots de velas usan `bookTicker`. |
 | REST sin comprimir (`exchangeInfo` ≈ 1,5 MB en cada arranque) | Solo queda REST para el ratio (no existe por WebSocket) y para los filtros de cantidad de `exchangeInfo` (al arrancar si no hay caché, y luego cada 10 días), todo con gzip. |
 | Panel: estado completo de los 3 bots cada 1,5 s, sin comprimir | Cada 3 s, gzip, solo el detalle del bot que se ve, y pausa con la pestaña oculta. La página tiene ETag (recarga = 304). |
 | Executor: `GET /api/state` cada 20 s por hilo | `HEAD` (sin cuerpo). |
@@ -220,18 +220,19 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 | `REST_PROXY_URL` | — | Proxy para la única petición REST (`exchangeInfo`, al arrancar). |
 | `SYMBOL_REFRESH_HOURS` | `240` | Cada cuánto se renueva `exchangeInfo` (filtros de cantidad): 10 días. |
 | `RATIO_TP_PCT` | `10` | Bots `ratio` y `ratio_rev`: take profit por precio, % a favor (0 = sin TP). |
-| `RATIO_SL_PCT` | `5` | Bots `ratio` y `ratio_rev`: stop loss por precio, % en contra (0 = sin SL). |
+| `RATIO_SL_PCT` | `4.8` | Bots `ratio` y `ratio_rev`: stop loss por precio, % en contra (0 = sin SL). |
 | `RATIO_EXIT_BY_RATIO` | `true` | Cerrar también cuando el ratio recupera el % que cayó. |
 | `REVENGE_ENABLED` | `true` | Bot `ratio_rev`: trade de venganza activo al arrancar. |
-| `REVENGE_MULT` | `10` | Venganza: multiplicador del notional de la operación perdedora. |
-| `REVENGE_RECOVER_PCT` | `65` | Venganza: % de la pérdida que busca recuperar (TP en USD). |
-| `REVENGE_SL_PCT` | `100` | Venganza: SL en % de (pérdida × multiplicador). |
+| `REVENGE_MULT` | `11` | Venganza: multiplicador del notional de la operación perdedora. |
+| `REVENGE_RECOVER_PCT` | `64` | Venganza: % de la pérdida que busca recuperar (TP en USD). |
+| `REVENGE_SL_PCT` | `150` | Venganza: SL en % de (pérdida × multiplicador). |
 | `REVENGE_DIR` | `opposite` | Venganza: `opposite` (contraria) o `same`. |
 | `KLINE_BOTS_ENABLED` | `false` | Activa los dos bots de velas 1m (abre el stream de velas). |
 | `TICKER_MODE` | `scan` | 24 h por WebSocket: exploración cada 5 min (`scan`) o abierto siempre (`ws`). |
-| `TICKER_SCAN_S` | `30` | Segundos de cada exploración del mercado. |
+| `TICKER_SCAN_S` | `30` | Segundos máximos de cada exploración del mercado (la diaria los usa enteros). |
+| `TICKER_SCAN_QUICK` | `true` | Corta las exploraciones de cada ciclo en cuanto llegó todo el mercado activo. |
 | `SYMBOL_SCAN_HOURS` | `24` | Cada cuánto la exploración rehace la lista de símbolos. |
-| `WS_SYMBOL_STREAM` | auto | Stream de precio por posición: `markPrice@1s` (solo ratio) o `bookTicker` (con velas). |
+| `WS_SYMBOL_STREAM` | auto | Stream de precio por posición: `aggTrade` (solo ratio) o `bookTicker` (con velas). |
 | `WS_ALL_MARKET` / `WS_ALL_TICKER` | `false` | Streams de todo el mercado en `WS.py` (mucho tráfico). |
 | `STATUS_POLL_MS` | `3000` | Intervalo de consulta del panel. |
 | `RECOVERY_FILE` | `/tmp/botkline_recovery.json` | Copia local de posiciones abiertas e historial. Upstash está desactivado por ahora: en Render free las posiciones abiertas se pierden al reiniciar. |

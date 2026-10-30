@@ -248,7 +248,7 @@ class SymbolWebSocketPriceCache:
         # ticker NUNCA pueden dar, porque esos sí tienen un intervalo
         # mínimo fijo de 1 s en el propio servidor de Binance.
         streams = [f"{symbol.lower()}@{self.symbol_stream}"]
-        if self.symbol_stream == "bookTicker" and not _ALL_MARKET_ENABLED:
+        if self.symbol_stream in ("bookTicker", "aggTrade") and not _ALL_MARKET_ENABLED:
             # Sin el mark de todo el mercado, un libro quieto dejaría el precio "viejo":
             # el markPrice@1s del propio símbolo mantiene fresco el timestamp.
             streams.append(f"{symbol.lower()}@markPrice@1s")
@@ -421,6 +421,11 @@ class SymbolWebSocketPriceCache:
             self._store_book_ticker(
                 symbol, _safe_float(payload, "b"), _safe_float(payload, "a"), now
             )
+        elif event == "aggTrade":
+            # Último precio operado (Binance agrupa cada 100 ms): mismo trato que el
+            # bookTicker; el markPrice@1s solo refresca el timestamp mientras esté fresco.
+            px = _safe_float(payload, "p")
+            self._store_book_ticker(symbol, px, px, now)
         elif event == "markPriceUpdate":
             self._store_price(symbol, _safe_float(payload, "p"), now)
         elif event == "24hrTicker":

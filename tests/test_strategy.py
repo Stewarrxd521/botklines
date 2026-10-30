@@ -262,3 +262,34 @@ def test_las_senales_de_un_par_llegan_al_executor_en_orden():
     for sym in {s for s, _ in got}:
         seq = [i for s, i in got if s == sym]
         assert seq == sorted(seq)
+def test_aggtrade_da_el_precio_al_instante_y_el_mark_no_lo_pisa():
+    from WS import SymbolWebSocketPriceCache
+    pc = SymbolWebSocketPriceCache([], symbol_stream="aggTrade")
+    assert pc._streams_for("FOOUSDT") == ["foousdt@aggTrade", "foousdt@markPrice@1s"]
+    now = time.time()
+    pc._dispatch_event({"e": "aggTrade", "s": "FOOUSDT", "p": "1.2345"}, now)
+    pc._dispatch_event({"e": "markPriceUpdate", "s": "FOOUSDT", "p": "1.2000"}, now + 0.5)
+    assert pc.price_cache["FOOUSDT"][0] == pytest.approx(1.2345)
+    assert pc.price_cache["FOOUSDT"][1] == pytest.approx(now + 0.5)   # el mark solo refresca la hora
+
+
+def test_la_exploracion_24h_se_corta_cuando_ya_llego_el_mercado(tmp_path, monkeypatch):
+    import asyncio
+    import json
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    bot.filters = {}
+    syms = [f"S{i}USDT" for i in range(300)]
+    msgs = [syms[:250], syms[:290], syms[:291], syms]           # el 3.º ya casi no trae nuevos
+    sent = []
+
+    async def fake_ws(url):
+        for chunk in msgs:
+            sent.append(chunk)
+            yield json.dumps([{"s": s, "c": "1", "P": "5"} for s in chunk])
+
+    monkeypatch.setattr(st, "_ws_messages", fake_ws)
+    seen = asyncio.run(bot._ticker_ws_snapshot(5, quick=True))
+    assert len(sent) == 3 and len(seen) == 291
+    sent.clear()
+    seen = asyncio.run(bot._ticker_ws_snapshot(5, quick=False))   # la diaria lo lee todo
+    assert len(sent) == 4 and len(seen) == 300

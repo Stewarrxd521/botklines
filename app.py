@@ -57,7 +57,7 @@ Bots de ratio de top traders (tres bots con la MISMA entrada y salidas distintas
     (24 h ≤ -20 %): el ratio SUBE entre drop_min % y drop_max % → LONG; TP cuando el
     ratio baja ese mismo % desde el ratio de entrada.
 
-Precios para TP/SL: WS.py, SOLO de los símbolos con posición abierta (markPrice@1s
+Precios para TP/SL: WS.py, SOLO de los símbolos con posición abierta (aggTrade + markPrice@1s
 con el bot de ratio; bookTicker en tiempo real si están activos los bots de velas).
 
 Ancho de banda: sin streams de todo el mercado, REST con gzip, la web pide solo el
@@ -156,9 +156,9 @@ TICKER_WS_URLS      = ([_t_env] if _t_env else []) + [
     "wss://fstream.binance.com/market/ws/!ticker@arr",
 ]
 TICKER_SILENCE_S    = float(os.getenv("TICKER_SILENCE_S", "20"))
-RATIO_WATCH_MIN_PCT = float(os.getenv("RATIO_WATCH_MIN_PCT", "20"))   # |24 h| mínimo para vigilar
-RATIO_DROP_MIN_PCT  = float(os.getenv("RATIO_DROP_MIN_PCT", "25"))    # caída mínima del ratio (5 m → 5 m)
-RATIO_DROP_MAX_PCT  = float(os.getenv("RATIO_DROP_MAX_PCT", "30"))    # caída máxima (1,18→0,86 = 27 %)
+RATIO_WATCH_MIN_PCT = float(os.getenv("RATIO_WATCH_MIN_PCT", "10"))   # |24 h| mínimo para vigilar
+RATIO_DROP_MIN_PCT  = float(os.getenv("RATIO_DROP_MIN_PCT", "13"))    # caída mínima del ratio (5 m → 5 m)
+RATIO_DROP_MAX_PCT  = float(os.getenv("RATIO_DROP_MAX_PCT", "100"))    # caída máxima (1,18→0,86 = 27 %)
 # LONG = subida del ratio en perdedores (24 h ≤ -X %). Activo por defecto, igual que el SHORT.
 RATIO_LONG_DEFAULT  = os.getenv("RATIO_LONG_DEFAULT", "true").strip().lower() in ("1", "true", "yes", "on")
 RATIO_PERIOD        = "5m"
@@ -172,19 +172,22 @@ RATIO_WATCH_MAX     = int(os.getenv("RATIO_WATCH_MAX", "100"))        # tope de 
 RATIO_CONCURRENCY   = max(1, int(os.getenv("RATIO_CONCURRENCY", "4")))
 # Salidas por precio del bot de ratio (0 = apagado). Editables en caliente desde la web.
 RATIO_TP_PCT        = float(os.getenv("RATIO_TP_PCT", "10"))           # take profit: +10 % a favor
-RATIO_SL_PCT        = abs(float(os.getenv("RATIO_SL_PCT", "5")))       # stop loss: -5 % en contra
+RATIO_SL_PCT        = abs(float(os.getenv("RATIO_SL_PCT", "4.8")))     # stop loss: -4,8 % en contra
 RATIO_EXIT_BY_RATIO = os.getenv("RATIO_EXIT_BY_RATIO", "true").lower() in ("1", "true", "yes")
 # Trade de venganza (bot "ratio + venganza"): tras cerrar en pérdida abre otra operación para recuperarla.
 REVENGE_ENABLED     = os.getenv("REVENGE_ENABLED", "true").lower() in ("1", "true", "yes")
-REVENGE_MULT        = float(os.getenv("REVENGE_MULT", "10"))          # notional = notional cerrado × N
-REVENGE_RECOVER_PCT = float(os.getenv("REVENGE_RECOVER_PCT", "65"))   # TP = este % de la pérdida (USD)
-REVENGE_SL_PCT      = float(os.getenv("REVENGE_SL_PCT", "100"))       # SL = este % de (pérdida × N) en USD
+REVENGE_MULT        = float(os.getenv("REVENGE_MULT", "11"))          # notional = notional cerrado × N
+REVENGE_RECOVER_PCT = float(os.getenv("REVENGE_RECOVER_PCT", "64"))   # TP = este % de la pérdida (USD)
+REVENGE_SL_PCT      = float(os.getenv("REVENGE_SL_PCT", "150"))       # SL = este % de (pérdida × N) en USD
 REVENGE_DIR         = os.getenv("REVENGE_DIR", "opposite")            # opposite | same (respecto a la perdedora)
 REVENGE_SKIP_REASONS = ("OBJETIVO", "CERRAR_TODAS")                   # cierres que no disparan venganza
 # Fuente del 24 h, siempre por WebSocket: "scan" = exploración de TICKER_SCAN_S por ciclo de
 # 5 min (~10 % del tiempo conectado); "ws" = !miniTicker@arr abierto siempre (~80 KB/s).
 TICKER_MODE         = os.getenv("TICKER_MODE", "scan").strip().lower()
-TICKER_SCAN_S       = float(os.getenv("TICKER_SCAN_S", "30"))         # duración de cada exploración
+TICKER_SCAN_S       = float(os.getenv("TICKER_SCAN_S", "30"))         # duración máxima de cada exploración
+# Las exploraciones de cada ciclo se cortan cuando un mensaje ya casi no trae símbolos nuevos
+# (~2-4 s en vez de 30 s); la diaria, que rehace la lista de símbolos, dura TICKER_SCAN_S entero.
+TICKER_SCAN_QUICK   = os.getenv("TICKER_SCAN_QUICK", "true").lower() in ("1", "true", "yes")
 SYMBOL_SCAN_HOURS   = float(os.getenv("SYMBOL_SCAN_HOURS", "24"))     # la lista de símbolos se rehace a diario
 KNOWN_SYMBOLS_FILE  = os.getenv("KNOWN_SYMBOLS_FILE", os.path.join(_HERE, "known_symbols.json"))
 
@@ -214,13 +217,14 @@ EVAL_MINUTES_KEPT = int(os.getenv("EVAL_MINUTES_KEPT", "30"))   # minutos de eva
 EVAL_TOP_N        = int(os.getenv("EVAL_TOP_N", "15"))          # mayores cuerpos mostrados
 
 STATUS_POLL_MS = int(os.getenv("STATUS_POLL_MS", "3000"))
-# Stream de precio por símbolo con posición: el bot de ratio sale a ±5-10 %, le basta
-# markPrice@1s (1 msg/s). Los bots de velas usan bookTicker (tiempo real, mucho más tráfico).
+# Stream de precio por símbolo con posición: aggTrade (último precio operado, Binance lo
+# agrupa cada 100 ms: ≤10 msg/s y nada si no hay operaciones) + markPrice@1s de respaldo.
+# Los bots de velas usan bookTicker (tiempo real, mucho más tráfico).
 PRICE_STREAM_ENV = os.getenv("WS_SYMBOL_STREAM", "").strip()
 
 
 def price_stream_for(klines_on: bool) -> str:
-    return PRICE_STREAM_ENV or ("bookTicker" if klines_on else "markPrice@1s")
+    return PRICE_STREAM_ENV or ("bookTicker" if klines_on else "aggTrade")
 
 
 def http_get_json(url: str, proxy: str = "", timeout: float = 15.0) -> Tuple[object, int]:
@@ -731,9 +735,9 @@ class KlineBot:
         saved = settings.get("engines") if isinstance(settings.get("engines"), dict) else {}
         legacy = {k: settings.get(k) for k in ("threshold_pct", "tp_pct", "block_long", "block_short")}
         self.engines: Dict[str, Engine] = {
-            ENGINE_CLOSE: Engine(ENGINE_CLOSE, saved.get(ENGINE_CLOSE) or legacy,
+            ENGINE_CLOSE: Engine(ENGINE_CLOSE, saved.get(ENGINE_CLOSE) or {**legacy, "paused": True},
                                  SIGNAL_THRESHOLD_PCT, TAKE_PROFIT_PCT),
-            ENGINE_LIVE:  Engine(ENGINE_LIVE, saved.get(ENGINE_LIVE) or {},
+            ENGINE_LIVE:  Engine(ENGINE_LIVE, saved.get(ENGINE_LIVE) or {"paused": True},
                                  LIVE_SIGNAL_THRESHOLD_PCT, LIVE_TAKE_PROFIT_PCT),
         }
         self.live = self.engines[ENGINE_LIVE]
@@ -943,7 +947,7 @@ class KlineBot:
         self._set_price_stream()
 
     def _set_price_stream(self) -> None:
-        """bookTicker (tiempo real) con los bots de velas; markPrice@1s si solo opera el de ratio."""
+        """bookTicker (tiempo real) con los bots de velas; aggTrade (≤100 ms) si solo operan los de ratio."""
         pc = self.price_cache
         want = price_stream_for(self.kline_stream is not None)
         if pc is not None and pc.symbol_stream != want:
@@ -1750,19 +1754,22 @@ class KlineBot:
     async def _refresh_tickers(self) -> None:
         """Exploración de todo el mercado por WebSocket (TICKER_SCAN_S segundos): 24 h de cada
         símbolo para la lista de vigilados y descubrimiento de símbolos nuevos."""
-        seen = await self._ticker_ws_snapshot(TICKER_SCAN_S)
+        daily = time.time() - self.symbols_scanned_at >= SYMBOL_SCAN_HOURS * 3600
+        seen = await self._ticker_ws_snapshot(TICKER_SCAN_S, quick=TICKER_SCAN_QUICK and not daily)
         self.ticker_connected = bool(seen)
         if seen:
             self._update_known_symbols(seen)
 
-    async def _ticker_ws_snapshot(self, seconds: float) -> set:
+    async def _ticker_ws_snapshot(self, seconds: float, quick: bool = False) -> set:
         """Abre el WebSocket del 24 h `seconds` segundos, guarda lo recibido y lo cierra.
-        Devuelve los símbolos vistos."""
+        quick: se cierra antes, en cuanto un mensaje casi no añade símbolos (ya llegó todo
+        el mercado activo; los que no se mueven conservan su último 24 h). Devuelve los vistos."""
         for url in TICKER_WS_URLS:
             it = None
             self._scan_seen = set()
             try:
                 it = _ws_messages(url).__aiter__()
+                msgs = 0
                 end = time.monotonic() + seconds
                 while (left := end - time.monotonic()) > 0:
                     try:
@@ -1770,7 +1777,12 @@ class KlineBot:
                     except asyncio.TimeoutError:
                         break
                     self.rx_ticker_bytes += len(raw)
+                    before = len(self._scan_seen)
                     self._on_tickers(raw)
+                    msgs += 1
+                    added = len(self._scan_seen) - before
+                    if quick and msgs >= 2 and added <= max(2, before // 200):
+                        break
             except asyncio.CancelledError:
                 raise
             except StopAsyncIteration:
@@ -2116,7 +2128,7 @@ class KlineBot:
         return cfg["drop_min_pct"] <= abs(chg) <= cfg["drop_max_pct"]
 
     async def _prefetch_price(self, sym: str) -> None:
-        """Suscribe el precio en vivo del símbolo (markPrice@1s) y espera el primer tick, para
+        """Suscribe el precio en vivo del símbolo (aggTrade) y espera el primer tick, para
         abrir con precio actual sin REST. Si no se abre, _refresh_pos_syms lo da de baja."""
         pc = self.price_cache
         if pc is None or self._price(sym):
