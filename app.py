@@ -1030,6 +1030,17 @@ class KlineBot:
         self.store.mark_dirty(True)
         self.log(f"[objetivo] contador de la sesión a cero ({why})")
 
+    def reset_realized(self, eng: Engine) -> dict:
+        """Pone a cero el PnL realizado de UN bot (el historial no se borra). El contador
+        del objetivo global no cambia: la base de la sesión se corrige en lo mismo."""
+        with self.lock:
+            old = eng.total_realized_pnl
+            eng.total_realized_pnl = 0.0
+            self.session_base -= old
+        self.store.mark_dirty(True)
+        self.log(f"[config] {eng.label}: PnL realizado a cero (era {old:+.4f} USDT)")
+        return {"engine": eng.name, "realized_pnl": 0.0, "was": old}
+
     def _check_profit_target(self) -> None:
         """Cierra TODAS las posiciones de los dos bots cuando realizado + abierto
         (desde el último objetivo) llega al objetivo en USD."""
@@ -2864,6 +2875,20 @@ def api_session_reset():
     return jsonify({"ok": True, **bot._global_snapshot()})
 
 
+@app.post("/api/realized/reset")
+def api_realized_reset():
+    """Pone a cero el PnL realizado de un bot. Body JSON: {"engine": "ratio"}."""
+    busy = _guard()
+    if busy:
+        return busy
+    eng, err = _engine_param(request.get_json(silent=True) or {}, default=None)
+    if err:
+        return err
+    if eng is None:
+        return jsonify({"ok": False, "error": f"Falta engine ({' o '.join(bot.engines)})"}), 400
+    return jsonify({"ok": True, **bot.reset_realized(eng)})
+
+
 @app.post("/api/pause")
 def api_pause():
     """Pausa o reanuda un bot. Body JSON: {"engine": "ratio"|"ratio_tp"|"ratio_rev"|"close"|"live",
@@ -3708,6 +3733,7 @@ function render(d) {
         <button type="button" class="small ghost" data-goto="operaciones" data-eng="${esc(n)}">Operaciones</button>
         <button type="button" class="small ghost" data-goto="bots" data-eng="${esc(n)}">Configurar</button>
         <button type="button" class="small ghost" data-goto="historial" data-eng="${esc(n)}">Historial</button>
+        <button type="button" class="small ghost" data-resetpnl="${esc(n)}">PnL realizado a 0</button>
       </div></div>`; }).join('');
 
   for (const id of ['btnInvert', 'btnInvert2']) {
@@ -3985,6 +4011,11 @@ document.addEventListener('click', async ev => {
   if (!t) return;
   const ds = t.dataset;
   if (ds.act && ACTIONS[ds.act]) return ACTIONS[ds.act](t);
+  if (ds.resetpnl) {
+    if (confirm(`¿Poner a cero el PnL realizado de ${SHORT_LABEL[ds.resetpnl]}? El historial se conserva y el objetivo global no cambia.`))
+      glb({engine: ds.resetpnl}, '/api/realized/reset', 'actMsg', r => `PnL realizado de ${SHORT_LABEL[r.engine]} a cero (era ${usd(r.was)}).`);
+    return;
+  }
   if (ds.goto) {
     if (ds.eng) { cur = ds.eng; store.set('botkline_engine', cur); if (ds.goto === 'operaciones') { opFilter = ds.eng; store.set('botkline_opfilter', opFilter); } }
     if (ds.goto === 'bots') { const p = document.querySelector(`details[data-key="${PANEL_OF[ds.eng] || 'b_klines'}"]`); if (p) { p.open = true; setTimeout(() => p.scrollIntoView({block: 'start'}), 50); } }

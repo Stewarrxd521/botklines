@@ -300,3 +300,14 @@ def test_vigilados_con_precio_lento_y_posiciones_con_precio_rapido():
     pc = SymbolWebSocketPriceCache(["AUSDT"], symbol_stream="aggTrade")
     pc.set_slow_symbols(["AUSDT", "BUSDT"])
     assert pc._desired_streams() == {"ausdt@aggTrade", "ausdt@markPrice@1s", "busdt@markPrice"}
+
+
+def test_poner_a_cero_el_realizado_de_un_bot_no_mueve_el_objetivo(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    bot.engines[st.ENGINE_RATIO].total_realized_pnl = 3.0
+    bot.engines[st.ENGINE_RATIO_REV].total_realized_pnl = -7.0
+    antes = bot.session_pnl()[0]
+    r = bot.reset_realized(bot.engines[st.ENGINE_RATIO_REV])
+    assert r["was"] == -7.0 and bot.engines[st.ENGINE_RATIO_REV].total_realized_pnl == 0
+    assert bot.engines[st.ENGINE_RATIO].total_realized_pnl == 3.0
+    assert bot.session_pnl()[0] == pytest.approx(antes)

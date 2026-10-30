@@ -252,6 +252,7 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 | `POST /api/block` | Bloquear o permitir LONG o SHORT en un bot. |
 | `GET/POST /api/ratio` | Ver o cambiar los bots de ratio: vigilancia y rango (comunes), `tp_pct`, `sl_pct`, `ratio_exit`; con `"engine": "ratio_rev"`, la salida y la venganza de ese bot. |
 | `GET/POST /api/global` | Modo invertido, objetivo en USD y fee (común a los dos bots). |
+| `POST /api/realized/reset` | Poner a cero el PnL realizado de un bot (`{"engine": "ratio"}`); el historial se conserva. |
 | `POST /api/pause` | Pausar o reanudar un bot. |
 | `POST /api/close-all` | Cerrar todas las posiciones (de un bot con `engine`). |
 | `POST /api/session/reset` | Poner a cero el contador del objetivo. |
