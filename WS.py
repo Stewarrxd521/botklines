@@ -172,6 +172,7 @@ class SymbolWebSocketPriceCache:
 
         self.symbol_stream = symbol_stream or _SYMBOL_STREAM
         self.symbols = sorted({s.upper() for s in symbols})
+        self.slow_symbols: frozenset[str] = frozenset()
         self._check_limit(self.symbols)
 
         # price_cache:  symbol -> (price, timestamp). Alimentado por
@@ -257,7 +258,9 @@ class SymbolWebSocketPriceCache:
     def _desired_streams(self) -> set[str]:
         with self.lock:
             symbols_snapshot = list(self.symbols)
-        wanted: set[str] = set()
+            slow_snapshot = list(self.slow_symbols)
+        # Seguidos "lentos" (p. ej. vigilados sin posición): solo markPrice@1s.
+        wanted: set[str] = {f"{s.lower()}@markPrice@1s" for s in slow_snapshot}
         if _ALL_MARKET_ENABLED:
             wanted.add(_ALL_MARKET_STREAM)
         if _ALL_TICKER_ENABLED:
@@ -597,6 +600,17 @@ class SymbolWebSocketPriceCache:
             with self._sync_flag_lock:
                 self._sync_scheduled = False
             print(f"⚠️ [WS] no se pudo programar la suscripción: {e}")
+
+    def set_slow_symbols(self, symbols: Iterable[str]):
+        """Símbolos con precio en vivo LENTO (markPrice@1s, 1 msg/s), aparte de los
+        seguidos con el stream rápido. Se sincroniza en caliente, sin reconectar."""
+        new = frozenset(s.upper() for s in symbols)
+        with self.lock:
+            if new == self.slow_symbols:
+                return
+            self.slow_symbols = new
+        self._check_limit(sorted(set(self.symbols) | new))
+        self._schedule_sync()
 
     def update_symbols(self, symbols: list[str]):
         """Reemplaza la lista de símbolos seguidos y sincroniza las

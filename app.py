@@ -221,6 +221,8 @@ STATUS_POLL_MS = int(os.getenv("STATUS_POLL_MS", "3000"))
 # agrupa cada 100 ms: ≤10 msg/s y nada si no hay operaciones) + markPrice@1s de respaldo.
 # Los bots de velas usan bookTicker (tiempo real, mucho más tráfico).
 PRICE_STREAM_ENV = os.getenv("WS_SYMBOL_STREAM", "").strip()
+# Vigilados del bot de ratio (24 h ≥ ±X %) sin posición: markPrice@1s (1 msg/s por símbolo).
+WATCH_LIVE_PRICE = os.getenv("WATCH_LIVE_PRICE", "true").lower() in ("1", "true", "yes")
 
 
 def price_stream_for(klines_on: bool) -> str:
@@ -1138,7 +1140,8 @@ class KlineBot:
         self.log(f"{ENGINE_LABELS[ENGINE_RATIO_TP]} | sale solo por el TP del ratio")
         self.log(f"{ENGINE_LABELS[ENGINE_RATIO_REV]} | {self._rev_desc()}")
         self.log(f"Red: 24 h por {f'WebSocket, exploración de {TICKER_SCAN_S:g} s cada 5 min' if TICKER_MODE != 'ws' else 'WebSocket continuo'} · "
-                 f"precio en vivo solo de símbolos con posición ({price_stream_for(self.klines_enabled)})")
+                 f"precio en vivo: con posición {price_stream_for(self.klines_enabled)}"
+                 f"{', vigilados markPrice@1s' if WATCH_LIVE_PRICE else ''}")
         self.log(f"[estado] Persistencia: {self._store_desc}")
         self.store.start()
         self.executor.warm()
@@ -1953,8 +1956,14 @@ class KlineBot:
         if added or removed or not old:
             self.log(f"[ratio] vigilados (24 h ≥ ±{wmin:g}%): {len(self.watch)} "
                      f"(+{len(added)} −{len(removed)}) {', '.join(self.watch[:12])}{'…' if len(self.watch) > 12 else ''}")
-        # Los vigilados NO se suscriben a precio en vivo (era el mayor consumo de tráfico):
-        # solo los símbolos con posición abierta, ver _refresh_pos_syms.
+        self._sync_watch_prices()
+
+    def _sync_watch_prices(self) -> None:
+        """Vigilados: precio en vivo lento (markPrice@1s). Los que tienen posición van
+        además por el stream rápido (aggTrade, ver _refresh_pos_syms)."""
+        pc = self.price_cache
+        if pc is not None:
+            pc.set_slow_symbols(self.watch if WATCH_LIVE_PRICE else [])
 
     def _ratio_open_syms(self) -> set:
         with self.lock:

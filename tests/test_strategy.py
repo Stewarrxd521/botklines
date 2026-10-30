@@ -293,3 +293,10 @@ def test_la_exploracion_24h_se_corta_cuando_ya_llego_el_mercado(tmp_path, monkey
     sent.clear()
     seen = asyncio.run(bot._ticker_ws_snapshot(5, quick=False))   # la diaria lo lee todo
     assert len(sent) == 4 and len(seen) == 300
+
+
+def test_vigilados_con_precio_lento_y_posiciones_con_precio_rapido():
+    from WS import SymbolWebSocketPriceCache
+    pc = SymbolWebSocketPriceCache(["AUSDT"], symbol_stream="aggTrade")
+    pc.set_slow_symbols(["AUSDT", "BUSDT"])
+    assert pc._desired_streams() == {"ausdt@aggTrade", "ausdt@markPrice@1s", "busdt@markPrice@1s"}
