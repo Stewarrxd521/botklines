@@ -1,3 +1,5 @@
+import random
+import threading
 import time
 import pytest
 
@@ -237,3 +239,75 @@ def test_solo_se_consulta_el_ratio_de_las_abiertas_que_esperan_tp_por_ratio(tmp_
 ])
 def test_flag(value, expected):
     assert st._flag(value) is expected
+
+
+def test_las_senales_de_un_par_llegan_al_executor_en_orden():
+    # Varios hilos de envío: un cierre total no puede adelantar al parcial del mismo par.
+    bridge = st.ExecutorBridge("http://executor.test", "s", logger=lambda m: None)
+    bridge._request = lambda *a, **k: (200, b"")
+    got, lock, done, n = [], threading.Lock(), threading.Event(), 60
+
+    def deliver(conns, payload, target, t0):
+        time.sleep(random.random() * 0.004)
+        with lock:
+            got.append((payload["symbol"], payload["i"]))
+            if len(got) == n:
+                done.set()
+        return True
+
+    bridge._deliver = deliver
+    for i in range(n):
+        bridge.send({"action": "close", "symbol": f"S{i % 3}USDT", "i": i})
+    assert done.wait(10)
+    for sym in {s for s, _ in got}:
+        seq = [i for s, i in got if s == sym]
+        assert seq == sorted(seq)
+def test_aggtrade_da_el_precio_al_instante_y_el_mark_no_lo_pisa():
+    from WS import SymbolWebSocketPriceCache
+    pc = SymbolWebSocketPriceCache([], symbol_stream="aggTrade")
+    assert pc._streams_for("FOOUSDT") == ["foousdt@aggTrade", "foousdt@markPrice@1s"]
+    now = time.time()
+    pc._dispatch_event({"e": "aggTrade", "s": "FOOUSDT", "p": "1.2345"}, now)
+    pc._dispatch_event({"e": "markPriceUpdate", "s": "FOOUSDT", "p": "1.2000"}, now + 0.5)
+    assert pc.price_cache["FOOUSDT"][0] == pytest.approx(1.2345)
+    assert pc.price_cache["FOOUSDT"][1] == pytest.approx(now + 0.5)   # el mark solo refresca la hora
+
+
+def test_la_exploracion_24h_se_corta_cuando_ya_llego_el_mercado(tmp_path, monkeypatch):
+    import asyncio
+    import json
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    bot.filters = {}
+    syms = [f"S{i}USDT" for i in range(300)]
+    msgs = [syms[:250], syms[:290], syms[:291], syms]           # el 3.º ya casi no trae nuevos
+    sent = []
+
+    async def fake_ws(url):
+        for chunk in msgs:
+            sent.append(chunk)
+            yield json.dumps([{"s": s, "c": "1", "P": "5"} for s in chunk])
+
+    monkeypatch.setattr(st, "_ws_messages", fake_ws)
+    seen = asyncio.run(bot._ticker_ws_snapshot(5, quick=True))
+    assert len(sent) == 3 and len(seen) == 291
+    sent.clear()
+    seen = asyncio.run(bot._ticker_ws_snapshot(5, quick=False))   # la diaria lo lee todo
+    assert len(sent) == 4 and len(seen) == 300
+
+
+def test_vigilados_con_precio_lento_y_posiciones_con_precio_rapido():
+    from WS import SymbolWebSocketPriceCache
+    pc = SymbolWebSocketPriceCache(["AUSDT"], symbol_stream="aggTrade")
+    pc.set_slow_symbols(["AUSDT", "BUSDT"])
+    assert pc._desired_streams() == {"ausdt@aggTrade", "ausdt@markPrice@1s", "busdt@markPrice"}
+
+
+def test_poner_a_cero_el_realizado_de_un_bot_no_mueve_el_objetivo(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    bot.engines[st.ENGINE_RATIO].total_realized_pnl = 3.0
+    bot.engines[st.ENGINE_RATIO_REV].total_realized_pnl = -7.0
+    antes = bot.session_pnl()[0]
+    r = bot.reset_realized(bot.engines[st.ENGINE_RATIO_REV])
+    assert r["was"] == -7.0 and bot.engines[st.ENGINE_RATIO_REV].total_realized_pnl == 0
+    assert bot.engines[st.ENGINE_RATIO].total_realized_pnl == 3.0
+    assert bot.session_pnl()[0] == pytest.approx(antes)

@@ -121,6 +121,9 @@ _ALL_TICKER_ENABLED  = os.environ.get("WS_ALL_TICKER", "false").lower() == "true
 # pares movidos) o "markPrice@1s" (1 mensaje/s, mucho menos tráfico).
 _SYMBOL_STREAM = os.environ.get("WS_SYMBOL_STREAM", "bookTicker")
 
+# Stream de los seguidos "lentos": "markPrice" = cada 3 s; "markPrice@1s" = cada segundo.
+_SLOW_STREAM = os.environ.get("WATCH_PRICE_STREAM", "markPrice")
+
 _WS_BASE_URL = os.environ.get("WS_FSTREAM_URL", "wss://fstream.binance.com/market/stream")
 
 # Mientras el bookTicker de un símbolo esté más fresco que esto, el mark
@@ -172,6 +175,7 @@ class SymbolWebSocketPriceCache:
 
         self.symbol_stream = symbol_stream or _SYMBOL_STREAM
         self.symbols = sorted({s.upper() for s in symbols})
+        self.slow_symbols: frozenset[str] = frozenset()
         self._check_limit(self.symbols)
 
         # price_cache:  symbol -> (price, timestamp). Alimentado por
@@ -248,7 +252,7 @@ class SymbolWebSocketPriceCache:
         # ticker NUNCA pueden dar, porque esos sí tienen un intervalo
         # mínimo fijo de 1 s en el propio servidor de Binance.
         streams = [f"{symbol.lower()}@{self.symbol_stream}"]
-        if self.symbol_stream == "bookTicker" and not _ALL_MARKET_ENABLED:
+        if self.symbol_stream in ("bookTicker", "aggTrade") and not _ALL_MARKET_ENABLED:
             # Sin el mark de todo el mercado, un libro quieto dejaría el precio "viejo":
             # el markPrice@1s del propio símbolo mantiene fresco el timestamp.
             streams.append(f"{symbol.lower()}@markPrice@1s")
@@ -257,7 +261,11 @@ class SymbolWebSocketPriceCache:
     def _desired_streams(self) -> set[str]:
         with self.lock:
             symbols_snapshot = list(self.symbols)
-        wanted: set[str] = set()
+            slow_snapshot = list(self.slow_symbols)
+        # Seguidos "lentos" (p. ej. vigilados sin posición): solo su mark price, cada 3 s
+        # (o el stream de _SLOW_STREAM). Los que ya van por el stream rápido no lo repiten.
+        fast = set(symbols_snapshot)
+        wanted: set[str] = {f"{s.lower()}@{_SLOW_STREAM}" for s in slow_snapshot if s not in fast}
         if _ALL_MARKET_ENABLED:
             wanted.add(_ALL_MARKET_STREAM)
         if _ALL_TICKER_ENABLED:
@@ -421,6 +429,11 @@ class SymbolWebSocketPriceCache:
             self._store_book_ticker(
                 symbol, _safe_float(payload, "b"), _safe_float(payload, "a"), now
             )
+        elif event == "aggTrade":
+            # Último precio operado (Binance agrupa cada 100 ms): mismo trato que el
+            # bookTicker; el markPrice@1s solo refresca el timestamp mientras esté fresco.
+            px = _safe_float(payload, "p")
+            self._store_book_ticker(symbol, px, px, now)
         elif event == "markPriceUpdate":
             self._store_price(symbol, _safe_float(payload, "p"), now)
         elif event == "24hrTicker":
@@ -592,6 +605,17 @@ class SymbolWebSocketPriceCache:
             with self._sync_flag_lock:
                 self._sync_scheduled = False
             print(f"⚠️ [WS] no se pudo programar la suscripción: {e}")
+
+    def set_slow_symbols(self, symbols: Iterable[str]):
+        """Símbolos con precio en vivo LENTO (markPrice cada 3 s), aparte de los
+        seguidos con el stream rápido. Se sincroniza en caliente, sin reconectar."""
+        new = frozenset(s.upper() for s in symbols)
+        with self.lock:
+            if new == self.slow_symbols:
+                return
+            self.slow_symbols = new
+        self._check_limit(sorted(set(self.symbols) | new))
+        self._schedule_sync()
 
     def update_symbols(self, symbols: list[str]):
         """Reemplaza la lista de símbolos seguidos y sincroniza las
