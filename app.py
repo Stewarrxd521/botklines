@@ -221,7 +221,7 @@ STATUS_POLL_MS = int(os.getenv("STATUS_POLL_MS", "3000"))
 # agrupa cada 100 ms: ≤10 msg/s y nada si no hay operaciones) + markPrice@1s de respaldo.
 # Los bots de velas usan bookTicker (tiempo real, mucho más tráfico).
 PRICE_STREAM_ENV = os.getenv("WS_SYMBOL_STREAM", "").strip()
-# Vigilados del bot de ratio (24 h ≥ ±X %) sin posición: markPrice@1s (1 msg/s por símbolo).
+# Vigilados del bot de ratio (24 h ≥ ±X %) sin posición: markPrice cada 3 s (WATCH_PRICE_STREAM).
 WATCH_LIVE_PRICE = os.getenv("WATCH_LIVE_PRICE", "true").lower() in ("1", "true", "yes")
 
 
@@ -1141,7 +1141,7 @@ class KlineBot:
         self.log(f"{ENGINE_LABELS[ENGINE_RATIO_REV]} | {self._rev_desc()}")
         self.log(f"Red: 24 h por {f'WebSocket, exploración de {TICKER_SCAN_S:g} s cada 5 min' if TICKER_MODE != 'ws' else 'WebSocket continuo'} · "
                  f"precio en vivo: con posición {price_stream_for(self.klines_enabled)}"
-                 f"{', vigilados markPrice@1s' if WATCH_LIVE_PRICE else ''}")
+                 f"{', vigilados markPrice cada 3 s' if WATCH_LIVE_PRICE else ''}")
         self.log(f"[estado] Persistencia: {self._store_desc}")
         self.store.start()
         self.executor.warm()
@@ -1959,7 +1959,7 @@ class KlineBot:
         self._sync_watch_prices()
 
     def _sync_watch_prices(self) -> None:
-        """Vigilados: precio en vivo lento (markPrice@1s). Los que tienen posición van
+        """Vigilados: precio en vivo lento (markPrice cada 3 s). Los que tienen posición van
         además por el stream rápido (aggTrade, ver _refresh_pos_syms)."""
         pc = self.price_cache
         if pc is not None:

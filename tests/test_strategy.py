@@ -299,4 +299,4 @@ def test_vigilados_con_precio_lento_y_posiciones_con_precio_rapido():
     from WS import SymbolWebSocketPriceCache
     pc = SymbolWebSocketPriceCache(["AUSDT"], symbol_stream="aggTrade")
     pc.set_slow_symbols(["AUSDT", "BUSDT"])
-    assert pc._desired_streams() == {"ausdt@aggTrade", "ausdt@markPrice@1s", "busdt@markPrice@1s"}
+    assert pc._desired_streams() == {"ausdt@aggTrade", "ausdt@markPrice@1s", "busdt@markPrice"}
