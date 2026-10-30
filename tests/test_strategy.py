@@ -311,3 +311,35 @@ def test_poner_a_cero_el_realizado_de_un_bot_no_mueve_el_objetivo(tmp_path, monk
     assert r["was"] == -7.0 and bot.engines[st.ENGINE_RATIO_REV].total_realized_pnl == 0
     assert bot.engines[st.ENGINE_RATIO].total_realized_pnl == 3.0
     assert bot.session_pnl()[0] == pytest.approx(antes)
+
+
+def _bot_con_envios(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    bot.executor_paused = False
+    enviados = []
+    bot.executor.send = lambda payload, *a, **k: enviados.append(payload)
+    now = time.time()
+    bot._tick = {"AUSDT": (25.0, 1.0, now)}
+    bot._price = lambda sym: 1.0
+    return bot, enviados, int(now * 1000)
+
+
+def test_el_tp_va_al_executor_solo_si_la_posicion_va_sola(tmp_path, monkeypatch):
+    bot, enviados, ts = _bot_con_envios(tmp_path, monkeypatch)
+    for n in (st.ENGINE_RATIO_TP, st.ENGINE_RATIO_REV):
+        bot.engines[n].paused = True                # solo abre el bot ratio TP/SL
+    bot._on_ratio_points("AUSDT", [(ts - 300_000, 1.18), (ts, 0.86)])
+    (pos,) = bot.engines[st.ENGINE_RATIO].positions.values()
+    assert [e["action"] for e in enviados] == ["open", "open_tp"]
+    assert enviados[1]["trigger_price"] == pytest.approx(pos.tp_price) and pos.ex_tp == pos.tp_price
+    # Cambiar el TP en caliente lo mueve también en Binance.
+    enviados.clear()
+    bot.set_ratio_config(tp_pct=8)
+    assert enviados[0]["action"] == "open_tp" and enviados[0]["trigger_price"] == pytest.approx(pos.tp_price)
+
+
+def test_con_varios_bots_en_el_mismo_par_no_se_pone_tp_en_binance(tmp_path, monkeypatch):
+    bot, enviados, ts = _bot_con_envios(tmp_path, monkeypatch)
+    bot._on_ratio_points("AUSDT", [(ts - 300_000, 1.18), (ts, 0.86)])
+    assert [e["action"] for e in enviados] == ["open", "open", "open"]
+    assert all("tp" not in e for e in enviados)

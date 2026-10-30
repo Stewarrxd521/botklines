@@ -222,6 +222,9 @@ STATUS_POLL_MS = int(os.getenv("STATUS_POLL_MS", "3000"))
 # Los bots de velas usan bookTicker (tiempo real, mucho más tráfico).
 PRICE_STREAM_ENV = os.getenv("WS_SYMBOL_STREAM", "").strip()
 # Vigilados del bot de ratio (24 h ≥ ±X %) sin posición: markPrice cada 3 s (WATCH_PRICE_STREAM).
+# El TP de cada apertura viaja en la señal ("tp") y el executor lo pone en Binance con la
+# cantidad de esa posición, si es la única de su par y dirección (ver _open_tp).
+SEND_TP = os.getenv("SEND_TP", "true").lower() in ("1", "true", "yes")
 WATCH_LIVE_PRICE = os.getenv("WATCH_LIVE_PRICE", "true").lower() in ("1", "true", "yes")
 
 
@@ -600,6 +603,7 @@ class Position:
     rev_parent:    int = 0      # trade_id de la operación perdedora que la disparó
     rev_tp_usd:    float = 0.0  # objetivo de la venganza en USD (neto) y su stop en USD
     rev_sl_usd:    float = 0.0
+    ex_tp:         float = 0.0      # TP puesto en Binance por el executor (0 = ninguno)
 
     def update(self, price: float) -> float:
         """Actualiza precio y excursiones. Llamar con el lock del bot tomado."""
@@ -1446,6 +1450,7 @@ class KlineBot:
                 "notional":  round(eff, 4),
                 "level":     round(body, 4),
                 "strategy":  eng.name,
+                **self._open_tp(pos),
             }, t0)
         eng._decide_ms.append(decide_ms)
 
@@ -1647,17 +1652,51 @@ class KlineBot:
         cfg = self._exit_cfg(name)
         return tp_sl_prices(entry, direction, cfg["tp_pct"], cfg["sl_pct"])
 
+    def _alone_in_executor(self, pos: Position) -> bool:
+        """¿Es la única posición enviada al executor en su par y dirección? El executor
+        suma las de todos los bots en una y Binance solo admite UN TP por lado: con otra
+        abierta, ese TP cubriría (y cerraría) también lo de los otros bots."""
+        with self.lock:
+            return not any(p is not pos and p.sent and p.symbol == pos.symbol and p.direction == pos.direction
+                           for e in self.engines.values() for p in e.positions.values())
+
+    def _open_tp(self, pos: Position) -> dict:
+        """Campo "tp" de la apertura: el TP de la posición, por su cantidad, si va sola."""
+        tp = 0.0 if pos.inverted else pos.tp_price          # invertida: tp_price es su SL
+        if tp > 0 and SEND_TP and self._alone_in_executor(pos):
+            pos.ex_tp = tp
+            return {"tp": tp}
+        return {}
+
+    def _sync_executor_tp(self, pos: Position) -> None:
+        """Tras cambiar el TP de una abierta: lo mueve en Binance si va sola, o quita el
+        viejo si ya comparte posición (desde entonces la cierra la señal del bot)."""
+        if not pos.sent or not SEND_TP:
+            return
+        tp = pos.tp_price if self._alone_in_executor(pos) else 0.0
+        if tp == pos.ex_tp:
+            return
+        base = {"trade_id": pos.trade_id, "symbol": pos.symbol, "direction": pos.direction, "strategy": pos.strategy}
+        if tp > 0:
+            self.executor.send({"action": "open_tp", "trigger_price": tp, **base})
+        elif pos.ex_tp > 0:
+            self.executor.send({"action": "close_tp", **base})
+        pos.ex_tp = tp
+
     def _apply_ratio_exits(self, names: Tuple[str, ...] = RATIO_ENGINES) -> None:
         """Recalcula TP/SL por precio de las posiciones abiertas de los bots de ratio con la
         configuración vigente y las revisa ya (por si el nivel nuevo ya se tocó). Las de
         venganza conservan su TP/SL en USD."""
-        syms = set()
+        syms, changed = set(), []
         with self.lock:
             for name in names:
                 for p in self.engines[name].positions.values():
                     if not p.revenge:
                         p.tp_price, p.sl_price = self._ratio_exit_prices(p.entry_price, p.direction, name)
                         syms.add(p.symbol)
+                        changed.append(p)
+        for p in changed:
+            self._sync_executor_tp(p)
         for sym in syms:
             self._on_price_event(sym, "config")
 
@@ -1762,7 +1801,7 @@ class KlineBot:
             self.executor.send({
                 "action": "open", "trade_id": pos.trade_id, "symbol": sym, "direction": side,
                 "price": px, "quantity": qty, "notional": round(eff, 4),
-                "level": round(-loss, 4), "strategy": eng.name,
+                "level": round(-loss, 4), "strategy": eng.name, **self._open_tp(pos),
             }, time.perf_counter())
 
     async def _refresh_tickers(self) -> None:
@@ -2207,6 +2246,13 @@ class KlineBot:
         price = self._live_price(sym)
         for name in RATIO_ENGINES:
             self._ratio_open(self.engines[name], sym, side, prev, last, chg, pct24, age_s, price)
+        # El TP va a Binance DESPUÉS de las aperturas de esta señal (mismo hilo de envío, en
+        # orden): así solo se pone si una sola de ellas quedó en ese par y dirección.
+        with self.lock:
+            fresh = [p for n in RATIO_ENGINES for p in self.engines[n].positions.values()
+                     if p.symbol == sym and p.direction == side and p.sent and not p.ex_tp]
+        for p in fresh:
+            self._sync_executor_tp(p)
 
     def _ratio_open(self, eng: Engine, sym: str, side: str, prev: Tuple[int, float], last: Tuple[int, float],
                     chg: float, pct24: float, age_s: float, price: Optional[float]) -> None:
