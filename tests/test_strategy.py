@@ -353,3 +353,16 @@ def test_cambiar_el_tp_de_un_bot_de_velas_lo_mueve_en_binance(tmp_path, monkeypa
                                    candle_time=0, last_price=1.0, strategy=st.ENGINE_CLOSE, ex_tp=1.02)
     bot.set_config(eng, tp_pct=3)
     assert enviados[-1]["action"] == "open_tp" and enviados[-1]["trigger_price"] == pytest.approx(1.03)
+
+
+def test_ahorro_de_datos_desde_la_web(tmp_path, monkeypatch):
+    from WS import SymbolWebSocketPriceCache
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    bot.price_cache = pc = SymbolWebSocketPriceCache(["AUSDT"], symbol_stream="aggTrade")
+    bot.watch = ["BUSDT"]
+    bot.set_global(watch_live_price=True, fast_prices=True)
+    bot._sync_watch_prices()
+    assert pc._desired_streams() == {"ausdt@aggTrade", "ausdt@markPrice@1s", "busdt@markPrice"}
+    g = bot.set_global(watch_live_price=False, fast_prices=False)
+    assert g["watch_live_price"] is False and g["fast_prices"] is False
+    assert pc._desired_streams() == {"ausdt@markPrice@1s"}

@@ -72,6 +72,15 @@ El tráfico de red venía casi todo de streams de *todo el mercado* abiertos las
 
 El bloque *Red* de la web (y `GET /health`) muestra los bytes recibidos y enviados desde el arranque y el ritmo por hora.
 
+### Ahorro de datos (botones en la web)
+
+En *Bots → Bots de ratio · entrada común → Ahorro de datos* hay dos interruptores que se guardan y se aplican al momento:
+
+- **Vigilados: precio en vivo** (`watch_live_price`). Encendido, cada vigilado recibe `markPrice` cada 3 s. Apagado, su 24 h se lee solo en la exploración de cada 5 min, y el precio para entrar se pide solo cuando el ratio da señal. Con muchos vigilados es lo que más tráfico ahorra.
+- **Abiertas: precio rápido** (`fast_prices`). Encendido, usa `aggTrade` (~100 ms). Apagado, usa `markPrice@1s`. Con el precio a 1 s, el TP puesto en Binance (si la posición va sola) cubre los picos.
+
+También con `POST /api/global` (`{"watch_live_price": false, "fast_prices": false}`).
+
 ## Panel web
 
 Menú con seis secciones; cada una tiene paneles desplegables (se recuerda cuáles dejaste abiertos) y tema claro, oscuro o automático:
