@@ -72,6 +72,15 @@ El tráfico de red venía casi todo de streams de *todo el mercado* abiertos las
 
 El bloque *Red* de la web (y `GET /health`) muestra los bytes recibidos y enviados desde el arranque y el ritmo por hora.
 
+### Ahorro de datos (botones en la web)
+
+En *Bots → Bots de ratio · entrada común → Ahorro de datos* hay dos interruptores que se guardan y se aplican al momento:
+
+- **Vigilados: precio en vivo** (`watch_live_price`). Encendido, cada vigilado recibe `markPrice` cada 3 s. Apagado, su 24 h se lee solo en la exploración de cada 5 min, y el precio para entrar se pide solo cuando el ratio da señal. Con muchos vigilados es lo que más tráfico ahorra.
+- **Abiertas: precio rápido** (`fast_prices`). Encendido, usa `aggTrade` (~100 ms). Apagado, usa `markPrice@1s`. Con el precio a 1 s, el TP puesto en Binance (si la posición va sola) cubre los picos.
+
+También con `POST /api/global` (`{"watch_live_price": false, "fast_prices": false}`).
+
 ## Panel web
 
 Menú con seis secciones; cada una tiene paneles desplegables (se recuerda cuáles dejaste abiertos) y tema claro, oscuro o automático:
@@ -177,6 +186,10 @@ Cada apertura y cierre se manda con `POST <EXECUTOR_URL>/signal` y la cabecera `
 `direction` puede ser `LONG` o `SHORT`, `level` lleva el % del cuerpo de la vela (o del cambio del ratio) que disparó la señal y `strategy` dice qué bot la mandó (`ratio`, `ratio_tp`, `ratio_rev`, `close` o `live`). Los `trade_id` son únicos entre todos los bots.
 
 El executor suma en **una** posición de Binance las de todos los bots en el mismo par y dirección (los tres bots de ratio abren con la misma señal). Por eso, mientras otro bot siga con ese par y dirección abierto, el `close` lleva `"quantity"` con la cantidad de esa operación y el executor cierra solo esa parte; el último en cerrar manda el cierre sin `quantity` y cierra todo lo que quede. La venganza en dirección contraria y los bots con posiciones opuestas en el mismo par necesitan la cuenta en **modo cobertura (Hedge Mode)**: en modo unidireccional Binance las netea.
+
+### TP en Binance
+
+La apertura lleva además `"tp"` con el take profit de esa posición. El executor lo pone en Binance (`TAKE_PROFIT_MARKET`, por mark price) con **la cantidad de esa posición**, así el TP salta aunque el bot o la red fallen. Binance solo admite **un TP por par y lado**, y el executor suma en una posición las de todos los bots del mismo par y dirección. Por eso el TP solo se manda cuando la posición **va sola** en su par y dirección. Si hay más bots en ese par, cada uno cierra por su señal, como antes. Con los bots de ratio, que abren juntos con la misma señal, el TP sale después de las aperturas como `open_tp` (y solo si al final quedó una). Si el TP cambia en caliente, se manda `open_tp` con el nuevo nivel (o `close_tp` si la posición ya no va sola). Se apaga con `SEND_TP=false`.
 
 ### Latencia
 

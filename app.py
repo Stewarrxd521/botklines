@@ -186,7 +186,7 @@ REVENGE_SKIP_REASONS = ("OBJETIVO", "CERRAR_TODAS")                   # cierres 
 TICKER_MODE         = os.getenv("TICKER_MODE", "scan").strip().lower()
 TICKER_SCAN_S       = float(os.getenv("TICKER_SCAN_S", "30"))         # duración máxima de cada exploración
 # Las exploraciones de cada ciclo se cortan cuando un mensaje ya casi no trae símbolos nuevos
-# (~2-4 s en vez de 30 s); la diaria, que rehace la lista de símbolos, dura TICKER_SCAN_S entero.
+# (2-3 mensajes, ~2-3 s, en vez de 30 s; los que no se movieron conservan su 24 h); la diaria, que rehace la lista de símbolos, dura TICKER_SCAN_S entero.
 TICKER_SCAN_QUICK   = os.getenv("TICKER_SCAN_QUICK", "true").lower() in ("1", "true", "yes")
 SYMBOL_SCAN_HOURS   = float(os.getenv("SYMBOL_SCAN_HOURS", "24"))     # la lista de símbolos se rehace a diario
 KNOWN_SYMBOLS_FILE  = os.getenv("KNOWN_SYMBOLS_FILE", os.path.join(_HERE, "known_symbols.json"))
@@ -222,11 +222,15 @@ STATUS_POLL_MS = int(os.getenv("STATUS_POLL_MS", "3000"))
 # Los bots de velas usan bookTicker (tiempo real, mucho más tráfico).
 PRICE_STREAM_ENV = os.getenv("WS_SYMBOL_STREAM", "").strip()
 # Vigilados del bot de ratio (24 h ≥ ±X %) sin posición: markPrice cada 3 s (WATCH_PRICE_STREAM).
+# El TP de cada apertura viaja en la señal ("tp") y el executor lo pone en Binance con la
+# cantidad de esa posición, si es la única de su par y dirección (ver _open_tp).
+SEND_TP = os.getenv("SEND_TP", "true").lower() in ("1", "true", "yes")
 WATCH_LIVE_PRICE = os.getenv("WATCH_LIVE_PRICE", "true").lower() in ("1", "true", "yes")
 
 
-def price_stream_for(klines_on: bool) -> str:
-    return PRICE_STREAM_ENV or ("bookTicker" if klines_on else "aggTrade")
+def price_stream_for(klines_on: bool, fast: bool = True) -> str:
+    """fast=False (ahorro de datos): markPrice@1s, 1 msg/s por símbolo con posición."""
+    return PRICE_STREAM_ENV or ("bookTicker" if klines_on else "aggTrade" if fast else "markPrice@1s")
 
 
 def http_get_json(url: str, proxy: str = "", timeout: float = 15.0) -> Tuple[object, int]:
@@ -600,6 +604,7 @@ class Position:
     rev_parent:    int = 0      # trade_id de la operación perdedora que la disparó
     rev_tp_usd:    float = 0.0  # objetivo de la venganza en USD (neto) y su stop en USD
     rev_sl_usd:    float = 0.0
+    ex_tp:         float = 0.0      # TP puesto en Binance por el executor (0 = ninguno)
 
     def update(self, price: float) -> float:
         """Actualiza precio y excursiones. Llamar con el lock del bot tomado."""
@@ -813,6 +818,9 @@ class KlineBot:
         # entradas nuevas al executor (los cierres de lo ya enviado sí salen).
         self.executor_paused = bool(settings.get("executor_paused"))
         self.klines_enabled = bool(settings.get("klines_enabled", KLINE_BOTS_ENABLED))
+        # Ahorro de datos (web): precio en vivo de los vigilados y precio rápido de las abiertas.
+        self.watch_live = bool(settings.get("watch_live_price", WATCH_LIVE_PRICE))
+        self.fast_prices = bool(settings.get("fast_prices", True))
         self.max_open = (int(settings["max_open"]) if settings.get("max_open") is not None
                          else MAX_OPEN_POSITIONS)
         self.session_base = 0.0
@@ -892,7 +900,8 @@ class KlineBot:
                 "inverted": self.inverted, "fee_pct": self.fee_pct,
                 "profit_target_usd": self.profit_target_usd, "max_open": self.max_open,
                 "executor_paused": self.executor_paused, "ratio": self.ratio_cfg, "ratio_rev": self.rev_cfg,
-                "klines_enabled": self.klines_enabled}
+                "klines_enabled": self.klines_enabled, "watch_live_price": self.watch_live,
+                "fast_prices": self.fast_prices}
         tmp = f"{SETTINGS_FILE}.tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as fh:
@@ -916,6 +925,9 @@ class KlineBot:
                 for p in eng.positions.values():
                     p.tp_price = exit_price(p.entry_price, p.direction, tp_pct, p.inverted)
                 syms = {p.symbol for p in eng.positions.values()}
+                moved = list(eng.positions.values())
+            for p in moved:
+                self._sync_executor_tp(p)                 # el TP puesto en Binance, también
             for sym in syms:
                 self._on_price_event(sym, "config")      # revisa ya el TP nuevo
         if changes:
@@ -951,7 +963,7 @@ class KlineBot:
     def _set_price_stream(self) -> None:
         """bookTicker (tiempo real) con los bots de velas; aggTrade (≤100 ms) si solo operan los de ratio."""
         pc = self.price_cache
-        want = price_stream_for(self.kline_stream is not None)
+        want = price_stream_for(self.kline_stream is not None, self.fast_prices)
         if pc is not None and pc.symbol_stream != want:
             pc.symbol_stream = want
             pc._schedule_sync()
@@ -974,7 +986,8 @@ class KlineBot:
 
     def set_global(self, inverted: Optional[bool] = None, fee_pct: Optional[float] = None,
                    profit_target_usd: Optional[float] = None, max_open: Optional[int] = None,
-                   executor_paused: Optional[bool] = None) -> dict:
+                   executor_paused: Optional[bool] = None, watch_live_price: Optional[bool] = None,
+                   fast_prices: Optional[bool] = None) -> dict:
         """Ajustes comunes a los dos bots. Invertir aplica a las entradas
         nuevas; las abiertas siguen con el modo (TP o SL) con el que se abrieron."""
         changes = []
@@ -995,6 +1008,16 @@ class KlineBot:
             self.executor_paused = executor_paused
             changes.append("envíos al executor PAUSADOS (entradas nuevas solo simuladas)" if executor_paused
                            else "envíos al executor reanudados")
+        if watch_live_price is not None and watch_live_price != self.watch_live:
+            self.watch_live = watch_live_price
+            self._sync_watch_prices()
+            changes.append("precio en vivo de los vigilados " + ("ACTIVADO (cada 3 s)" if watch_live_price
+                                                                 else "APAGADO (24 h cada 5 min)"))
+        if fast_prices is not None and fast_prices != self.fast_prices:
+            self.fast_prices = fast_prices
+            self._set_price_stream()
+            changes.append("precio de las abiertas " + ("rápido (aggTrade, ~100 ms)" if fast_prices
+                                                        else "cada 1 s (markPrice@1s)"))
         if changes:
             self._save_settings()
             self.store.mark_dirty(True)
@@ -1004,7 +1027,8 @@ class KlineBot:
     def global_settings(self) -> dict:
         return {"inverted": self.inverted, "fee_pct": self.fee_pct, "klines_enabled": self.klines_enabled,
                 "profit_target_usd": self.profit_target_usd, "max_open": self.max_open,
-                "executor_paused": self.executor_paused}
+                "executor_paused": self.executor_paused, "watch_live_price": self.watch_live,
+                "fast_prices": self.fast_prices}
 
     def open_count(self) -> int:
         with self.lock:
@@ -1151,8 +1175,8 @@ class KlineBot:
         self.log(f"{ENGINE_LABELS[ENGINE_RATIO_TP]} | sale solo por el TP del ratio")
         self.log(f"{ENGINE_LABELS[ENGINE_RATIO_REV]} | {self._rev_desc()}")
         self.log(f"Red: 24 h por {f'WebSocket, exploración de {TICKER_SCAN_S:g} s cada 5 min' if TICKER_MODE != 'ws' else 'WebSocket continuo'} · "
-                 f"precio en vivo: con posición {price_stream_for(self.klines_enabled)}"
-                 f"{', vigilados markPrice cada 3 s' if WATCH_LIVE_PRICE else ''}")
+                 f"precio en vivo: con posición {price_stream_for(self.klines_enabled, self.fast_prices)}"
+                 f"{', vigilados markPrice cada 3 s' if self.watch_live else ''}")
         self.log(f"[estado] Persistencia: {self._store_desc}")
         self.store.start()
         self.executor.warm()
@@ -1165,7 +1189,7 @@ class KlineBot:
             self.log("[estado] ⚠️ Aún no recupero el estado local: sin entradas ni cierres hasta recuperarlo")
 
         self.price_cache = SymbolWebSocketPriceCache(sorted(self._pos_syms),
-                                                     symbol_stream=price_stream_for(self.klines_enabled))
+                                                     symbol_stream=price_stream_for(self.klines_enabled, self.fast_prices))
         self.price_cache.set_update_callback(self._on_price_event)
         self.price_cache.start()
 
@@ -1446,6 +1470,7 @@ class KlineBot:
                 "notional":  round(eff, 4),
                 "level":     round(body, 4),
                 "strategy":  eng.name,
+                **self._open_tp(pos),
             }, t0)
         eng._decide_ms.append(decide_ms)
 
@@ -1647,17 +1672,51 @@ class KlineBot:
         cfg = self._exit_cfg(name)
         return tp_sl_prices(entry, direction, cfg["tp_pct"], cfg["sl_pct"])
 
+    def _alone_in_executor(self, pos: Position) -> bool:
+        """¿Es la única posición enviada al executor en su par y dirección? El executor
+        suma las de todos los bots en una y Binance solo admite UN TP por lado: con otra
+        abierta, ese TP cubriría (y cerraría) también lo de los otros bots."""
+        with self.lock:
+            return not any(p is not pos and p.sent and p.symbol == pos.symbol and p.direction == pos.direction
+                           for e in self.engines.values() for p in e.positions.values())
+
+    def _open_tp(self, pos: Position) -> dict:
+        """Campo "tp" de la apertura: el TP de la posición, por su cantidad, si va sola."""
+        tp = 0.0 if pos.inverted else pos.tp_price          # invertida: tp_price es su SL
+        if tp > 0 and SEND_TP and self._alone_in_executor(pos):
+            pos.ex_tp = tp
+            return {"tp": tp}
+        return {}
+
+    def _sync_executor_tp(self, pos: Position) -> None:
+        """Tras cambiar el TP de una abierta: lo mueve en Binance si va sola, o quita el
+        viejo si ya comparte posición (desde entonces la cierra la señal del bot)."""
+        if not pos.sent or not SEND_TP:
+            return
+        tp = pos.tp_price if not pos.inverted and self._alone_in_executor(pos) else 0.0
+        if tp == pos.ex_tp:
+            return
+        base = {"trade_id": pos.trade_id, "symbol": pos.symbol, "direction": pos.direction, "strategy": pos.strategy}
+        if tp > 0:
+            self.executor.send({"action": "open_tp", "trigger_price": tp, **base})
+        elif pos.ex_tp > 0:
+            self.executor.send({"action": "close_tp", **base})
+        pos.ex_tp = tp
+
     def _apply_ratio_exits(self, names: Tuple[str, ...] = RATIO_ENGINES) -> None:
         """Recalcula TP/SL por precio de las posiciones abiertas de los bots de ratio con la
         configuración vigente y las revisa ya (por si el nivel nuevo ya se tocó). Las de
         venganza conservan su TP/SL en USD."""
-        syms = set()
+        syms, changed = set(), []
         with self.lock:
             for name in names:
                 for p in self.engines[name].positions.values():
                     if not p.revenge:
                         p.tp_price, p.sl_price = self._ratio_exit_prices(p.entry_price, p.direction, name)
                         syms.add(p.symbol)
+                        changed.append(p)
+        for p in changed:
+            self._sync_executor_tp(p)
         for sym in syms:
             self._on_price_event(sym, "config")
 
@@ -1762,7 +1821,7 @@ class KlineBot:
             self.executor.send({
                 "action": "open", "trade_id": pos.trade_id, "symbol": sym, "direction": side,
                 "price": px, "quantity": qty, "notional": round(eff, 4),
-                "level": round(-loss, 4), "strategy": eng.name,
+                "level": round(-loss, 4), "strategy": eng.name, **self._open_tp(pos),
             }, time.perf_counter())
 
     async def _refresh_tickers(self) -> None:
@@ -1795,7 +1854,7 @@ class KlineBot:
                     self._on_tickers(raw)
                     msgs += 1
                     added = len(self._scan_seen) - before
-                    if quick and msgs >= 2 and added <= max(2, before // 200):
+                    if quick and (msgs >= 3 or (msgs >= 2 and added <= max(3, before // 100))):
                         break
             except asyncio.CancelledError:
                 raise
@@ -1974,7 +2033,7 @@ class KlineBot:
         además por el stream rápido (aggTrade, ver _refresh_pos_syms)."""
         pc = self.price_cache
         if pc is not None:
-            pc.set_slow_symbols(self.watch if WATCH_LIVE_PRICE else [])
+            pc.set_slow_symbols(self.watch if self.watch_live else [])
 
     def _ratio_open_syms(self) -> set:
         with self.lock:
@@ -2207,6 +2266,13 @@ class KlineBot:
         price = self._live_price(sym)
         for name in RATIO_ENGINES:
             self._ratio_open(self.engines[name], sym, side, prev, last, chg, pct24, age_s, price)
+        # El TP va a Binance DESPUÉS de las aperturas de esta señal (mismo hilo de envío, en
+        # orden): así solo se pone si una sola de ellas quedó en ese par y dirección.
+        with self.lock:
+            fresh = [p for n in RATIO_ENGINES for p in self.engines[n].positions.values()
+                     if p.symbol == sym and p.direction == side and p.sent and not p.ex_tp]
+        for p in fresh:
+            self._sync_executor_tp(p)
 
     def _ratio_open(self, eng: Engine, sym: str, side: str, prev: Tuple[int, float], last: Tuple[int, float],
                     chg: float, pct24: float, age_s: float, price: Optional[float]) -> None:
@@ -2772,6 +2838,9 @@ def api_global_set():
         vals["inverted"] = _flag(data["inverted"])
     if "executor_paused" in data:
         vals["executor_paused"] = _flag(data["executor_paused"])
+    for key in ("watch_live_price", "fast_prices"):
+        if key in data:
+            vals[key] = _flag(data[key])
     if data.get("max_open") not in (None, ""):
         try:
             v = int(float(data["max_open"]))
@@ -3360,6 +3429,14 @@ HTML = r"""<!doctype html>
             </ul>
           </div>
         </div>
+        <div class="box" style="margin-top:14px">
+          <h4>Ahorro de datos <span class="muted" style="font-weight:400">· Render cobra el tráfico</span></h4>
+          <div class="row c">
+            <button type="button" data-act="watchLive" id="btnWatchLive">—</button>
+            <button type="button" data-act="fastPx" id="btnFastPx">—</button>
+          </div>
+          <div class="note" id="ecoNote"></div>
+        </div>
         <div id="rtMsg" class="muted msg"></div>
       </div>
     </details>
@@ -3833,6 +3910,12 @@ function render(d) {
   be.textContent = rc.ratio_exit ? 'TP por ratio activo · desactivar' : 'TP por ratio desactivado · activar';
   be.className = 'small ' + (rc.ratio_exit ? 'ok' : 'ghost');
 
+  const bw = q('btnWatchLive'), bf = q('btnFastPx');
+  bw.dataset.on = g.watch_live_price ? '1' : ''; bf.dataset.on = g.fast_prices ? '1' : '';
+  bw.textContent = g.watch_live_price ? 'Vigilados: precio en vivo (3 s) · apagar' : 'Vigilados: sin precio en vivo · encender';
+  bf.textContent = g.fast_prices ? 'Abiertas: precio rápido (~100 ms) · pasar a 1 s' : 'Abiertas: precio cada 1 s · pasar a rápido';
+  bw.className = 'small ' + (g.watch_live_price ? 'ok' : 'ghost'); bf.className = 'small ' + (g.fast_prices ? 'ok' : 'ghost');
+  q('ecoNote').textContent = `Vigilados ahora: ${r.watch_count || 0}. Con su precio en vivo apagado, su 24 h se lee en la exploración de cada 5 min y el precio para entrar se pide solo cuando el ratio da señal. Con las abiertas a 1 s, el TP puesto en Binance (si va sola) cubre los picos.`;
   q('klState').innerHTML = `<span class="st ${k.running ? 'on' : 'idle'}">${k.running ? 'VELAS ENCENDIDAS' : 'VELAS APAGADAS'}</span>`;
   const bk = q('btnKlines');
   bk.dataset.on = k.running ? '1' : '';
@@ -3998,6 +4081,8 @@ const ACTIONS = {
                    : '¿Apagar las velas? Los bots al cierre y en vivo dejan de abrir; sus posiciones abiertas siguen con su TP/SL.'))
       glb({klines_enabled: on}, '/api/global', 'cfgMsg', r => r.klines_enabled ? 'Velas encendidas.' : 'Velas apagadas.');
   },
+  watchLive(b) { const on = !b.dataset.on; glb({watch_live_price: on}, '/api/global', 'rtMsg', r => r.watch_live_price ? 'Precio en vivo de los vigilados encendido (cada 3 s).' : 'Precio en vivo de los vigilados apagado: menos tráfico.'); },
+  fastPx(b) { const on = !b.dataset.on; glb({fast_prices: on}, '/api/global', 'rtMsg', r => r.fast_prices ? 'Abiertas con precio rápido (~100 ms).' : 'Abiertas con precio cada 1 s: menos tráfico.'); },
   ratioExit(b) { ratioPost({ratio_exit: !b.dataset.on}, r => `TP por ratio ${r.ratio_exit ? 'activado' : 'desactivado'}`); },
   revRatioExit(b) { revPost({ratio_exit: !b.dataset.on}, r => `TP por ratio ${r.ratio_exit ? 'activado' : 'desactivado'} en el bot ratio + venganza`, 'rtMsg'); },
   revToggle(b) {
