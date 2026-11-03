@@ -125,6 +125,11 @@ def _bot_sin_red(tmp_path, monkeypatch):
     bot.executor.send = lambda *a, **k: None
     bot.filters = {"AUSDT": {"stepSize": 1, "minQty": 0, "minNotional": 5}}
     bot.fee_pct = 0.0
+    bot.min_hold_s = 0.0                       # las pruebas de la demora la ponen a mano
+
+    def sin_red(*a, **k):
+        raise RuntimeError("sin red en las pruebas")
+    bot._rest_get = sin_red
     return bot
 
 
@@ -324,25 +329,28 @@ def _bot_con_envios(tmp_path, monkeypatch):
     return bot, enviados, int(now * 1000)
 
 
-def test_el_tp_va_al_executor_solo_si_la_posicion_va_sola(tmp_path, monkeypatch):
+def test_el_tp_va_en_la_apertura_y_se_mueve_en_caliente(tmp_path, monkeypatch):
     bot, enviados, ts = _bot_con_envios(tmp_path, monkeypatch)
     for n in (st.ENGINE_RATIO_TP, st.ENGINE_RATIO_REV):
         bot.engines[n].paused = True                # solo abre el bot ratio TP/SL
     bot._on_ratio_points("AUSDT", [(ts - 300_000, 1.18), (ts, 0.86)])
     (pos,) = bot.engines[st.ENGINE_RATIO].positions.values()
-    assert [e["action"] for e in enviados] == ["open", "open_tp"]
-    assert enviados[1]["trigger_price"] == pytest.approx(pos.tp_price) and pos.ex_tp == pos.tp_price
-    # Cambiar el TP en caliente lo mueve también en Binance.
+    assert [e["action"] for e in enviados] == ["open"]
+    assert enviados[0]["tp"] == pytest.approx(pos.tp_price) and pos.ex_tp == pos.tp_price
+    # Cambiar el TP en caliente lo mueve también en Binance (solo el de ese trade_id).
     enviados.clear()
     bot.set_ratio_config(tp_pct=8)
     assert enviados[0]["action"] == "open_tp" and enviados[0]["trigger_price"] == pytest.approx(pos.tp_price)
+    assert enviados[0]["trade_id"] == pos.trade_id
 
 
-def test_con_varios_bots_en_el_mismo_par_no_se_pone_tp_en_binance(tmp_path, monkeypatch):
+def test_con_varios_bots_en_el_mismo_par_cada_uno_lleva_su_tp(tmp_path, monkeypatch):
     bot, enviados, ts = _bot_con_envios(tmp_path, monkeypatch)
     bot._on_ratio_points("AUSDT", [(ts - 300_000, 1.18), (ts, 0.86)])
     assert [e["action"] for e in enviados] == ["open", "open", "open"]
-    assert all("tp" not in e for e in enviados)
+    por_bot = {e["strategy"]: e for e in enviados}
+    assert "tp" in por_bot[st.ENGINE_RATIO] and "tp" in por_bot[st.ENGINE_RATIO_REV]
+    assert "tp" not in por_bot[st.ENGINE_RATIO_TP]          # el bot "solo TP ratio" no tiene TP por precio
 
 
 def test_cambiar_el_tp_de_un_bot_de_velas_lo_mueve_en_binance(tmp_path, monkeypatch):
@@ -366,3 +374,264 @@ def test_ahorro_de_datos_desde_la_web(tmp_path, monkeypatch):
     g = bot.set_global(watch_live_price=False, fast_prices=False)
     assert g["watch_live_price"] is False and g["fast_prices"] is False
     assert pc._desired_streams() == {"ausdt@markPrice@1s"}
+
+
+# ── Precio de libro (como el executor) ────────────────────────────────────────
+
+def test_recorrer_el_libro_da_el_precio_medio_y_el_peor_mas_alla_de_20_niveles():
+    asks = [["1.0", "2"], ["1.1", "3"]]
+    assert st.walk_book(asks, 4) == pytest.approx((2 * 1.0 + 2 * 1.1) / 4)
+    assert st.walk_book(asks, 10) == pytest.approx((2 * 1.0 + 3 * 1.1 + 5 * 1.1) / 10)   # resto al peor
+    assert st.walk_book(asks, 1) == pytest.approx(1.0)
+    assert st.walk_book([], 1) is None and st.walk_book([["0", "5"]], 1) is None
+
+
+def _libro(bot, bids, asks, ticker=None):
+    pedidos = []
+
+    def rest(path, params=None, timeout=15.0):
+        pedidos.append(path)
+        if path == "/fapi/v1/depth":
+            if bids is None:
+                raise RuntimeError("HTTP 500")
+            return {"bids": bids, "asks": asks}
+        if path == "/fapi/v1/ticker/bookTicker" and ticker:
+            return ticker
+        raise RuntimeError("sin red")
+    bot._rest_get = rest
+    return pedidos
+
+
+def test_las_aperturas_de_ratio_entran_al_precio_del_libro(tmp_path, monkeypatch):
+    bot, enviados, ts = _bot_con_envios(tmp_path, monkeypatch)
+    pedidos = _libro(bot, bids=[["0.99", "3"], ["0.98", "10"]], asks=[["1.01", "10"]])
+    bot._on_ratio_points("AUSDT", [(ts - 300_000, 1.18), (ts, 0.86)])
+    abiertas = [p for n in st.RATIO_ENGINES for p in bot.engines[n].positions.values()]
+    assert len(abiertas) == 3 and pedidos.count("/fapi/v1/depth") == 1      # un libro para los 3 bots
+    esperado = (3 * 0.99 + 2 * 0.98) / 5                                    # SHORT vende contra los bids
+    for p in abiertas:
+        assert p.entry_price == pytest.approx(esperado) and p.entry_src == "libro" and p.signal_price == 1.0
+    pos = next(iter(bot.engines[st.ENGINE_RATIO].positions.values()))
+    assert pos.tp_price == pytest.approx(esperado * 0.9)                    # TP desde la entrada real
+    assert enviados[0]["price"] == 1.0 and enviados[0]["tp"] == pytest.approx(pos.tp_price)
+
+
+def test_el_cierre_se_valora_con_el_libro_y_la_orden_sale_antes(tmp_path, monkeypatch):
+    bot, enviados, _ = _bot_con_envios(tmp_path, monkeypatch)
+    eng = bot.engines[st.ENGINE_RATIO]
+    eng.positions[7] = st.Position(trade_id=7, symbol="AUSDT", direction=st.SHORT, entry_price=1.0, qty=5,
+                                   notional=5.0, tp_price=0.9, sl_price=1.05, signal_pct=-27, candle_open=1.18,
+                                   candle_close=0.86, candle_time=0, last_price=1.0, strategy=st.ENGINE_RATIO)
+    _libro(bot, bids=[["0.89", "10"]], asks=[["0.90", "2"], ["0.92", "10"]])
+    assert bot._close(7, 0.9, "TP")
+    assert enviados[0]["action"] == "close" and enviados[0]["close_price"] == 0.9
+    rec = eng.closed_trades[0]
+    esperado = (2 * 0.90 + 3 * 0.92) / 5                                    # cerrar SHORT = comprar asks
+    assert rec["close_price"] == pytest.approx(esperado) and rec["close_src"] == "libro"
+    assert rec["trigger_price"] == 0.9 and rec["pnl"] == pytest.approx((1.0 - esperado) * 5)
+
+
+def test_sin_libro_usa_el_mejor_ask_bid_y_sin_eso_el_precio_en_vivo(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    _libro(bot, bids=None, asks=None, ticker={"bidPrice": "0.97", "askPrice": "0.98"})
+    bot._fetch_book("AUSDT")
+    assert bot._fill_from_book("AUSDT", True, 5, 1.0) == (pytest.approx(0.98), "mejor ask/bid")
+    assert bot._fill_from_book("AUSDT", False, 5, 1.0) == (pytest.approx(0.97), "mejor ask/bid")
+    bot._books.clear()
+    bot._price = lambda sym: 1.02
+    assert bot._fill_from_book("AUSDT", True, 5, 1.0) == (1.02, "precio en vivo")
+    bot._price = lambda sym: None
+    assert bot._fill_from_book("AUSDT", True, 5, 1.0) == (1.0, "señal")
+
+
+# ── Demora mínima antes de cerrar ─────────────────────────────────────────────
+
+def test_no_cierra_por_precio_antes_de_la_demora_minima(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    bot.set_global(min_hold_s=2)
+    eng = bot.engines[st.ENGINE_RATIO_REV]
+    eng.positions[8] = st.Position(trade_id=8, symbol="AUSDT", direction=st.LONG, entry_price=1.0, qty=50,
+                                   notional=50.0, tp_price=1.001, sl_price=0.99, signal_pct=0, candle_open=1,
+                                   candle_close=1, candle_time=0, last_price=1.0, strategy=st.ENGINE_RATIO_REV,
+                                   revenge=True)
+    bot._price = lambda sym: 1.002                  # el TP se toca en el mismo instante de abrir
+    bot._check_take_profit("AUSDT")
+    assert 8 in eng.positions
+    eng.positions[8].opened_ts -= 2.1               # ya cumplió los 2 s
+    bot._check_take_profit("AUSDT")
+    assert 8 not in eng.positions and eng.closed_trades[0]["duration_s"] >= 2
+    assert bot.global_settings()["min_hold_s"] == 2
+
+
+# ── RSI + VWAP ────────────────────────────────────────────────────────────────
+
+def test_velas_a_pedir_por_rest():
+    day = 1_762_128_000_000                          # 00:00 UTC
+    assert st.klines_needed(day + 45 * 60_000, 14) == 141       # 00:45 → 140 de calentamiento del RSI + la en curso
+    assert st.klines_needed(day + 12 * 3600_000, 14) == 721     # 12:00 → las 720 de hoy + la en curso
+    assert st.klines_needed(day + 1439 * 60_000 + 30_000, 14) == 1440
+
+
+def test_vwap_y_sigma_del_dia_utc():
+    ind = st.CandleIndicators(14)
+    day = 1_762_128_000_000
+    ind.add(day - 60_000, 50, 50, 50, 100)          # vela de ayer: no entra en el VWAP de hoy
+    ind.add(day, 10, 10, 10, 1)
+    ind.add(day + 60_000, 20, 20, 20, 3)
+    v, sd = ind.vwap()
+    assert v == pytest.approx(17.5) and sd == pytest.approx(18.75 ** 0.5)
+    lo, mid, hi = ind.bands(2.5)
+    assert lo == pytest.approx(17.5 - 2.5 * sd) and hi == pytest.approx(17.5 + 2.5 * sd)
+    assert ind.day_candles == 2
+
+
+def test_rsi_de_wilder_progresivo_igual_que_de_una_vez():
+    rnd = random.Random(7)
+    closes, px = [], 100.0
+    for _ in range(300):
+        px *= 1 + rnd.uniform(-0.01, 0.01)
+        closes.append(px)
+    a, b = st.CandleIndicators(14), st.CandleIndicators(14)
+    for i, c in enumerate(closes):
+        a.add(i * 60_000 + 60_000, c, c, c, 1)
+    for i, c in enumerate(closes[:200]):            # "REST"
+        b.add(i * 60_000 + 60_000, c, c, c, 1)
+    for i, c in enumerate(closes[200:], start=200):  # "WebSocket"
+        b.add(i * 60_000 + 60_000, c, c, c, 1)
+    assert a.rsi == pytest.approx(b.rsi) and 0 < a.rsi < 100
+    # Referencia: Wilder clásico (media simple de los 14 primeros y suavizado después).
+    ch = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    ag = sum(max(x, 0) for x in ch[:14]) / 14
+    al = sum(max(-x, 0) for x in ch[:14]) / 14
+    for x in ch[14:]:
+        ag, al = (ag * 13 + max(x, 0)) / 14, (al * 13 + max(-x, 0)) / 14
+    assert a.rsi == pytest.approx(100 - 100 / (1 + ag / al))
+    sube = st.CandleIndicators(3)
+    for i in range(6):
+        sube.add(i * 60_000 + 60_000, 1 + i, 1 + i, 1 + i, 1)
+    assert sube.rsi == 100.0
+
+
+def _abierta_ratio(bot, name, tid, direction=st.SHORT, revenge=False):
+    p = st.Position(trade_id=tid, symbol="AUSDT", direction=direction, entry_price=1.0, qty=5, notional=5.0,
+                    tp_price=0, sl_price=0, signal_pct=-27, candle_open=1.18, candle_close=0.86, candle_time=0,
+                    last_price=1.0, strategy=name, revenge=revenge)
+    bot.engines[name].positions[tid] = p
+    return p
+
+
+def test_tp_por_rsi_y_vwap_cierra_solo_en_los_bots_encendidos(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    _abierta_ratio(bot, st.ENGINE_RATIO_TP, 11)
+    _abierta_ratio(bot, st.ENGINE_RATIO, 12)                       # este bot lo tiene apagado
+    _abierta_ratio(bot, st.ENGINE_RATIO_REV, 13, revenge=True)     # las venganzas no lo usan
+    bot.engines[st.ENGINE_RATIO_REV].positions[13].strategy = st.ENGINE_RATIO_REV
+    bot.set_ind_config(enabled={st.ENGINE_RATIO_TP: True, st.ENGINE_RATIO_REV: True})
+    assert bot._ind_buf == {"AUSDT": []}                           # pidiendo las velas por REST
+    now_ms = int(time.time() // 60 * 60) * 1000                     # minuto en curso
+    rows, px = [], 1.0
+    for i in range(150, 0, -1):                                    # 150 velas cerradas, suaves
+        t = now_ms - i * 60_000
+        px *= 1.0005 if i % 2 else 0.9996
+        rows.append([t, px, px * 1.001, px * 0.999, px, 100.0, t + 59_999])
+    rows.append([now_ms, px, px, px, px, 1.0, now_ms + 59_999])   # la vela en curso: se descarta
+    bot._ind_seeded("AUSDT", rows)
+    ind = bot._ind["AUSDT"]
+    assert ind.count == 150 and ind.ready()
+    # Desplome en la vela que cierra después de abrir: RSI < 13 y cierre bajo VWAP − 2,5σ.
+    bot._ind_candle("AUSDT", now_ms, px, px * 0.80, px * 0.80, 5000.0)
+    assert ind.rsi < 13
+    assert 11 not in bot.engines[st.ENGINE_RATIO_TP].positions
+    assert bot.engines[st.ENGINE_RATIO_TP].closed_trades[0]["reason"] == "TP_RSI_VWAP"
+    assert 12 in bot.engines[st.ENGINE_RATIO].positions and 13 in bot.engines[st.ENGINE_RATIO_REV].positions
+
+
+def test_un_hueco_de_velas_recarga_por_rest(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    _abierta_ratio(bot, st.ENGINE_RATIO_TP, 21)
+    bot.set_ind_config(enabled={st.ENGINE_RATIO_TP: True})
+    bot._ind_seeded("AUSDT", [[i * 60_000, 1, 1, 1, 1, 1, i * 60_000 + 59_999] for i in range(1, 40)])
+    bot._ind_candle("AUSDT", 45 * 60_000, 1, 1, 1, 1)               # faltan las de 40..44
+    assert "AUSDT" not in bot._ind and bot._ind_buf["AUSDT"] == [(45 * 60_000, 1, 1, 1, 1)]
+
+
+def test_config_del_tp_por_indicadores(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    r = bot.set_ind_config(rsi_period=21, rsi_level=15, vwap_k=2, enabled={st.ENGINE_RATIO: True})
+    assert r["cfg"]["rsi_period"] == 21 and r["cfg"]["enabled"][st.ENGINE_RATIO] is True
+    with pytest.raises(ValueError):
+        bot.set_ind_config(rsi_level=60)
+    with pytest.raises(ValueError):
+        bot.set_ind_config(use_rsi=False, use_vwap=False)
+    nuevo = st.KlineBot()                                            # se guarda en los ajustes
+    assert nuevo.ind_cfg["rsi_period"] == 21 and nuevo.ind_cfg["vwap_k"] == 2
+
+
+def test_ws_velas_1m_de_los_pares_con_tp_por_indicadores():
+    from WS import SymbolWebSocketPriceCache
+    pc = SymbolWebSocketPriceCache(["AUSDT"], symbol_stream="aggTrade")
+    got = []
+    pc.set_kline_symbols(["AUSDT"], lambda *a: got.append(a))
+    assert "ausdt@kline_1m" in pc._desired_streams()
+    k = {"t": 60_000, "o": "1", "h": "2", "l": "0.5", "c": "1.5", "v": "10", "x": False}
+    pc._dispatch_event({"e": "kline", "s": "AUSDT", "k": k}, time.time())
+    assert got == []                                                 # la vela en curso no cuenta
+    pc._dispatch_event({"e": "kline", "s": "AUSDT", "k": {**k, "x": True}}, time.time())
+    assert got == [("AUSDT", 60_000, 1.0, 2.0, 0.5, 1.5, 10.0)]
+
+
+def test_en_el_loop_el_libro_se_pide_en_un_hilo_sin_bloquear(tmp_path, monkeypatch):
+    import asyncio
+    bot, enviados, _ = _bot_con_envios(tmp_path, monkeypatch)
+    eng = bot.engines[st.ENGINE_RATIO]
+    eng.positions[31] = st.Position(trade_id=31, symbol="AUSDT", direction=st.LONG, entry_price=1.0, qty=5,
+                                    notional=5.0, tp_price=1.1, sl_price=0.95, signal_pct=27, candle_open=1,
+                                    candle_close=1, candle_time=0, last_price=1.0, strategy=st.ENGINE_RATIO)
+    hilo_rest = []
+
+    def rest(path, params=None, timeout=15.0):
+        hilo_rest.append(threading.get_ident())
+        time.sleep(0.05)
+        return {"bids": [["1.09", "100"]], "asks": [["1.11", "100"]]}
+    bot._rest_get = rest
+
+    async def run():
+        bot.loop = asyncio.get_running_loop()
+        bot._close(31, 1.1, "TP")
+        assert enviados[-1]["action"] == "close" and not eng.closed_trades    # la orden ya salió; el papel, después
+        for _ in range(100):
+            if eng.closed_trades:
+                break
+            await asyncio.sleep(0.01)
+    asyncio.run(run())
+    assert eng.closed_trades[0]["close_price"] == pytest.approx(1.09)          # LONG cierra vendiendo a bids
+    assert hilo_rest and hilo_rest[0] != threading.get_ident()
+
+
+def test_al_encender_se_cargan_las_velas_una_vez_por_rest(tmp_path, monkeypatch):
+    import asyncio
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    _abierta_ratio(bot, st.ENGINE_RATIO, 41)
+    pedidos = []
+
+    def rest(path, params=None, timeout=15.0):
+        pedidos.append((path, params))
+        now_ms = int(time.time() * 1000)
+        n = params["limit"]
+        base = now_ms // 60_000 * 60_000 - (n - 1) * 60_000
+        return [[base + i * 60_000, 1, 1.01, 0.99, 1 + i * 1e-4, 10, base + i * 60_000 + 59_999] for i in range(n)]
+    bot._rest_get = rest
+
+    async def run():
+        bot.loop, bot.running = asyncio.get_running_loop(), True
+        bot.set_ind_config(enabled={st.ENGINE_RATIO: True})
+        for _ in range(100):
+            if "AUSDT" in bot._ind:
+                break
+            await asyncio.sleep(0.01)
+        bot.running = False
+    asyncio.run(run())
+    assert len(pedidos) == 1 and pedidos[0][0] == "/fapi/v1/klines"
+    n = pedidos[0][1]["limit"]
+    assert n == st.klines_needed(int(time.time() * 1000), 14)
+    assert bot._ind["AUSDT"].count == n - 1 and not bot._ind_seeding        # la vela en curso se descarta
