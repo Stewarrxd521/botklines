@@ -130,6 +130,11 @@ def _bot_sin_red(tmp_path, monkeypatch):
     def sin_red(*a, **k):
         raise RuntimeError("sin red en las pruebas")
     bot._rest_get = sin_red
+
+    async def sin_ws(sym):
+        raise RuntimeError("sin red en las pruebas")
+    bot._ws_depth = sin_ws
+    bot._alt_http = sin_red
     return bot
 
 
@@ -386,19 +391,16 @@ def test_recorrer_el_libro_da_el_precio_medio_y_el_peor_mas_alla_de_20_niveles()
     assert st.walk_book([], 1) is None and st.walk_book([["0", "5"]], 1) is None
 
 
-def _libro(bot, bids, asks, ticker=None):
+def _libro(bot, bids, asks):
+    """El libro llega por el WebSocket depth20 (sin REST)."""
     pedidos = []
 
-    def rest(path, params=None, timeout=15.0):
-        pedidos.append(path)
-        if path == "/fapi/v1/depth":
-            if bids is None:
-                raise RuntimeError("HTTP 500")
-            return {"bids": bids, "asks": asks}
-        if path == "/fapi/v1/ticker/bookTicker" and ticker:
-            return ticker
-        raise RuntimeError("sin red")
-    bot._rest_get = rest
+    async def ws(sym):
+        pedidos.append(sym)
+        if bids is None:
+            raise RuntimeError("sin libro")
+        return bids, asks
+    bot._ws_depth = ws
     return pedidos
 
 
@@ -407,7 +409,7 @@ def test_las_aperturas_de_ratio_entran_al_precio_del_libro(tmp_path, monkeypatch
     pedidos = _libro(bot, bids=[["0.99", "3"], ["0.98", "10"]], asks=[["1.01", "10"]])
     bot._on_ratio_points("AUSDT", [(ts - 300_000, 1.18), (ts, 0.86)])
     abiertas = [p for n in st.RATIO_ENGINES for p in bot.engines[n].positions.values()]
-    assert len(abiertas) == 3 and pedidos.count("/fapi/v1/depth") == 1      # un libro para los 3 bots
+    assert len(abiertas) == 3 and pedidos == ["AUSDT"]                       # un libro para los 3 bots
     esperado = (3 * 0.99 + 2 * 0.98) / 5                                    # SHORT vende contra los bids
     for p in abiertas:
         assert p.entry_price == pytest.approx(esperado) and p.entry_src == "libro" and p.signal_price == 1.0
@@ -431,13 +433,13 @@ def test_el_cierre_se_valora_con_el_libro_y_la_orden_sale_antes(tmp_path, monkey
     assert rec["trigger_price"] == 0.9 and rec["pnl"] == pytest.approx((1.0 - esperado) * 5)
 
 
-def test_sin_libro_usa_el_mejor_ask_bid_y_sin_eso_el_precio_en_vivo(tmp_path, monkeypatch):
+def test_sin_libro_usa_el_precio_en_vivo_y_sin_eso_el_de_la_senal(tmp_path, monkeypatch):
     bot = _bot_sin_red(tmp_path, monkeypatch)
-    _libro(bot, bids=None, asks=None, ticker={"bidPrice": "0.97", "askPrice": "0.98"})
+    rest = []
+    bot._rest_get = lambda *a, **k: rest.append(a)            # el libro NUNCA va por REST
+    _libro(bot, bids=None, asks=None)
     bot._fetch_book("AUSDT")
-    assert bot._fill_from_book("AUSDT", True, 5, 1.0) == (pytest.approx(0.98), "mejor ask/bid")
-    assert bot._fill_from_book("AUSDT", False, 5, 1.0) == (pytest.approx(0.97), "mejor ask/bid")
-    bot._books.clear()
+    assert not rest and bot.book_errors == 1
     bot._price = lambda sym: 1.02
     assert bot._fill_from_book("AUSDT", True, 5, 1.0) == (1.02, "precio en vivo")
     bot._price = lambda sym: None
@@ -580,20 +582,18 @@ def test_ws_velas_1m_de_los_pares_con_tp_por_indicadores():
     assert got == [("AUSDT", 60_000, 1.0, 2.0, 0.5, 1.5, 10.0)]
 
 
-def test_en_el_loop_el_libro_se_pide_en_un_hilo_sin_bloquear(tmp_path, monkeypatch):
+def test_en_el_loop_el_libro_se_pide_en_segundo_plano_sin_bloquear(tmp_path, monkeypatch):
     import asyncio
     bot, enviados, _ = _bot_con_envios(tmp_path, monkeypatch)
     eng = bot.engines[st.ENGINE_RATIO]
     eng.positions[31] = st.Position(trade_id=31, symbol="AUSDT", direction=st.LONG, entry_price=1.0, qty=5,
                                     notional=5.0, tp_price=1.1, sl_price=0.95, signal_pct=27, candle_open=1,
                                     candle_close=1, candle_time=0, last_price=1.0, strategy=st.ENGINE_RATIO)
-    hilo_rest = []
 
-    def rest(path, params=None, timeout=15.0):
-        hilo_rest.append(threading.get_ident())
-        time.sleep(0.05)
-        return {"bids": [["1.09", "100"]], "asks": [["1.11", "100"]]}
-    bot._rest_get = rest
+    async def ws(sym):
+        await asyncio.sleep(0.05)
+        return [["1.09", "100"]], [["1.11", "100"]]
+    bot._ws_depth = ws
 
     async def run():
         bot.loop = asyncio.get_running_loop()
@@ -605,7 +605,6 @@ def test_en_el_loop_el_libro_se_pide_en_un_hilo_sin_bloquear(tmp_path, monkeypat
             await asyncio.sleep(0.01)
     asyncio.run(run())
     assert eng.closed_trades[0]["close_price"] == pytest.approx(1.09)          # LONG cierra vendiendo a bids
-    assert hilo_rest and hilo_rest[0] != threading.get_ident()
 
 
 def test_al_encender_se_cargan_las_velas_una_vez_por_rest(tmp_path, monkeypatch):
@@ -643,7 +642,7 @@ def test_un_418_bloquea_solo_esa_ruta_y_no_vuelve_a_pedir(tmp_path, monkeypatch)
     import urllib.error
     from email.message import Message
     monkeypatch.setattr(st, "SETTINGS_FILE", str(tmp_path / "s.json"))
-    monkeypatch.setattr(st, "REST_PROXY_URL", "http://proxy:1")
+    monkeypatch.setattr(st, "REST_PROXIES", ["http://proxy:1"])
     bot = st.KlineBot()
     llamadas = []
 
@@ -655,7 +654,6 @@ def test_un_418_bloquea_solo_esa_ruta_y_no_vuelve_a_pedir(tmp_path, monkeypatch)
             raise urllib.error.HTTPError(url, 418, "banned", h, None)
         return {"ok": True}, 10
     monkeypatch.setattr(st, "http_get_json", fake)
-    bot._rest_route = 1                                     # empieza por la IP directa (vetada)
     assert bot._rest_get("/fapi/v1/depth") == {"ok": True}  # sigue por el proxy
     assert llamadas == ["", "http://proxy:1"] and bot._rest_block_until == 0
     llamadas.clear()
@@ -677,45 +675,121 @@ def test_un_418_bloquea_solo_esa_ruta_y_no_vuelve_a_pedir(tmp_path, monkeypatch)
     assert llamadas == []                                   # con todo vetado no sale nada
 
 
-def _bybit_rows(now_ms, n):
-    base = now_ms // 60_000 * 60_000
-    return [[str(base - i * 60_000), "1", "1.01", "0.99", str(1 + i * 1e-4), "10", "10"] for i in range(n)]  # nueva → vieja
+def test_con_la_ip_vetada_rota_entre_las_proxies(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "SETTINGS_FILE", str(tmp_path / "s.json"))
+    monkeypatch.setattr(st, "REST_PROXIES", ["http://a:1@p:80", "http://b:2@p:80", "http://c:3@p:80"])
+    bot = st.KlineBot()
+    usadas = []
+    monkeypatch.setattr(st, "http_get_json", lambda url, proxy="", timeout=15.0: (usadas.append(proxy), ({}, 1))[1])
+    bot._rest_get("/futures/data/x")
+    assert usadas == [""]                                   # sin veto: IP directa
+    bot._route_block[""] = time.time() + 3600
+    usadas.clear()
+    for _ in range(6):
+        bot._rest_get("/futures/data/x")
+    assert usadas == st.REST_PROXIES * 2                    # vetada: proxies en rueda
+    assert "clave" not in st.proxy_label(st.REST_PROXIES[0]) and ":1@" not in st.proxy_label(st.REST_PROXIES[0])
 
 
-def test_velas_de_bybit_cuando_binance_esta_bloqueado(tmp_path, monkeypatch):
+def test_las_proxies_por_defecto_son_solo_para_binance():
+    assert len(st.REST_PROXIES) >= 5 and all(u.startswith("http://fixie:") for u in st.REST_PROXIES[:5])
+
+
+def _respuestas(ex, now_ms, start, end):
+    ts = [t for t in range(start, end + 1, 60_000) if t <= now_ms]
+    if ex == "bybit":
+        return {"retCode": 0, "result": {"list": [[str(t), "1", "1.01", "0.99", "1", "10", "10"] for t in reversed(ts)]}}
+    if ex == "kucoin":
+        return {"code": "200000", "data": [[t, 1, 1.01, 0.99, 1, 10] for t in ts]}
+    return [[t // 1000, 0.99, 1.01, 1, 1, 10] for t in reversed(ts)]
+
+
+def test_velas_de_otros_exchanges_en_orden_y_binance_al_final(tmp_path, monkeypatch):
+    from urllib.parse import urlsplit, parse_qs
+    from datetime import datetime
     bot = _bot_sin_red(tmp_path, monkeypatch)
-    bot._rest_block_until = time.time() + 3600              # Binance vetado
+    rest_binance = []
+    bot._rest_get = lambda *a, **k: rest_binance.append(a) or []
+    pedidos = []
+    tiene = {"bybit": False, "kucoin": False, "coinbase": True}
+
+    def http(url, timeout=10.0):
+        u = urlsplit(url)
+        q = {k: v[0] for k, v in parse_qs(u.query).items()}
+        ex = next(k for k, b in st.ALT_URLS.items() if url.startswith(b))
+        pedidos.append(ex)
+        if not tiene[ex]:
+            raise LookupError("HTTP 404")
+        if ex == "coinbase":
+            assert u.path == "/products/A-USD/candles" and q["granularity"] == "60"
+            iso = lambda x: int(datetime.strptime(x, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=st.timezone.utc).timestamp() * 1000)
+            start, end = iso(q["start"]), iso(q["end"])
+            assert (end - start) // 60_000 + 1 <= 300
+        return _respuestas(ex, int(time.time() * 1000), start, end)
+    bot._alt_http = http
+    rows, ex = bot._fetch_seed_klines("AUSDT")
+    n = st.klines_needed(int(time.time() * 1000), 14)
+    assert ex == "coinbase" and not rest_binance             # Binance no se toca si otro tiene el par
+    assert len(rows) == n and rows[0][0] < rows[-1][0]
+    assert pedidos[:2] == ["bybit", "kucoin"]                  # Bybit y KuCoin no lo tienen (un intento cada uno)
+    assert pedidos.count("coinbase") == 1 + -(-n // 290)       # prueba del nombre + páginas de 290
+    # Ninguno lo tiene: Binance (REST) como último recurso.
+    tiene["coinbase"] = False
+    bot._alt_missing.clear(); bot._alt_sym.clear()
+    bot._rest_get = lambda *a, **k: rest_binance.append(a) or [[0, 1, 1, 1, 1, 1, 59_999]]
+    rows, ex = bot._fetch_seed_klines("AUSDT")
+    assert ex == "binance" and len(rest_binance) == 1
+
+
+def test_bybit_y_kucoin_paginan_y_normalizan(tmp_path, monkeypatch):
+    from urllib.parse import urlsplit, parse_qs
+    bot = _bot_sin_red(tmp_path, monkeypatch)
     pedidos = []
 
-    def fake(url, proxy="", timeout=15.0):
-        from urllib.parse import urlsplit, parse_qs
+    def http(url, timeout=10.0):
         q = {k: v[0] for k, v in parse_qs(urlsplit(url).query).items()}
-        pedidos.append(q)
-        assert url.startswith(st.BYBIT_URL + "/v5/market/kline") and q["category"] == "linear" and q["interval"] == "1"
-        now_ms = int(q.get("end", int(time.time() * 1000)))
-        return {"retCode": 0, "result": {"list": _bybit_rows(now_ms, int(q["limit"]))}}, 100
-    monkeypatch.setattr(st, "http_get_json", fake)
-    rows, src = bot._fetch_seed_klines("AUSDT")
-    n = st.klines_needed(int(time.time() * 1000), 14)
-    assert src == "bybit" and len(rows) == n and rows[0][0] < rows[-1][0]
-    assert all(r[6] == r[0] + 59_999 for r in rows)
-    # Más de 1000: dos peticiones, la segunda hacia atrás.
+        ex = next(k for k, b in st.ALT_URLS.items() if url.startswith(b))
+        pedidos.append((ex, q))
+        if ex == "bybit":
+            return _respuestas(ex, int(time.time() * 1000), int(q["start"]), int(q["end"]))
+        assert q["symbol"] == "XBTUSDTM"
+        return _respuestas(ex, int(time.time() * 1000), int(q["from"]), int(q["to"]))
+    bot._alt_http = http
+    rows = bot._alt_klines("bybit", "AUSDT", 1441)
+    assert [p[0] for p in pedidos] == ["bybit"] * 3 and len(rows) == 1441     # prueba + 2 páginas
+    assert all(r[6] == r[0] + 59_999 and r[2] == 1.01 and r[3] == 0.99 for r in rows)
     pedidos.clear()
-    largas = bot._bybit_klines("AUSDT", 1441)
-    assert len(pedidos) == 2 and int(pedidos[1]["limit"]) == 441 and len(largas) == 1441
-    assert len({r[0] for r in largas}) == 1441
+    rows = bot._alt_klines("kucoin", "BTCUSDT", 1200)
+    assert len(pedidos) == 1 + 3 and len(rows) == 1200
 
 
-def test_las_velas_de_bybit_no_se_mezclan_con_las_de_binance(tmp_path, monkeypatch):
+def test_velas_de_otro_exchange_no_se_mezclan_y_rellenan_minutos_sin_operaciones(tmp_path, monkeypatch):
     bot = _bot_sin_red(tmp_path, monkeypatch)
     _abierta_ratio(bot, st.ENGINE_RATIO_TP, 51)
-    bot.set_ind_config(enabled={st.ENGINE_RATIO_TP: True}, source="bybit")
+    bot.set_ind_config(enabled={st.ENGINE_RATIO_TP: True})
     rows = [[i * 60_000, 1, 1, 1, 1, 1, i * 60_000 + 59_999] for i in range(1, 40)]
-    bot._ind_seeded("AUSDT", rows, "bybit")
+    bot._ind_seeded("AUSDT", rows, "coinbase")
     ind = bot._ind["AUSDT"]
     bot._ind_candle("AUSDT", 40 * 60_000, 1, 1, 1, 1)                  # del WS de Binance: se ignora
     assert ind.last_open == 39 * 60_000
-    bot._ind_candle("AUSDT", 40 * 60_000, 1, 1, 1, 1, "bybit")
-    assert ind.last_open == 40 * 60_000 and bot.ind_snapshot()["symbols"]["AUSDT"]["src"] == "bybit"
-    with pytest.raises(ValueError):
-        bot.set_ind_config(source="okx")
+    bot._ind_candle("AUSDT", 42 * 60_000, 1.2, 1.1, 1.15, 3, "coinbase")  # sin velas en 40 y 41
+    assert ind.last_open == 42 * 60_000 and ind.count == 42 and "AUSDT" in bot._ind
+    assert bot.ind_snapshot()["symbols"]["AUSDT"]["src"] == "coinbase"
+
+
+def test_el_libro_se_toma_del_websocket_depth20(tmp_path, monkeypatch):
+    import asyncio
+    monkeypatch.setattr(st, "SETTINGS_FILE", str(tmp_path / "s.json"))
+    bot = st.KlineBot()
+    urls = []
+
+    async def fake_ws(url):
+        urls.append(url)
+        if "/public/" in url:
+            raise OSError("404")
+        yield '{"e":"depthUpdate","s":"AUSDT","b":[["0.99","3"]],"a":[["1.01","4"]]}'
+    monkeypatch.setattr(st, "_ws_messages", fake_ws)
+    bids, asks = asyncio.run(bot._ws_depth("AUSDT"))
+    assert bids == [["0.99", "3"]] and asks == [["1.01", "4"]]
+    assert urls == ["wss://fstream.binance.com/public/ws/ausdt@depth20@100ms",
+                    "wss://fstream.binance.com/market/ws/ausdt@depth20@100ms"]

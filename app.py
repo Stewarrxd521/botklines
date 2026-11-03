@@ -112,6 +112,26 @@ BASE_URL    = os.getenv("BASE_URL", "https://fapi.binance.com")
 QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDT")
 # Proxy HTTP opcional SOLO para la única consulta REST del arranque (exchangeInfo).
 REST_PROXY_URL = os.getenv("REST_PROXY_URL", "").strip()   # http://usuario:clave@host:puerto (variable de entorno)
+# Proxies SOLO para el REST de Binance (ratio de top traders): se usan, rotando, mientras la IP
+# directa esté vetada (418/429). REST_PROXY_URLS (separadas por comas) reemplaza esta lista.
+_DEFAULT_PROXIES = (
+    "http://fixie:JoXk8xTakh7l345@ventoux.usefixie.com:80,"
+    "http://fixie:cRuvdj10B4X67d1@ventoux.usefixie.com:80,"
+    "http://fixie:i3vqqjb7isp0bWq@ventoux.usefixie.com:80,"
+    "http://fixie:GHbIB5zTUESRi7O@ventoux.usefixie.com:80,"
+    "http://fixie:MNNq7XkuOq55G52@ventoux.usefixie.com:80"
+)
+REST_PROXIES = list(dict.fromkeys(
+    [u.strip() for u in os.getenv("REST_PROXY_URLS", _DEFAULT_PROXIES).split(",") if u.strip()]
+    + ([REST_PROXY_URL] if REST_PROXY_URL else [])))
+
+
+def proxy_label(url: str) -> str:
+    """Nombre corto de una ruta para logs y la web, sin la clave."""
+    if not url:
+        return "IP directa"
+    p = urlsplit(url)
+    return f"proxy {p.username or ''}@{p.hostname or ''}#{REST_PROXIES.index(url) + 1 if url in REST_PROXIES else '?'}"
 INITIAL_SYMBOLS = [s.strip().upper() for s in os.getenv("INITIAL_SYMBOLS", "").split(",") if s.strip()]
 SYMBOLS_CACHE_FILE = os.getenv(
     "SYMBOLS_CACHE_FILE", os.path.join(tempfile.gettempdir(), "futures_symbols_cache.json"))
@@ -235,16 +255,23 @@ BOOK_FILL = os.getenv("BOOK_FILL", "true").lower() in ("1", "true", "yes")
 BOOK_DEPTH = 20
 BOOK_MAX_AGE_S = float(os.getenv("BOOK_MAX_AGE_S", "1.5"))     # libro reutilizable (los 3 bots de ratio)
 BOOK_TIMEOUT_S = float(os.getenv("BOOK_TIMEOUT_S", "2"))
+# El libro se toma por WebSocket (sin REST). Desde 2026-04 el libro va por /public; se prueban en orden.
+BOOK_WS_URLS = [u.strip().rstrip("/") for u in os.getenv(
+    "BOOK_WS_URLS", "wss://fstream.binance.com/public/ws,wss://fstream.binance.com/market/ws,"
+                    "wss://fstream.binance.com/ws").split(",") if u.strip()]
 # TP por RSI + VWAP ±kσ (UTC) de los bots de ratio, con velas 1m: REST una vez y WebSocket después.
 IND_RSI_PERIOD = int(os.getenv("IND_RSI_PERIOD", "14"))
 IND_RSI_LEVEL = float(os.getenv("IND_RSI_LEVEL", "13"))       # SHORT: RSI < 13 · LONG: RSI > 87
 IND_VWAP_K = float(os.getenv("IND_VWAP_K", "2.5"))
-# Velas del RSI/VWAP: "auto" = Binance (REST una vez + WebSocket) y Bybit si el REST de Binance está
-# bloqueado (418/429); "bybit" = siempre Bybit (REST al cargar + 1 petición pequeña por minuto).
-IND_SOURCES = ("auto", "binance", "bybit")
-IND_SOURCE = os.getenv("IND_SOURCE", "auto").strip().lower()
-IND_SOURCE = IND_SOURCE if IND_SOURCE in IND_SOURCES else "auto"
-BYBIT_URL = os.getenv("BYBIT_URL", "https://api.bybit.com").rstrip("/")
+# Velas del RSI/VWAP: se piden por REST a otros exchanges, en este orden (el primero que tenga el
+# par); Binance solo como último recurso, para no gastar su REST (solo el ratio lo usa).
+IND_EXCHANGES = [x.strip().lower() for x in os.getenv("IND_EXCHANGES", "bybit,kucoin,coinbase,binance").split(",")
+                 if x.strip().lower() in ("bybit", "kucoin", "coinbase", "binance")] or ["binance"]
+ALT_URLS = {"bybit": os.getenv("BYBIT_URL", "https://api.bybit.com").rstrip("/"),
+            "kucoin": os.getenv("KUCOIN_URL", "https://api-futures.kucoin.com").rstrip("/"),
+            "coinbase": os.getenv("COINBASE_URL", "https://api.exchange.coinbase.com").rstrip("/")}
+ALT_MAX_ROWS = {"bybit": 1000, "kucoin": 500, "coinbase": 290}     # velas por petición
+EX_LABEL = {"bybit": "Bybit", "kucoin": "KuCoin", "coinbase": "Coinbase", "binance": "Binance"}
 
 
 def price_stream_for(klines_on: bool, fast: bool = True) -> str:
@@ -947,8 +974,11 @@ class KlineBot:
         self.ratio_last_cycle_ts = 0.0
         self.ratio_next_cycle_ts = 0.0
         self._rest_block_until = 0.0
-        self._rest_route = 0
         self._route_block: Dict[str, float] = {}        # ruta REST ("" = IP directa, o el proxy) → bloqueada hasta
+        self._route_ok: Dict[str, int] = {}
+        self._route_errors: Dict[str, int] = {}
+        self._proxy_rr = 0
+        self._rest_last_route: Optional[str] = None
         self._rest_times: Deque[float] = deque()      # peticiones de los últimos 5 min
         self._scan_seen: Optional[set] = None         # símbolos vistos en la exploración en curso
         self._filters_ts = 0.0                        # cuándo se obtuvieron los filtros de cantidad
@@ -989,7 +1019,9 @@ class KlineBot:
         self._ind_reset = False
         self._ind_seeding: set = set()
         self._ind_src: Dict[str, str] = {}            # símbolo → exchange de sus velas (binance | bybit)
-        self.rx_alt_bytes = 0                          # REST a Bybit (velas)                # símbolos con carga REST programada o en curso
+        self.rx_alt_bytes = 0                          # REST a otros exchanges (velas)
+        self._alt_sym: Dict[Tuple[str, str], str] = {}        # (exchange, par) → nombre allí
+        self._alt_missing: Dict[Tuple[str, str], float] = {}  # (exchange, par) sin velas → cuándo se vio                # símbolos con carga REST programada o en curso
         self.ind_seeds = 0
         self.ind_hits = 0
         self.max_open = (int(settings["max_open"]) if settings.get("max_open") is not None
@@ -1398,7 +1430,7 @@ class KlineBot:
             self._supervised(self._maintenance_loop, "maintenance"),
             *([self._supervised(self._ticker_loop, "ticker")] if TICKER_MODE == "ws" else []),
             self._supervised(self._ratio_loop, "ratio"),
-            self._supervised(self._ind_bybit_loop, "velas Bybit"),
+            self._supervised(self._ind_alt_loop, "velas de otros exchanges"),
             self._supervised(self._symbols_retry_loop, "symbols"),
         )
 
@@ -1841,32 +1873,39 @@ class KlineBot:
         b = self._books.get(sym)
         return b is not None and time.time() - b[0] <= BOOK_MAX_AGE_S
 
-    def _fetch_book(self, sym: str) -> None:
-        """Libro de 20 niveles por REST (bloqueante: fuera del loop). Si falla, el mejor
-        bid/ask (bookTicker). Respeta la pausa de REST tras un 418/429."""
-        if time.time() < self._rest_block_until:
-            return
+    async def _ws_depth(self, sym: str) -> Optional[Tuple[list, list]]:
+        """Foto del libro de 20 niveles por WebSocket (<par>@depth20@100ms: se conecta, toma el
+        primer mensaje y se cierra). No usa REST ni consume peso de la IP en Binance."""
+        stream = f"{sym.lower()}@depth20@100ms"
+        last_exc: Optional[Exception] = None
+        for base in BOOK_WS_URLS:
+            try:
+                agen = _ws_messages(f"{base}/{stream}")
+                try:
+                    msg = await asyncio.wait_for(agen.__anext__(), BOOK_TIMEOUT_S)
+                finally:
+                    await agen.aclose()
+                d = json.loads(msg)
+                d = d.get("data", d) if isinstance(d, dict) else {}
+                bids, asks = d.get("b") or d.get("bids") or [], d.get("a") or d.get("asks") or []
+                if bids or asks:
+                    return bids, asks
+            except Exception as exc:
+                last_exc = exc
+        raise RuntimeError(f"sin libro por WebSocket: {last_exc!r}")
+
+    async def _load_book(self, sym: str) -> None:
         self.book_fetches += 1
         try:
-            d = self._rest_get("/fapi/v1/depth", {"symbol": sym, "limit": BOOK_DEPTH}, BOOK_TIMEOUT_S)
-            bids, asks = (d.get("bids") or [], d.get("asks") or []) if isinstance(d, dict) else ([], [])
-            if bids or asks:
-                self._books[sym] = (time.time(), bids, asks, "libro")
-                return
+            bids, asks = await self._ws_depth(sym)
+            self._books[sym] = (time.time(), bids, asks, "libro")
         except Exception as exc:
             self.book_errors += 1
             self.last_error = f"libro {sym}: {exc}"
-        if time.time() < self._rest_block_until:
-            return
-        try:
-            d = self._rest_get("/fapi/v1/ticker/bookTicker", {"symbol": sym}, BOOK_TIMEOUT_S)
-            bid, ask = float(d.get("bidPrice") or 0), float(d.get("askPrice") or 0)
-            if bid > 0 or ask > 0:
-                self._books[sym] = (time.time(), [[bid, float("inf")]] if bid > 0 else [],
-                                    [[ask, float("inf")]] if ask > 0 else [], "mejor ask/bid")
-        except Exception as exc:
-            self.book_errors += 1
-            self.last_error = f"bookTicker {sym}: {exc}"
+
+    def _fetch_book(self, sym: str) -> None:
+        """Versión bloqueante (fuera del loop del bot: pruebas, hilos)."""
+        asyncio.run(self._load_book(sym))
 
     def _fill_from_book(self, sym: str, buy: bool, qty: float, fallback: float) -> Tuple[float, str]:
         """Precio de una orden de mercado de `qty`: el libro reciente (asks si compra, bids si
@@ -1883,10 +1922,10 @@ class KlineBot:
 
     def _with_fill(self, sym: str, buy: bool, qty: float, fallback: float, cont) -> None:
         """cont(precio, origen) con el precio de ejecución en papel. Si hay que pedir el libro y
-        estamos en el loop del bot, se pide en un hilo y cont corre al volver (no bloquea el loop)."""
+        estamos en el loop del bot, se pide en segundo plano y cont corre al volver (no bloquea)."""
         if not BOOK_FILL:
             return cont(fallback, "")
-        if self._book_fresh(sym) or time.time() < self._rest_block_until:
+        if self._book_fresh(sym):
             return cont(*self._fill_from_book(sym, buy, qty, fallback))
         if not self._on_loop():
             self._fetch_book(sym)
@@ -1899,9 +1938,9 @@ class KlineBot:
                 self.last_error = f"{sym}: {exc!r}"
                 self.log(f"[libro] error tras pedir el libro de {sym}: {exc!r}")
 
-        fut = self._book_inflight.get(sym)              # una sola petición por par aunque cierren varias
+        fut = self._book_inflight.get(sym)              # una sola foto por par aunque cierren varias
         if fut is None:
-            fut = self.loop.run_in_executor(None, self._fetch_book, sym)
+            fut = asyncio.ensure_future(self._load_book(sym))
             self._book_inflight[sym] = fut
             fut.add_done_callback(lambda _f: self._book_inflight.pop(sym, None))
         fut.add_done_callback(done)
@@ -2388,24 +2427,31 @@ class KlineBot:
             open_syms = {p.symbol for n in names for p in self.engines[n].positions.values() if not p.revenge}
         return list(dict.fromkeys(list(self.watch) + sorted(open_syms)))
 
-    def _rest_get(self, path: str, params: Optional[dict] = None, timeout: float = 15.0):
-        """GET público a Binance (gzip) por el proxy y/o la IP directa. Un 429/418 bloquea SOLO esa
-        ruta (es la IP la que queda vetada) y se sigue por la otra; con todas bloqueadas no sale
-        ninguna petición hasta que venza el bloqueo (insistir lo alarga)."""
-        routes = [REST_PROXY_URL, ""] if REST_PROXY_URL else [""]
-        order = routes[self._rest_route:] + routes[:self._rest_route]
+    def _rest_routes(self) -> List[str]:
+        """Orden de rutas para el REST de Binance: la IP directa mientras no esté vetada; si lo
+        está, las proxies rotando (una distinta en cada petición) y saltando las vetadas."""
         now = time.time()
-        order = [r for r in order if self._route_block.get(r, 0.0) <= now]
+        free = [r for r in [""] + REST_PROXIES if self._route_block.get(r, 0.0) <= now]
+        if "" in free:
+            return [""] + [r for r in free if r]
+        if not free:
+            return []
+        k = self._proxy_rr % len(free)
+        self._proxy_rr += 1
+        return free[k:] + free[:k]
+
+    def _rest_get(self, path: str, params: Optional[dict] = None, timeout: float = 15.0):
+        """GET público a Binance (gzip). Un 429/418 veta SOLO la ruta que lo recibió (es la IP la que
+        queda bloqueada) y se sigue por la siguiente; con todas vetadas no sale ninguna petición hasta
+        que venza el veto (insistir lo alarga)."""
+        order = self._rest_routes()
         if not order:
-            raise RuntimeError(f"REST de Binance en pausa {self._rest_block_until - now:.0f} s (418/429)")
+            raise RuntimeError(f"REST de Binance en pausa {self._rest_block_until - time.time():.0f} s (418/429 en todas las rutas)")
         url = f"{BASE_URL}{path}" + (f"?{urlencode(params)}" if params else "")
         last_exc: Optional[Exception] = None
-        for proxy in order:
+        for route in order:
             try:
-                data, nbytes = http_get_json(url, proxy, timeout)
-                self.rx_rest_bytes += nbytes
-                self._rest_route = routes.index(proxy)
-                return data
+                data, nbytes = http_get_json(url, route, timeout)
             except urllib.error.HTTPError as exc:
                 if exc.code not in (418, 429):
                     raise RuntimeError(f"HTTP {exc.code}")
@@ -2413,18 +2459,34 @@ class KlineBot:
                     wait = float(exc.headers.get("Retry-After") or 60)
                 except (TypeError, ValueError):
                     wait = 60.0
-                self._route_block[proxy] = time.time() + max(wait, 30.0)
+                self._route_block[route] = time.time() + max(wait, 30.0)
+                routes = [""] + REST_PROXIES
                 left = [r for r in routes if self._route_block.get(r, 0.0) <= time.time()]
                 self._rest_block_until = 0.0 if left else min(self._route_block[r] for r in routes)
-                self.log(f"[REST] Binance respondió {exc.code} por {'el proxy' if proxy else 'la IP directa'} en "
-                         f"{path}: esa ruta queda en pausa {max(wait, 30.0):.0f} s"
-                         f"{' (se sigue por la otra)' if left else ''}")
+                self.log(f"[REST] Binance respondió {exc.code} por {proxy_label(route)} en {path}: esa ruta queda "
+                         f"en pausa {max(wait, 30.0):.0f} s{f' · quedan {len(left)} ruta(s)' if left else ' · sin rutas libres'}")
                 last_exc = RuntimeError(f"HTTP {exc.code}")
+                continue
             except Exception as exc:
                 last_exc = exc
+                self._route_errors[route] = self._route_errors.get(route, 0) + 1
+                continue
+            self.rx_rest_bytes += nbytes
+            self._route_ok[route] = self._route_ok.get(route, 0) + 1
+            if route != self._rest_last_route:
+                if route or self._rest_last_route is not None:
+                    self.log(f"[REST] Binance ahora por {proxy_label(route)}")
+                self._rest_last_route = route
+            return data
         if isinstance(last_exc, RuntimeError) and str(last_exc).startswith("HTTP"):
             raise last_exc
         raise RuntimeError(f"sin respuesta: {last_exc}")
+
+    def rest_routes_snapshot(self) -> List[dict]:
+        now = time.time()
+        return [{"route": proxy_label(r), "blocked_s": max(0.0, self._route_block.get(r, 0.0) - now),
+                 "ok": self._route_ok.get(r, 0), "errors": self._route_errors.get(r, 0),
+                 "current": r == self._rest_last_route} for r in [""] + REST_PROXIES]
 
     def _fetch_ratio(self, symbol: str) -> List[Tuple[int, float]]:
         data = self._rest_get("/futures/data/topLongShortAccountRatio",
@@ -2571,7 +2633,7 @@ class KlineBot:
 
     async def _prefetch_book(self, sym: str) -> None:
         if BOOK_FILL and not self._book_fresh(sym):
-            await asyncio.to_thread(self._fetch_book, sym)
+            await self._load_book(sym)
 
     def _ratio_check_tp(self, sym: str, pts: List[Tuple[int, float]]) -> None:
         """TP por ratio: el ratio recupera el % que se movió (en los bots que lo tienen activo)."""
@@ -2615,16 +2677,14 @@ class KlineBot:
                "rsi_level": num("rsi_level", IND_RSI_LEVEL, 0.1, 49.9),
                "vwap_k": num("vwap_k", IND_VWAP_K, 0.1, 10.0),
                "use_rsi": bool(raw.get("use_rsi", True)),
-               "use_vwap": bool(raw.get("use_vwap", True)),
-               "source": raw.get("source") if raw.get("source") in IND_SOURCES else IND_SOURCE}
+               "use_vwap": bool(raw.get("use_vwap", True))}
         if not (cfg["use_rsi"] or cfg["use_vwap"]):
             cfg["use_rsi"] = cfg["use_vwap"] = True
         return cfg
 
     def set_ind_config(self, enabled: Optional[Dict[str, bool]] = None, rsi_period: Optional[int] = None,
                        rsi_level: Optional[float] = None, vwap_k: Optional[float] = None,
-                       use_rsi: Optional[bool] = None, use_vwap: Optional[bool] = None,
-                       source: Optional[str] = None) -> dict:
+                       use_rsi: Optional[bool] = None, use_vwap: Optional[bool] = None) -> dict:
         """En caliente: encender/apagar el TP por RSI/VWAP de cada bot de ratio y sus parámetros
         (comunes a los tres). Cambiar el periodo del RSI recarga las velas (1 REST por símbolo)."""
         old = self.ind_cfg
@@ -2649,10 +2709,6 @@ class KlineBot:
             new["use_rsi"] = bool(use_rsi)
         if use_vwap is not None:
             new["use_vwap"] = bool(use_vwap)
-        if source is not None:
-            if source not in IND_SOURCES:
-                raise ValueError("source debe ser auto, binance o bybit")
-            new["source"] = source
         if not (new["use_rsi"] or new["use_vwap"]):
             raise ValueError("activa al menos el RSI o el VWAP")
         if new == old:
@@ -2665,8 +2721,6 @@ class KlineBot:
         for key, label in (("use_rsi", "RSI"), ("use_vwap", "VWAP")):
             if new[key] != old[key]:
                 changes.append(f"{label} {'usado' if new[key] else 'ignorado'}")
-        if new["source"] != old["source"]:
-            changes.append(f"velas de {old['source']} → {new['source']}")
         self.ind_cfg = new
         if new["rsi_period"] != old["rsi_period"]:
             self._ind_reset = True                     # otro periodo: se recargan las velas
@@ -2693,11 +2747,6 @@ class KlineBot:
             self._ind.clear()
             self._ind_buf.clear()
             self._ind_src.clear()
-        fixed = self.ind_cfg.get("source")
-        if fixed in ("binance", "bybit"):              # fuente elegida a mano: se recargan los de la otra
-            for sym in [x for x, src in self._ind_src.items() if src != fixed]:
-                self._ind.pop(sym, None)
-                self._ind_src.pop(sym, None)
         for sym in set(self._ind) | set(self._ind_buf):
             if sym not in want:
                 self._ind.pop(sym, None)
@@ -2705,10 +2754,8 @@ class KlineBot:
                 self._ind_err.pop(sym, None)
                 self._ind_src.pop(sym, None)
         pc = self.price_cache
-        if pc is not None:                             # kline de Binance solo de los que no van por Bybit
-            ws = set() if self.ind_cfg.get("source") == "bybit" else \
-                {x for x in want if self._ind_src.get(x) != "bybit"}
-            pc.set_kline_symbols(ws, self._on_ws_kline)
+        if pc is not None:                             # kline del WS de Binance: solo los cargados de Binance
+            pc.set_kline_symbols({x for x in want if self._ind_src.get(x) == "binance"}, self._on_ws_kline)
         for sym in sorted(want - set(self._ind)):
             self._ind_buf.setdefault(sym, [])
             if sym not in self._ind_seeding:          # p. ej. recuperada antes de arrancar el loop
@@ -2728,72 +2775,119 @@ class KlineBot:
 
         loop.call_later(delay, go) if delay > 0 else go()
 
-    def _seed_source(self) -> str:
-        """De dónde se cargan las velas: Binance salvo que se elija Bybit, o que esté en "auto" y el
-        REST de Binance esté bloqueado (418/429)."""
-        src = self.ind_cfg.get("source", "auto")
-        if src == "auto":
-            return "bybit" if time.time() < self._rest_block_until else "binance"
-        return src
-
     def _fetch_seed_klines(self, sym: str) -> Tuple[list, str]:
-        """(velas [open_time, o, h, l, c, v, close_time] de la más vieja a la más nueva, origen)."""
+        """(velas [open_time, o, h, l, c, v, close_time] de la más vieja a la más nueva, exchange).
+        Prueba los exchanges de IND_EXCHANGES en orden; Binance (REST) es el último recurso."""
         n = klines_needed(int(time.time() * 1000), self.ind_cfg["rsi_period"])
-        if self._seed_source() == "binance":
+        errors = []
+        for ex in IND_EXCHANGES:
             try:
-                self._rest_times.append(time.time())
-                data = self._rest_get("/fapi/v1/klines", {"symbol": sym, "interval": "1m", "limit": n}, 10.0)
-                if not isinstance(data, list):
-                    raise RuntimeError("respuesta de velas inesperada")
-                return data, "binance"
+                if ex == "binance":
+                    self._rest_times.append(time.time())
+                    data = self._rest_get("/fapi/v1/klines", {"symbol": sym, "interval": "1m", "limit": n}, 10.0)
+                    if not isinstance(data, list) or not data:
+                        raise RuntimeError("respuesta de velas inesperada")
+                    return data, "binance"
+                return self._alt_klines(ex, sym, n), ex
             except Exception as exc:
-                if self.ind_cfg.get("source") != "auto":
-                    raise
-                self.log(f"[RSI/VWAP] {sym}: Binance no dio las velas ({exc}); las pido a Bybit")
-        return self._bybit_klines(sym, n), "bybit"
+                errors.append(f"{EX_LABEL[ex]}: {exc}")
+        raise RuntimeError(" · ".join(errors))
 
-    def _bybit_get(self, params: dict, timeout: float = 10.0) -> list:
-        url = f"{BYBIT_URL}/v5/market/kline?" + urlencode({"category": "linear", "interval": "1", **params})
-        last_exc: Optional[Exception] = None
-        for proxy in ([""] + ([REST_PROXY_URL] if REST_PROXY_URL else [])):
+    # ── Velas de otros exchanges (Bybit, KuCoin futuros, Coinbase) ────────────
+
+    @staticmethod
+    def _alt_candidates(ex: str, sym: str) -> List[str]:
+        """Nombres posibles del par en cada exchange. Un "1000PEPE" se prueba también sin el
+        prefijo: la escala del precio no importa (RSI y VWAP se comparan con velas del mismo sitio)."""
+        base = sym[:-4] if sym.endswith("USDT") else sym
+        bases = [base]
+        for pre in ("1000000", "10000", "1000"):
+            if base.startswith(pre) and len(base) > len(pre):
+                bases.append(base[len(pre):])
+                break
+        if ex == "bybit":
+            return [b + "USDT" for b in bases]
+        if ex == "kucoin":
+            return [("XBT" if b == "BTC" else b) + "USDTM" for b in bases]
+        return [f"{b}-USD" for b in bases] + [f"{b}-USDT" for b in bases]
+
+    def _alt_http(self, url: str, timeout: float = 10.0):
+        """GET a otro exchange por la IP directa (las proxies son solo para Binance)."""
+        try:
+            data, nbytes = http_get_json(url, "", timeout)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (400, 404):
+                raise LookupError(f"HTTP {exc.code}")
+            raise RuntimeError(f"HTTP {exc.code}")
+        self.rx_alt_bytes += nbytes
+        return data
+
+    def _alt_window(self, ex: str, symx: str, start_ms: int, end_ms: int) -> list:
+        """Velas 1m con apertura en [start_ms, end_ms], normalizadas y de la más vieja a la más nueva.
+        LookupError si el exchange no tiene el par."""
+        base = ALT_URLS[ex]
+        out = []
+        if ex == "bybit":
+            q = urlencode({"category": "linear", "symbol": symx, "interval": "1", "start": start_ms,
+                           "end": end_ms, "limit": ALT_MAX_ROWS["bybit"]})
+            d = self._alt_http(f"{base}/v5/market/kline?{q}")
+            if not isinstance(d, dict) or d.get("retCode") != 0:
+                raise LookupError(f"{(d or {}).get('retMsg') if isinstance(d, dict) else d}")
+            for r in (d.get("result") or {}).get("list") or []:      # [inicio, o, h, l, c, vol, turnover]
+                out.append((int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])))
+        elif ex == "kucoin":
+            q = urlencode({"symbol": symx, "granularity": 1, "from": start_ms, "to": end_ms})
+            d = self._alt_http(f"{base}/api/v1/kline/query?{q}")
+            if not isinstance(d, dict) or str(d.get("code")) != "200000":
+                raise LookupError(f"{(d or {}).get('msg') if isinstance(d, dict) else d}")
+            for r in d.get("data") or []:                             # [inicio, o, h, l, c, vol (lotes)]
+                out.append((int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])))
+        else:
+            iso = lambda ms: datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            q = urlencode({"granularity": 60, "start": iso(start_ms), "end": iso(end_ms)})
+            d = self._alt_http(f"{base}/products/{symx}/candles?{q}")
+            if not isinstance(d, list):
+                raise LookupError(f"{(d or {}).get('message') if isinstance(d, dict) else d}")
+            for r in d:                                               # [inicio s, low, high, open, close, vol]
+                out.append((int(r[0]) * 1000, float(r[3]), float(r[2]), float(r[1]), float(r[4]), float(r[5])))
+        return [[t, o, h, lo, c, v, t + 59_999] for t, o, h, lo, c, v in sorted(out) if start_ms <= t <= end_ms]
+
+    def _alt_symbol(self, ex: str, sym: str) -> str:
+        """Nombre del par en `ex` (se prueba con las últimas velas y se recuerda). LookupError si no
+        lo tiene (también se recuerda 6 h para no repetir peticiones inútiles)."""
+        key = (ex, sym)
+        if key in self._alt_sym:
+            return self._alt_sym[key]
+        if time.time() - self._alt_missing.get(key, 0.0) < 6 * 3600:
+            raise LookupError("no tiene el par")
+        now_min = int(time.time() * 1000) // 60_000 * 60_000
+        for cand in self._alt_candidates(ex, sym):
             try:
-                data, nbytes = http_get_json(url, proxy, timeout)
-                self.rx_alt_bytes += nbytes
-            except Exception as exc:
-                last_exc = exc
+                if self._alt_window(ex, cand, now_min - 10 * 60_000, now_min):
+                    self._alt_sym[key] = cand
+                    return cand
+            except LookupError:
                 continue
-            if not isinstance(data, dict) or data.get("retCode") != 0:
-                raise RuntimeError(f"Bybit: {(data or {}).get('retMsg') if isinstance(data, dict) else data}")
-            return ((data.get("result") or {}).get("list")) or []
-        raise RuntimeError(f"Bybit sin respuesta: {last_exc}")
+        self._alt_missing[key] = time.time()
+        raise LookupError("no tiene el par")
 
-    def _bybit_klines(self, sym: str, n: int) -> list:
-        """Velas 1m de Bybit (perpetuo lineal del mismo nombre), hasta 1000 por petición: con más,
-        una segunda petición hacia atrás. Mismo formato que las de Binance (volumen en la moneda base)."""
-        rows: Dict[int, list] = {}
-        end = None
-        while len(rows) < n:
-            params = {"symbol": sym, "limit": min(1000, n - len(rows))}
-            if end is not None:
-                params["end"] = end
-            got = self._bybit_get(params)
-            if not got:
-                break
-            for r in got:                              # [inicio, o, h, l, c, volumen, turnover], nueva → vieja
-                t = int(r[0])
-                rows[t] = [t, float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5]), t + 59_999]
-            end = min(int(r[0]) for r in got) - 1
-            if len(got) < params["limit"]:
-                break
+    def _alt_klines(self, ex: str, sym: str, n: int) -> list:
+        """Las últimas `n` velas 1m (incluida la en curso) de otro exchange, en tantas peticiones
+        como pida su máximo por petición (Bybit 1000, KuCoin 500, Coinbase 290)."""
+        symx = self._alt_symbol(ex, sym)
+        now_min = int(time.time() * 1000) // 60_000 * 60_000
+        t, rows = now_min - (n - 1) * 60_000, {}
+        while t <= now_min:
+            end = min(now_min, t + (ALT_MAX_ROWS[ex] - 1) * 60_000)
+            for r in self._alt_window(ex, symx, t, end):
+                rows[r[0]] = r
+            t = end + 60_000
         if not rows:
-            raise RuntimeError(f"Bybit no tiene velas de {sym}")
-        return [rows[t] for t in sorted(rows)]
+            raise LookupError("sin velas")
+        return [rows[k] for k in sorted(rows)]
 
     async def _ind_seed(self, sym: str) -> None:
         """Carga inicial por REST (una petición) de las velas que piden el RSI y el VWAP del día."""
-        wait = self._rest_block_until - time.time()
-        if wait > 0 and self._seed_source() == "binance":
-            return self._schedule_seed(sym, wait + 1)
         try:
             rows, src = await asyncio.to_thread(self._fetch_seed_klines, sym)
         except Exception as exc:
@@ -2824,31 +2918,31 @@ class KlineBot:
         self._ind_seed_ts[sym] = time.time()
         self.ind_seeds += 1
         b = ind.bands(self.ind_cfg["vwap_k"])
-        self.log(f"[RSI/VWAP] {sym}: {ind.count} velas de {'Bybit' if src == 'bybit' else 'Binance'} por REST "
+        self.log(f"[RSI/VWAP] {sym}: {ind.count} velas de {EX_LABEL.get(src, src)} por REST "
                  f"({ind.day_candles} de hoy UTC) | RSI {ind.rsi if ind.rsi is not None else float('nan'):.1f} | "
                  f"VWAP {b[1] if b else 0:g} ±{self.ind_cfg['vwap_k']:g}σ [{b[0] if b else 0:g} · {b[2] if b else 0:g}]; "
-                 f"sigue vela a vela por {'REST de Bybit cada minuto' if src == 'bybit' else 'WebSocket de Binance'}")
-        if src == "bybit":
-            self._sync_indicators()                    # ya no hace falta su kline de Binance
+                 f"sigue vela a vela por {'WebSocket de Binance' if src == 'binance' else f'REST de {EX_LABEL.get(src, src)} cada minuto'}")
+        self._sync_indicators()                        # kline del WS de Binance solo si vienen de Binance
 
-    async def _ind_bybit_loop(self) -> None:
-        """Pares cargados desde Bybit: su última vela cerrada, una petición pequeña por minuto
-        (así el RSI y el VWAP siguen con velas del mismo exchange)."""
+    async def _ind_alt_loop(self) -> None:
+        """Pares cargados de otro exchange: sus últimas velas cerradas, una petición pequeña por
+        minuto al MISMO exchange (no se mezclan volúmenes de mercados distintos)."""
         while self.running:
-            now = time.time()
-            await asyncio.sleep(60 - now % 60 + 2)     # 2 s después de cada cierre de minuto
-            syms = [s for s, src in self._ind_src.items() if src == "bybit" and s in self._ind]
-            for sym in syms:
-                try:
-                    got = await asyncio.to_thread(self._bybit_get, {"symbol": sym, "limit": 3})
-                except Exception as exc:
-                    self._ind_err[sym] = str(exc)
+            await asyncio.sleep(60 - time.time() % 60 + 2)     # 2 s después de cada cierre de minuto
+            for sym, ex in list(self._ind_src.items()):
+                if ex == "binance" or sym not in self._ind:
                     continue
-                now_ms = time.time() * 1000
-                for r in sorted(got, key=lambda r: int(r[0])):
-                    t = int(r[0])
-                    if t + 60_000 <= now_ms:
-                        self._ind_candle(sym, t, float(r[2]), float(r[3]), float(r[4]), float(r[5]), "bybit")
+                now_min = int(time.time() * 1000) // 60_000 * 60_000
+                try:
+                    symx = self._alt_sym[(ex, sym)]
+                    got = await asyncio.to_thread(self._alt_window, ex, symx, now_min - 4 * 60_000, now_min)
+                except Exception as exc:
+                    self._ind_err[sym] = f"{EX_LABEL[ex]}: {exc}"
+                    continue
+                self._ind_err.pop(sym, None)
+                for r in got:
+                    if r[0] + 60_000 <= time.time() * 1000:
+                        self._ind_candle(sym, r[0], r[2], r[3], r[4], r[5], ex)
 
     def _on_ws_kline(self, sym: str, t: int, o: float, h: float, lo: float, c: float, v: float) -> None:
         loop = self.loop                               # hilo del WS: al loop del bot
@@ -2857,7 +2951,7 @@ class KlineBot:
 
     def _ind_candle(self, sym: str, t: int, h: float, lo: float, c: float, v: float, src: str = "binance") -> None:
         """Vela 1m cerrada: actualiza RSI y VWAP del símbolo y revisa el TP. Solo cuentan las velas
-        del exchange del que se cargó (no se mezclan volúmenes de Binance y Bybit)."""
+        del exchange del que se cargó (no se mezclan volúmenes de mercados distintos)."""
         buf = self._ind_buf.get(sym)
         if buf is not None:
             if src == "binance":
@@ -2866,6 +2960,10 @@ class KlineBot:
         ind = self._ind.get(sym)
         if ind is None or t <= ind.last_open or self._ind_src.get(sym, "binance") != src:
             return
+        if src != "binance" and t - ind.last_open <= 15 * 60_000:
+            # Coinbase no publica minutos sin operaciones: se rellenan planos (sin volumen).
+            for gap in range(ind.last_open + 60_000, t, 60_000):
+                ind.add(gap, ind.close, ind.close, ind.close, 0.0)
         if t > ind.last_open + 60_000:                 # faltan velas (reconexión): se recarga por REST
             self.log(f"[RSI/VWAP] {sym}: hueco de {(t - ind.last_open) // 60_000 - 1} vela(s); recargo por REST")
             del self._ind[sym]
@@ -2911,7 +3009,8 @@ class KlineBot:
         pc = self.price_cache
         return {"cfg": cfg, "symbols": rows, "seeds": self.ind_seeds, "hits": self.ind_hits,
                 "kline_msgs": pc.kline_ticks if pc is not None else 0,
-                "next_seed": klines_needed(int(time.time() * 1000), cfg["rsi_period"])}
+                "next_seed": klines_needed(int(time.time() * 1000), cfg["rsi_period"]),
+                "exchanges": [EX_LABEL[x] for x in IND_EXCHANGES]}
 
     def _record_ratio_signal(self, eng: Engine, sym: str, direction: str, prev: Tuple[int, float],
                              last: Tuple[int, float], chg: float, action: str) -> None:
@@ -3060,6 +3159,7 @@ class KlineBot:
             "rest_blocked_s": max(0.0, self._rest_block_until - now),
             "filters": len(self.filters), "ind": self.ind_snapshot(),
             "book": {"on": BOOK_FILL, "fetches": self.book_fetches, "errors": self.book_errors},
+            "routes": self.rest_routes_snapshot(),
         }
 
     # ── Mantenimiento ─────────────────────────────────────────────────────────
@@ -3556,8 +3656,7 @@ def api_indicators_get():
 def api_indicators_set():
     """TP por RSI + VWAP ±kσ (UTC) de los bots de ratio, en caliente. Body JSON (todo opcional):
     {"engine": "ratio", "enabled": true} enciende/apaga el de un bot; parámetros comunes:
-    {"rsi_period": 14, "rsi_level": 13, "vwap_k": 2.5, "use_rsi": true, "use_vwap": true,
-    "source": "auto"|"binance"|"bybit"} (de dónde salen las velas).
+    {"rsi_period": 14, "rsi_level": 13, "vwap_k": 2.5, "use_rsi": true, "use_vwap": true}.
     SHORT cierra con RSI < nivel y cierre ≤ VWAP − kσ; LONG con RSI > 100 − nivel y cierre ≥ VWAP + kσ."""
     busy = _guard()
     if busy:
@@ -3579,8 +3678,6 @@ def api_indicators_set():
     for key in ("use_rsi", "use_vwap"):
         if key in data:
             vals[key] = _flag(data[key])
-    if data.get("source"):
-        vals["source"] = str(data["source"]).strip().lower()
     if not vals:
         return jsonify({"ok": False, "error": "Nada que cambiar"}), 400
     try:
@@ -4178,7 +4275,7 @@ HTML = r"""<!doctype html>
             <button type="button" class="small" data-act="indUse" data-key="use_rsi" id="indUseRsi">—</button>
             <button type="button" class="small" data-act="indUse" data-key="use_vwap" id="indUseVwap">—</button>
           </div>
-          <div class="row c" style="margin-top:10px"><span class="muted" style="font-size:12px">Velas de:</span><span id="indSrc"></span></div>
+
           <div class="note" id="indNote"></div>
           <div class="scroll" id="indTblWrap" style="margin-top:10px" hidden><table><thead><tr><th>Par</th><th>Estado</th><th>Velas de</th><th>RSI</th><th>Cierre</th><th>VWAP −σ</th><th>VWAP</th><th>VWAP +σ</th><th>Velas</th><th>Última</th></tr></thead><tbody id="indTbl"></tbody></table></div>
         </div>
@@ -4676,12 +4773,10 @@ function render(d) {
       bt.dataset.on = on ? '1' : ''; bt.className = 'small ' + (on ? 'ok' : 'ghost');
       bt.textContent = `${label}: ${on ? 'se exige · ignorar' : 'ignorado · exigir'}`;
     }
-    const SRC = [['auto', 'Auto (Binance; Bybit si hay bloqueo)'], ['binance', 'Binance'], ['bybit', 'Bybit']];
-    q('indSrc').innerHTML = SRC.map(([v, l]) => `<button type="button" class="small ${ic.source === v ? 'ok' : 'ghost'}" data-act="indSrc" data-src="${v}">${l}</button>`).join(' ');
     const cond = [ic.use_rsi ? `RSI(${ic.rsi_period}) < ${ic.rsi_level}` : '', ic.use_vwap ? `cierre ≤ VWAP − ${ic.vwap_k}σ` : ''].filter(Boolean).join(' y ');
     const condL = [ic.use_rsi ? `RSI > ${+(100 - ic.rsi_level).toFixed(2)}` : '', ic.use_vwap ? `cierre ≥ VWAP + ${ic.vwap_k}σ` : ''].filter(Boolean).join(' y ');
     q('indNote').innerHTML = `Cierra el <b>SHORT</b> cuando una vela 1m cierra con ${cond}; el <b>LONG</b> con ${condL}. Solo cuentan las velas cerradas después de abrir; las venganzas no lo usan. `
-      + `Al abrir se piden por REST <b>una vez</b> ${ind.next_seed} velas (las de hoy desde las 00:00 UTC, mínimo ${10 * ic.rsi_period} para el RSI) y luego se sigue vela a vela: por WebSocket kline_1m si vienen de Binance, o con una petición pequeña por minuto si vienen de Bybit (solo los pares con posición). Cargas: ${ind.seeds} · TP disparados: ${ind.hits}.`;
+      + `Al abrir se piden por REST <b>una vez</b> ${ind.next_seed} velas (las de hoy desde las 00:00 UTC, mínimo ${10 * ic.rsi_period} para el RSI) a ${esc((ind.exchanges || []).join(' → '))} (el primero que tenga el par; Binance solo como último recurso) y luego se sigue vela a vela con una petición pequeña por minuto a ese mismo exchange (o por WebSocket si vinieron de Binance). Solo los pares con posición. Cargas: ${ind.seeds} · TP disparados: ${ind.hits}.`;
     const rows = Object.entries(ind.symbols || {});
     q('indTblWrap').hidden = !rows.length;
     q('indTbl').innerHTML = rows.map(([sym, v]) => `<tr><td>${esc(sym)}</td><td>${esc(v.state)}${v.error ? ' <span class="neg">' + esc(v.error) + '</span>' : ''}</td><td>${esc(v.src || '—')}</td>
@@ -4724,7 +4819,8 @@ function render(d) {
       + ` · consultas ${r.polls} · errores ${r.errors}`
       + (r.filters === 0 ? ` · <span class="neg">sin filtros de cantidad (exchangeInfo): no se puede abrir</span>` : '')
       + (r.ticker_error && !r.ticker_connected ? ` · <span class="warn">24 h: ${esc(r.ticker_error)}</span>` : '')
-      + (r.rest_blocked_s > 0 ? ` · <span class="neg">ratio en pausa ${dur(r.rest_blocked_s)} (límite de peticiones)</span>` : '')
+      + (r.rest_blocked_s > 0 ? ` · <span class="neg">ratio en pausa ${dur(r.rest_blocked_s)} (418/429 en todas las rutas)</span>` : '')
+      + ((r.routes || []).length ? ` · REST Binance: ${esc((r.routes.find(x => x.current) || r.routes[0]).route)}, ${r.routes.filter(x => !x.blocked_s).length}/${r.routes.length} rutas libres` : '')
       + (r.last_error ? ` · <span class="warn">${esc(r.last_error)}</span>` : '');
     q('tRt').innerHTML = r.rows.map(z => `<tr>
       <td><b>${esc(z.symbol)}</b></td><td>${z.pct24 === null ? '—' : pct(z.pct24)}</td><td>${num(z.price, 8)}</td>
@@ -4796,7 +4892,7 @@ function render(d) {
 // ── Acciones ──
 const glbText = r => `objetivo ${r.profit_target_usd > 0 ? '+' + r.profit_target_usd + ' USD' : 'apagado'} · límite ${r.max_open > 0 ? r.max_open + ' abiertas' : 'sin límite'} · fee ${r.fee_pct}% por lado · demora mínima ${r.min_hold_s} s`;
 const indText = r => { const c = r.cfg; return `TP RSI/VWAP: ${RATIO.filter(n => c.enabled[n]).map(n => SHORT_LABEL[n]).join(', ') || 'ningún bot'} · `
-  + [c.use_rsi ? `RSI(${c.rsi_period}) < ${c.rsi_level} / > ${+(100 - c.rsi_level).toFixed(2)}` : '', c.use_vwap ? `VWAP ±${c.vwap_k}σ` : ''].filter(Boolean).join(' y ') + ` · velas: ${c.source}`; };
+  + [c.use_rsi ? `RSI(${c.rsi_period}) < ${c.rsi_level} / > ${+(100 - c.rsi_level).toFixed(2)}` : '', c.use_vwap ? `VWAP ±${c.vwap_k}σ` : ''].filter(Boolean).join(' y '); };
 async function glb(body, url = '/api/global', box = 'glbMsg', okMsg = glbText) {
   q(box).textContent = 'Guardando…';
   try {
@@ -4862,7 +4958,6 @@ const ACTIONS = {
     const on = !b.dataset.on;
     glb({engine: b.dataset.eng, enabled: on}, '/api/indicators', 'rtMsg', indText);
   },
-  indSrc(b) { glb({source: b.dataset.src}, '/api/indicators', 'rtMsg', indText); },
   indUse(b) { glb({[b.dataset.key]: !b.dataset.on}, '/api/indicators', 'rtMsg', indText); },
   ratioExit(b) { ratioPost({ratio_exit: !b.dataset.on}, r => `TP por ratio ${r.ratio_exit ? 'activado' : 'desactivado'}`); },
   revRatioExit(b) { revPost({ratio_exit: !b.dataset.on}, r => `TP por ratio ${r.ratio_exit ? 'activado' : 'desactivado'} en el bot ratio + venganza`, 'rtMsg'); },
