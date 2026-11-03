@@ -50,6 +50,8 @@ Una salida más, que se enciende y apaga **por bot** y en caliente (*Bots → Bo
 
 **Velas**: al abrir una posición en un bot con esta salida encendida se piden por REST, **una sola vez**, `max(minutos desde las 00:00 UTC, 10 × periodo) + 1` velas 1m (las de hoy para el VWAP y al menos 140 para que el RSI de Wilder ya esté asentado; la última, aún abierta, se descarta). Ej.: 00:45 UTC → 141 velas; 12:00 → 721; máximo 1440. Después se sigue **vela a vela** por WebSocket (`<par>@kline_1m`, solo los pares con posición, ~2 MB/h por par) y el RSI y las bandas se actualizan cada minuto sin más REST. Si el WebSocket se corta y falta alguna vela, se recarga por REST.
 
+**Velas de otro exchange**: *Velas de* en la web (o `"source"` en `/api/indicators`, `IND_SOURCE`) elige `auto` (por defecto: Binance; si el REST de Binance está bloqueado por un 418/429, **Bybit**), `binance` o `bybit`. Las de Bybit se cargan por REST (`/v5/market/kline`, perpetuo lineal del mismo nombre, hasta 1000 por petición) y siguen con una petición pequeña por minuto; nunca se mezclan con velas de Binance (el volumen del VWAP sería de dos mercados distintos).
+
 ```bash
 curl -X POST https://<bot>/api/indicators -H 'Content-Type: application/json' -d '{"engine": "ratio_tp", "enabled": true}'
 curl -X POST https://<bot>/api/indicators -H 'Content-Type: application/json' -d '{"rsi_period": 14, "rsi_level": 13, "vwap_k": 2.5}'
@@ -57,6 +59,7 @@ curl -X POST https://<bot>/api/indicators -H 'Content-Type: application/json' -d
 
 ### Demora mínima y precio de ejecución en papel
 
+- **Bloqueos de Binance (418/429)**: el bloqueo se aplica a la **ruta** que lo recibió (IP directa o `REST_PROXY_URL`) y se sigue por la otra. Con todas bloqueadas no sale ninguna petición hasta que venza (insistir alarga el veto). Un 418 en la primera petición indica que la IP de salida (compartida en Render) ya estaba vetada: el ratio de top traders solo lo da Binance, así que la solución es un proxy o cambiar de región.
 - **Demora mínima**: ninguna posición se cierra por TP/SL, ratio o RSI/VWAP antes de **2 s** desde que abrió (`MIN_HOLD_S`, editable en *Sistema → Ajustes generales*). Si la señal llega antes, se vuelve a mirar al cumplirse la demora. Los cierres manuales, «Cerrar todas» y el objetivo global no esperan.
 - **Precios como el executor**: la entrada y la salida en papel se valoran con el **libro de 20 niveles** (REST `depth`): una compra recorre los asks desde el mejor y una venta los bids, y se toma el precio medio ponderado de la cantidad; lo que pase de 20 niveles va al peor precio visto. Sin libro, el mejor ask/bid (`bookTicker`); sin eso, el precio en vivo o el de la señal. El TP/SL se calcula desde esa entrada. Los cierres mandan la orden al executor al instante y el libro se pide en paralelo, sin bloquear al bot. Los tres bots de ratio comparten un mismo libro (se pide mientras llega el precio en vivo) y la venganza reutiliza el del cierre que la dispara. Se apaga con `BOOK_FILL=false`.
 
@@ -270,6 +273,7 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 | `BOOK_FILL` | `true` | Entrada y salida en papel con el libro de 20 niveles, como el executor. |
 | `BOOK_MAX_AGE_S` / `BOOK_TIMEOUT_S` | `1.5` / `2` | Cuánto vale un libro pedido y la espera máxima de la petición. |
 | `IND_RSI_PERIOD` / `IND_RSI_LEVEL` / `IND_VWAP_K` | `14` / `13` / `2.5` | Valores iniciales del TP por RSI + VWAP (luego se editan en la web). |
+| `IND_SOURCE` | `auto` | Velas del RSI/VWAP: `auto` (Binance, Bybit si Binance bloquea), `binance` o `bybit`. |
 | `WATCH_LIVE_PRICE` | `true` | Precio en vivo `markPrice` (cada 3 s) para los vigilados sin posición (`false` = solo los que tienen posición). |
 | `WS_SYMBOL_STREAM` | auto | Stream de precio por posición: `aggTrade` (solo ratio) o `bookTicker` (con velas). |
 | `WS_ALL_MARKET` / `WS_ALL_TICKER` | `false` | Streams de todo el mercado en `WS.py` (mucho tráfico). |

@@ -635,3 +635,87 @@ def test_al_encender_se_cargan_las_velas_una_vez_por_rest(tmp_path, monkeypatch)
     n = pedidos[0][1]["limit"]
     assert n == st.klines_needed(int(time.time() * 1000), 14)
     assert bot._ind["AUSDT"].count == n - 1 and not bot._ind_seeding        # la vela en curso se descarta
+
+
+# ── Bloqueos 418/429 y velas de Bybit ─────────────────────────────────────────
+
+def test_un_418_bloquea_solo_esa_ruta_y_no_vuelve_a_pedir(tmp_path, monkeypatch):
+    import urllib.error
+    from email.message import Message
+    monkeypatch.setattr(st, "SETTINGS_FILE", str(tmp_path / "s.json"))
+    monkeypatch.setattr(st, "REST_PROXY_URL", "http://proxy:1")
+    bot = st.KlineBot()
+    llamadas = []
+
+    def fake(url, proxy="", timeout=15.0):
+        llamadas.append(proxy)
+        if proxy == "":
+            h = Message()
+            h["Retry-After"] = "163000"
+            raise urllib.error.HTTPError(url, 418, "banned", h, None)
+        return {"ok": True}, 10
+    monkeypatch.setattr(st, "http_get_json", fake)
+    bot._rest_route = 1                                     # empieza por la IP directa (vetada)
+    assert bot._rest_get("/fapi/v1/depth") == {"ok": True}  # sigue por el proxy
+    assert llamadas == ["", "http://proxy:1"] and bot._rest_block_until == 0
+    llamadas.clear()
+    bot._rest_get("/fapi/v1/depth")
+    assert llamadas == ["http://proxy:1"]                   # la vetada ya no se toca
+
+    def todo_418(url, proxy="", timeout=15.0):
+        llamadas.append(proxy)
+        h = Message()
+        h["Retry-After"] = "120"
+        raise urllib.error.HTTPError(url, 418, "banned", h, None)
+    monkeypatch.setattr(st, "http_get_json", todo_418)
+    with pytest.raises(RuntimeError):
+        bot._rest_get("/fapi/v1/depth")
+    assert bot._rest_block_until > time.time() + 100
+    llamadas.clear()
+    with pytest.raises(RuntimeError, match="en pausa"):
+        bot._rest_get("/fapi/v1/klines")
+    assert llamadas == []                                   # con todo vetado no sale nada
+
+
+def _bybit_rows(now_ms, n):
+    base = now_ms // 60_000 * 60_000
+    return [[str(base - i * 60_000), "1", "1.01", "0.99", str(1 + i * 1e-4), "10", "10"] for i in range(n)]  # nueva → vieja
+
+
+def test_velas_de_bybit_cuando_binance_esta_bloqueado(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    bot._rest_block_until = time.time() + 3600              # Binance vetado
+    pedidos = []
+
+    def fake(url, proxy="", timeout=15.0):
+        from urllib.parse import urlsplit, parse_qs
+        q = {k: v[0] for k, v in parse_qs(urlsplit(url).query).items()}
+        pedidos.append(q)
+        assert url.startswith(st.BYBIT_URL + "/v5/market/kline") and q["category"] == "linear" and q["interval"] == "1"
+        now_ms = int(q.get("end", int(time.time() * 1000)))
+        return {"retCode": 0, "result": {"list": _bybit_rows(now_ms, int(q["limit"]))}}, 100
+    monkeypatch.setattr(st, "http_get_json", fake)
+    rows, src = bot._fetch_seed_klines("AUSDT")
+    n = st.klines_needed(int(time.time() * 1000), 14)
+    assert src == "bybit" and len(rows) == n and rows[0][0] < rows[-1][0]
+    assert all(r[6] == r[0] + 59_999 for r in rows)
+    # Más de 1000: dos peticiones, la segunda hacia atrás.
+    pedidos.clear()
+    largas = bot._bybit_klines("AUSDT", 1441)
+    assert len(pedidos) == 2 and int(pedidos[1]["limit"]) == 441 and len(largas) == 1441
+    assert len({r[0] for r in largas}) == 1441
+
+
+def test_las_velas_de_bybit_no_se_mezclan_con_las_de_binance(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    _abierta_ratio(bot, st.ENGINE_RATIO_TP, 51)
+    bot.set_ind_config(enabled={st.ENGINE_RATIO_TP: True}, source="bybit")
+    rows = [[i * 60_000, 1, 1, 1, 1, 1, i * 60_000 + 59_999] for i in range(1, 40)]
+    bot._ind_seeded("AUSDT", rows, "bybit")
+    ind = bot._ind["AUSDT"]
+    bot._ind_candle("AUSDT", 40 * 60_000, 1, 1, 1, 1)                  # del WS de Binance: se ignora
+    assert ind.last_open == 39 * 60_000
+    bot._ind_candle("AUSDT", 40 * 60_000, 1, 1, 1, 1, "bybit")
+    assert ind.last_open == 40 * 60_000 and bot.ind_snapshot()["symbols"]["AUSDT"]["src"] == "bybit"
+    with pytest.raises(ValueError):
+        bot.set_ind_config(source="okx")
