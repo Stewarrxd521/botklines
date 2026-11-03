@@ -37,7 +37,28 @@ curl -X POST https://<bot>/api/ratio -H 'Content-Type: application/json' \
      -d '{"tp_pct": 10, "sl_pct": -5, "ratio_exit": true}'
 ```
 
-`0` apaga el TP o el SL; el SL se puede mandar como `5` o `-5`. Los niveles nuevos se aplican también a las posiciones abiertas de ese bot (se recalculan desde su precio de entrada) y se guardan en `SETTINGS_FILE`. El cierre sale con motivo `TP`, `SL` o `TP_RATIO`.
+`0` apaga el TP o el SL; el SL se puede mandar como `5` o `-5`. Los niveles nuevos se aplican también a las posiciones abiertas de ese bot (se recalculan desde su precio de entrada) y se guardan en `SETTINGS_FILE`. El cierre sale con motivo `TP`, `SL`, `TP_RATIO` o `TP_RSI_VWAP`.
+
+### TP por RSI + VWAP ±σ (los tres bots de ratio)
+
+Una salida más, que se enciende y apaga **por bot** y en caliente (*Bots → Bots de ratio → TP por RSI + VWAP*; apagada por defecto):
+
+- **SHORT**: cierra cuando una vela 1m cierra con **RSI(14) < 13** y el cierre **≤ VWAP − 2,5σ**.
+- **LONG**: lo simétrico, **RSI > 87** y cierre **≥ VWAP + 2,5σ**.
+- El VWAP es el del **día UTC** (se reinicia a las 00:00 UTC), con precio típico (H+L+C)/3 y su desviación típica ponderada por volumen. El RSI es el de Wilder.
+- Periodo, nivel y σ son comunes a los tres bots y editables en la web; también se puede exigir solo el RSI o solo el VWAP. Solo cuentan las velas que cierran **después** de abrir; las venganzas no lo usan.
+
+**Velas**: al abrir una posición en un bot con esta salida encendida se piden por REST, **una sola vez**, `max(minutos desde las 00:00 UTC, 10 × periodo) + 1` velas 1m (las de hoy para el VWAP y al menos 140 para que el RSI de Wilder ya esté asentado; la última, aún abierta, se descarta). Ej.: 00:45 UTC → 141 velas; 12:00 → 721; máximo 1440. Después se sigue **vela a vela** por WebSocket (`<par>@kline_1m`, solo los pares con posición, ~2 MB/h por par) y el RSI y las bandas se actualizan cada minuto sin más REST. Si el WebSocket se corta y falta alguna vela, se recarga por REST.
+
+```bash
+curl -X POST https://<bot>/api/indicators -H 'Content-Type: application/json' -d '{"engine": "ratio_tp", "enabled": true}'
+curl -X POST https://<bot>/api/indicators -H 'Content-Type: application/json' -d '{"rsi_period": 14, "rsi_level": 13, "vwap_k": 2.5}'
+```
+
+### Demora mínima y precio de ejecución en papel
+
+- **Demora mínima**: ninguna posición se cierra por TP/SL, ratio o RSI/VWAP antes de **2 s** desde que abrió (`MIN_HOLD_S`, editable en *Sistema → Ajustes generales*). Si la señal llega antes, se vuelve a mirar al cumplirse la demora. Los cierres manuales, «Cerrar todas» y el objetivo global no esperan.
+- **Precios como el executor**: la entrada y la salida en papel se valoran con el **libro de 20 niveles** (REST `depth`): una compra recorre los asks desde el mejor y una venta los bids, y se toma el precio medio ponderado de la cantidad; lo que pase de 20 niveles va al peor precio visto. Sin libro, el mejor ask/bid (`bookTicker`); sin eso, el precio en vivo o el de la señal. El TP/SL se calcula desde esa entrada. Los cierres mandan la orden al executor al instante y el libro se pide en paralelo, sin bloquear al bot. Los tres bots de ratio comparten un mismo libro (se pide mientras llega el precio en vivo) y la venganza reutiliza el del cierre que la dispara. Se apaga con `BOOK_FILL=false`.
 
 ### Trade de venganza (bot `ratio_rev`)
 
@@ -189,7 +210,7 @@ El executor suma en **una** posición de Binance las de todos los bots en el mis
 
 ### TP en Binance
 
-La apertura lleva además `"tp"` con el take profit de esa posición. El executor lo pone en Binance (`TAKE_PROFIT_MARKET`, por mark price) con **la cantidad de esa posición**, así el TP salta aunque el bot o la red fallen. Binance solo admite **un TP por par y lado**, y el executor suma en una posición las de todos los bots del mismo par y dirección. Por eso el TP solo se manda cuando la posición **va sola** en su par y dirección. Si hay más bots en ese par, cada uno cierra por su señal, como antes. Con los bots de ratio, que abren juntos con la misma señal, el TP sale después de las aperturas como `open_tp` (y solo si al final quedó una). Si el TP cambia en caliente, se manda `open_tp` con el nuevo nivel (o `close_tp` si la posición ya no va sola). Se apaga con `SEND_TP=false`.
+Cada apertura con TP por precio lleva `"tp"` con el take profit de esa posición. El executor lo pone en Binance con **la cantidad de esa posición** y lo identifica por su `trade_id`, así que hay un TP por posición aunque varios bots compartan par y dirección (los tres de ratio abren juntos), y el TP salta aunque el bot o la red fallen. El bot *solo TP ratio* no lleva TP por precio. Si el TP cambia en caliente, se manda `open_tp` del `trade_id` con el nuevo nivel (o `close_tp` si se apagó). Se apaga con `SEND_TP=false`.
 
 ### Latencia
 
@@ -245,6 +266,10 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 | `TICKER_SCAN_S` | `30` | Segundos máximos de cada exploración del mercado (la diaria los usa enteros). |
 | `TICKER_SCAN_QUICK` | `true` | Corta las exploraciones de cada ciclo en cuanto llegó todo el mercado activo. |
 | `SYMBOL_SCAN_HOURS` | `24` | Cada cuánto la exploración rehace la lista de símbolos. |
+| `MIN_HOLD_S` | `2` | Segundos mínimos entre la apertura y un cierre por TP/SL, ratio o RSI/VWAP (editable en la web). |
+| `BOOK_FILL` | `true` | Entrada y salida en papel con el libro de 20 niveles, como el executor. |
+| `BOOK_MAX_AGE_S` / `BOOK_TIMEOUT_S` | `1.5` / `2` | Cuánto vale un libro pedido y la espera máxima de la petición. |
+| `IND_RSI_PERIOD` / `IND_RSI_LEVEL` / `IND_VWAP_K` | `14` / `13` / `2.5` | Valores iniciales del TP por RSI + VWAP (luego se editan en la web). |
 | `WATCH_LIVE_PRICE` | `true` | Precio en vivo `markPrice` (cada 3 s) para los vigilados sin posición (`false` = solo los que tienen posición). |
 | `WS_SYMBOL_STREAM` | auto | Stream de precio por posición: `aggTrade` (solo ratio) o `bookTicker` (con velas). |
 | `WS_ALL_MARKET` / `WS_ALL_TICKER` | `false` | Streams de todo el mercado en `WS.py` (mucho tráfico). |
@@ -264,7 +289,8 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 | `GET /api/trades.csv?engine=` | Historial con MFE/MAE en CSV. |
 | `POST /api/block` | Bloquear o permitir LONG o SHORT en un bot. |
 | `GET/POST /api/ratio` | Ver o cambiar los bots de ratio: vigilancia y rango (comunes), `tp_pct`, `sl_pct`, `ratio_exit`; con `"engine": "ratio_rev"`, la salida y la venganza de ese bot. |
-| `GET/POST /api/global` | Modo invertido, objetivo en USD y fee (común a los dos bots). |
+| `GET/POST /api/global` | Modo invertido, objetivo en USD, fee y demora mínima `min_hold_s` (comunes). |
+| `GET/POST /api/indicators` | TP por RSI + VWAP: `{"engine": "ratio", "enabled": true}` por bot; `rsi_period`, `rsi_level`, `vwap_k`, `use_rsi`, `use_vwap` comunes. |
 | `POST /api/realized/reset` | Poner a cero el PnL realizado de un bot (`{"engine": "ratio"}`); el historial se conserva. |
 | `POST /api/pause` | Pausar o reanudar un bot. |
 | `POST /api/close-all` | Cerrar todas las posiciones (de un bot con `engine`). |

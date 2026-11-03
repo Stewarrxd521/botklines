@@ -176,6 +176,10 @@ class SymbolWebSocketPriceCache:
         self.symbol_stream = symbol_stream or _SYMBOL_STREAM
         self.symbols = sorted({s.upper() for s in symbols})
         self.slow_symbols: frozenset[str] = frozenset()
+        # Velas 1m CERRADAS por símbolo (<sym>@kline_1m), para indicadores progresivos.
+        self.kline_symbols: frozenset[str] = frozenset()
+        self._kline_cb = None
+        self.kline_ticks = 0
         self._check_limit(self.symbols)
 
         # price_cache:  symbol -> (price, timestamp). Alimentado por
@@ -236,7 +240,7 @@ class SymbolWebSocketPriceCache:
 
     def _check_limit(self, symbols: list[str]):
         # Streams por símbolo (1, o 2 con bookTicker sin mark global) + los globales activos.
-        needed = (len(symbols) * len(self._streams_for("x"))
+        needed = (len(symbols) * len(self._streams_for("x")) + len(getattr(self, "kline_symbols", ()))
                   + int(_ALL_MARKET_ENABLED) + int(_ALL_TICKER_ENABLED))
         if needed > _BINANCE_MAX_STREAMS:
             raise ValueError(
@@ -262,10 +266,12 @@ class SymbolWebSocketPriceCache:
         with self.lock:
             symbols_snapshot = list(self.symbols)
             slow_snapshot = list(self.slow_symbols)
+            kline_snapshot = list(self.kline_symbols)
         # Seguidos "lentos" (p. ej. vigilados sin posición): solo su mark price, cada 3 s
         # (o el stream de _SLOW_STREAM). Los que ya van por el stream rápido no lo repiten.
         fast = set(symbols_snapshot)
         wanted: set[str] = {f"{s.lower()}@{_SLOW_STREAM}" for s in slow_snapshot if s not in fast}
+        wanted.update(f"{s.lower()}@kline_1m" for s in kline_snapshot)
         if _ALL_MARKET_ENABLED:
             wanted.add(_ALL_MARKET_STREAM)
         if _ALL_TICKER_ENABLED:
@@ -436,6 +442,16 @@ class SymbolWebSocketPriceCache:
             self._store_book_ticker(symbol, px, px, now)
         elif event == "markPriceUpdate":
             self._store_price(symbol, _safe_float(payload, "p"), now)
+        elif event == "kline":
+            self.kline_ticks += 1
+            k = payload.get("k")
+            cb = self._kline_cb
+            if isinstance(k, dict) and k.get("x") and cb is not None:
+                try:
+                    cb(symbol, int(k["t"]), float(k["o"]), float(k["h"]), float(k["l"]),
+                       float(k["c"]), float(k["v"]))
+                except Exception as e:
+                    print(f"⚠️ [WS] vela de {symbol} descartada: {e}")
         elif event == "24hrTicker":
             with self.lock:
                 self.ticker_cache[symbol] = TickerData(
@@ -615,6 +631,20 @@ class SymbolWebSocketPriceCache:
                 return
             self.slow_symbols = new
         self._check_limit(sorted(set(self.symbols) | new))
+        self._schedule_sync()
+
+    def set_kline_symbols(self, symbols: Iterable[str], callback=None):
+        """Velas 1m de estos símbolos (<sym>@kline_1m). Binance manda la vela en curso cada
+        ~250 ms; solo las CERRADAS (x=true) llegan a callback(symbol, open_time_ms, o, h, l, c, v),
+        desde el hilo del WS. En caliente, sin reconectar."""
+        new = frozenset(s.upper() for s in symbols)
+        if callback is not None:
+            self._kline_cb = callback
+        with self.lock:
+            if new == self.kline_symbols:
+                return
+            self.kline_symbols = new
+        self._check_limit(list(self.symbols))
         self._schedule_sync()
 
     def update_symbols(self, symbols: list[str]):
