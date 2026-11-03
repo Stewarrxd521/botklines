@@ -615,11 +615,11 @@ def test_al_encender_se_cargan_las_velas_una_vez_por_rest(tmp_path, monkeypatch)
 
     def rest(path, params=None, timeout=15.0):
         pedidos.append((path, params))
-        now_ms = int(time.time() * 1000)
-        n = params["limit"]
-        base = now_ms // 60_000 * 60_000 - (n - 1) * 60_000
-        return [[base + i * 60_000, 1, 1.01, 0.99, 1 + i * 1e-4, 10, base + i * 60_000 + 59_999] for i in range(n)]
+        assert params["limit"] <= 499                        # tramos de peso 2
+        ts = range(params["startTime"], params["endTime"] + 1, 60_000)
+        return [[t, 1, 1.01, 0.99, 1 + t / 6e12, 10, t + 59_999] for t in ts]
     bot._rest_get = rest
+    monkeypatch.setattr(st, "IND_EXCHANGES", ["binance"])
 
     async def run():
         bot.loop, bot.running = asyncio.get_running_loop(), True
@@ -630,9 +630,8 @@ def test_al_encender_se_cargan_las_velas_una_vez_por_rest(tmp_path, monkeypatch)
             await asyncio.sleep(0.01)
         bot.running = False
     asyncio.run(run())
-    assert len(pedidos) == 1 and pedidos[0][0] == "/fapi/v1/klines"
-    n = pedidos[0][1]["limit"]
-    assert n == st.klines_needed(int(time.time() * 1000), 14)
+    n = st.klines_needed(int(time.time() * 1000), 14)
+    assert len(pedidos) == -(-n // 499) and all(p[0] == "/fapi/v1/klines" for p in pedidos)
     assert bot._ind["AUSDT"].count == n - 1 and not bot._ind_seeding        # la vela en curso se descarta
 
 
@@ -646,7 +645,7 @@ def test_un_418_bloquea_solo_esa_ruta_y_no_vuelve_a_pedir(tmp_path, monkeypatch)
     bot = st.KlineBot()
     llamadas = []
 
-    def fake(url, proxy="", timeout=15.0):
+    def fake(url, proxy="", timeout=15.0, **k):
         llamadas.append(proxy)
         if proxy == "":
             h = Message()
@@ -660,7 +659,7 @@ def test_un_418_bloquea_solo_esa_ruta_y_no_vuelve_a_pedir(tmp_path, monkeypatch)
     bot._rest_get("/fapi/v1/depth")
     assert llamadas == ["http://proxy:1"]                   # la vetada ya no se toca
 
-    def todo_418(url, proxy="", timeout=15.0):
+    def todo_418(url, proxy="", timeout=15.0, **k):
         llamadas.append(proxy)
         h = Message()
         h["Retry-After"] = "120"
@@ -680,7 +679,7 @@ def test_con_la_ip_vetada_rota_entre_las_proxies(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "REST_PROXIES", ["http://a:1@p:80", "http://b:2@p:80", "http://c:3@p:80"])
     bot = st.KlineBot()
     usadas = []
-    monkeypatch.setattr(st, "http_get_json", lambda url, proxy="", timeout=15.0: (usadas.append(proxy), ({}, 1))[1])
+    monkeypatch.setattr(st, "http_get_json", lambda url, proxy="", timeout=15.0, **k: (usadas.append(proxy), ({}, 1))[1])
     bot._rest_get("/futures/data/x")
     assert usadas == [""]                                   # sin veto: IP directa
     bot._route_block[""] = time.time() + 3600
@@ -711,7 +710,7 @@ def test_velas_de_otros_exchanges_en_orden_y_binance_al_final(tmp_path, monkeypa
     rest_binance = []
     bot._rest_get = lambda *a, **k: rest_binance.append(a) or []
     pedidos = []
-    tiene = {"bybit": False, "kucoin": False, "coinbase": True}
+    tiene = {"bybit": False, "kucoin": False, "coinbase": True, "mexc": False}
 
     def http(url, timeout=10.0):
         u = urlsplit(url)
@@ -736,9 +735,53 @@ def test_velas_de_otros_exchanges_en_orden_y_binance_al_final(tmp_path, monkeypa
     # Ninguno lo tiene: Binance (REST) como último recurso.
     tiene["coinbase"] = False
     bot._alt_missing.clear(); bot._alt_sym.clear()
+    pedidos.clear()
     bot._rest_get = lambda *a, **k: rest_binance.append(a) or [[0, 1, 1, 1, 1, 1, 59_999]]
     rows, ex = bot._fetch_seed_klines("AUSDT")
-    assert ex == "binance" and len(rest_binance) == 1
+    assert pedidos.index("mexc") > pedidos.index("coinbase")  # MEXC justo antes de Binance
+    assert ex == "binance" and len(rest_binance) == -(-n // 499)
+
+
+def test_mexc_futuros_normaliza_columnas_y_pagina(tmp_path, monkeypatch):
+    from urllib.parse import urlsplit, parse_qs
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    pedidos = []
+
+    def http(url, timeout=10.0):
+        u = urlsplit(url)
+        q = {k: v[0] for k, v in parse_qs(u.query).items()}
+        pedidos.append(u.path)
+        if u.path.endswith("/1000PEPE_USDT"):
+            return {"success": False, "code": 1001, "message": "contract not exists"}
+        assert u.path == "/api/v1/contract/kline/PEPE_USDT" and q["interval"] == "Min1"
+        now_s = int(time.time())
+        ts = [t for t in range(int(q["start"]), int(q["end"]) + 1, 60) if t <= now_s]
+        return {"success": True, "code": 0, "data": {"time": ts, "open": [1] * len(ts), "high": [1.01] * len(ts),
+                                                     "low": [0.99] * len(ts), "close": [1] * len(ts),
+                                                     "vol": [10] * len(ts)}}
+    bot._alt_http = http
+    rows = bot._alt_klines("mexc", "1000PEPEUSDT", 1441)
+    assert len(rows) == 1441 and rows[0][0] < rows[-1][0]
+    assert all(r[6] == r[0] + 59_999 and r[2] == 1.01 and r[3] == 0.99 and r[5] == 10 for r in rows)
+    assert len(pedidos) == 2 + 2                                 # 2 nombres probados + 2 páginas de 1000
+
+
+def test_con_mucho_peso_usado_la_ruta_descansa_hasta_el_minuto_siguiente(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "SETTINGS_FILE", str(tmp_path / "s.json"))
+    monkeypatch.setattr(st, "REST_PROXIES", ["http://proxy:1"])
+    bot = st.KlineBot()
+    usadas = []
+
+    def fake(url, proxy="", timeout=15.0, headers_out=None):
+        usadas.append(proxy)
+        headers_out["x-mbx-used-weight-1m"] = "2000" if proxy == "" else "10"
+        return [], 1
+    monkeypatch.setattr(st, "http_get_json", fake)
+    bot._rest_get("/futures/data/x")
+    assert 0 < bot._route_block[""] - time.time() <= 62 and bot._route_weight[""] == 2000
+    bot._rest_get("/futures/data/x")
+    assert usadas == ["", "http://proxy:1"]                     # sin esperar al 429: sigue por el proxy
+    assert bot.rest_routes_snapshot()[1]["weight"] == 10
 
 
 def test_bybit_y_kucoin_paginan_y_normalizan(tmp_path, monkeypatch):
