@@ -24,7 +24,7 @@ Tres bots de ratio operan en paralelo con **la misma entrada** y salidas distint
 
 1. **Exploración por WebSocket**: en cada ciclo de 5 min se abre `!miniTicker@arr` y se lee el 24 h de todo el mercado; se cierra en cuanto un mensaje ya casi no trae símbolos nuevos (2-4 s). Solo la exploración diaria dura los 30 s completos (`TICKER_SCAN_S`). La misma exploración descubre los símbolos: una vez al día la lista se rehace (salen los deslistados) y entre medias se añaden los nuevos; se guarda en `KNOWN_SYMBOLS_FILE`.
    **Vigilados**: los perpetuos con variación 24 h ≥ +10 % (`RATIO_WATCH_MIN_PCT`, editable en la web). Con LONG activo, también los ≤ −10 %.
-2. **Entrada**: cada 5 min se consulta el ratio de cuentas de los top traders de cada vigilado. Si **cae** entre 13 % y 100 % de un punto de 5 min al siguiente en un ganador (24 h ≥ +X %) → **SHORT**. Si **sube** entre 13 % y 100 % en un perdedor (24 h ≤ −X %) → **LONG**. Las dos direcciones están activas por defecto (`RATIO_LONG_DEFAULT=false` deja el LONG bloqueado al arrancar) y cada una se bloquea desde la web.
+2. **Entrada**: cada 5 min se consulta el ratio de cuentas de los top traders de cada vigilado, **3 min después** del cierre del bloque de 5 min (a las :03 y :08; `RATIO_POLL_DELAY_S=180`), porque Binance tarda unos 3 min en publicar el punto de todos los pares; los que aún falten se reintentan cada 25 s hasta antes del siguiente ciclo. Si **cae** entre 13 % y 100 % de un punto de 5 min al siguiente en un ganador (24 h ≥ +X %) → **SHORT**. Si **sube** entre 13 % y 100 % en un perdedor (24 h ≤ −X %) → **LONG**. Las dos direcciones están activas por defecto (`RATIO_LONG_DEFAULT=false` deja el LONG bloqueado al arrancar) y cada una se bloquea desde la web.
 3. **Salida** (lo que llegue antes):
    - **Take profit por precio**: **+10 %** a favor desde la entrada (`RATIO_TP_PCT`).
    - **Stop loss por precio**: **−4,8 %** en contra desde la entrada (`RATIO_SL_PCT`).
@@ -273,6 +273,7 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 | `BOOK_FILL` | `true` | Entrada y salida en papel con el libro de 20 niveles, como el executor. |
 | `BOOK_MAX_AGE_S` / `BOOK_TIMEOUT_S` | `1.5` / `2` | Cuánto vale una foto del libro y la espera máxima del WebSocket. |
 | `IND_RSI_PERIOD` / `IND_RSI_LEVEL` / `IND_VWAP_K` | `14` / `13` / `2.5` | Valores iniciales del TP por RSI + VWAP (luego se editan en la web). |
+| `RATIO_POLL_DELAY_S` | `180` | Segundos tras cada bloque de 5 min (:00/:05) antes de consultar el ratio. |
 | `IND_EXCHANGES` | `bybit,kucoin,coinbase,binance` | Orden de los exchanges para las velas del RSI/VWAP. |
 | `WATCH_LIVE_PRICE` | `true` | Precio en vivo `markPrice` (cada 3 s) para los vigilados sin posición (`false` = solo los que tienen posición). |
 | `WS_SYMBOL_STREAM` | auto | Stream de precio por posición: `aggTrade` (solo ratio) o `bookTicker` (con velas). |
