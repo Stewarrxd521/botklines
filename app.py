@@ -265,13 +265,19 @@ IND_RSI_LEVEL = float(os.getenv("IND_RSI_LEVEL", "13"))       # SHORT: RSI < 13 
 IND_VWAP_K = float(os.getenv("IND_VWAP_K", "2.5"))
 # Velas del RSI/VWAP: se piden por REST a otros exchanges, en este orden (el primero que tenga el
 # par); Binance solo como último recurso, para no gastar su REST (solo el ratio lo usa).
-IND_EXCHANGES = [x.strip().lower() for x in os.getenv("IND_EXCHANGES", "bybit,kucoin,coinbase,binance").split(",")
-                 if x.strip().lower() in ("bybit", "kucoin", "coinbase", "binance")] or ["binance"]
+IND_EXCHANGES = [x.strip().lower() for x in os.getenv("IND_EXCHANGES", "bybit,kucoin,coinbase,mexc,binance").split(",")
+                 if x.strip().lower() in ("bybit", "kucoin", "coinbase", "mexc", "binance")] or ["binance"]
 ALT_URLS = {"bybit": os.getenv("BYBIT_URL", "https://api.bybit.com").rstrip("/"),
             "kucoin": os.getenv("KUCOIN_URL", "https://api-futures.kucoin.com").rstrip("/"),
-            "coinbase": os.getenv("COINBASE_URL", "https://api.exchange.coinbase.com").rstrip("/")}
-ALT_MAX_ROWS = {"bybit": 1000, "kucoin": 500, "coinbase": 290}     # velas por petición
-EX_LABEL = {"bybit": "Bybit", "kucoin": "KuCoin", "coinbase": "Coinbase", "binance": "Binance"}
+            "coinbase": os.getenv("COINBASE_URL", "https://api.exchange.coinbase.com").rstrip("/"),
+            "mexc": os.getenv("MEXC_URL", "https://contract.mexc.com").rstrip("/")}
+ALT_MAX_ROWS = {"bybit": 1000, "kucoin": 500, "coinbase": 290, "mexc": 1000}     # velas por petición
+EX_LABEL = {"bybit": "Bybit", "kucoin": "KuCoin", "coinbase": "Coinbase", "mexc": "MEXC", "binance": "Binance"}
+# Velas de Binance (último recurso): en tramos de ≤499 (peso 2 cada uno; 1500 de golpe pesan 10).
+BINANCE_KLINES_CHUNK = max(1, min(499, int(os.getenv("BINANCE_KLINES_CHUNK", "499"))))
+# Peso usado por minuto que Binance devuelve en X-MBX-USED-WEIGHT-1M: al pasar este tope la ruta
+# descansa hasta el minuto siguiente, antes de que llegue el 429 (y luego el 418 por insistir).
+REST_WEIGHT_BUDGET = int(os.getenv("REST_WEIGHT_BUDGET", str(int(2400 * 0.8))))
 
 
 def price_stream_for(klines_on: bool, fast: bool = True) -> str:
@@ -279,13 +285,17 @@ def price_stream_for(klines_on: bool, fast: bool = True) -> str:
     return PRICE_STREAM_ENV or ("bookTicker" if klines_on else "aggTrade" if fast else "markPrice@1s")
 
 
-def http_get_json(url: str, proxy: str = "", timeout: float = 15.0) -> Tuple[object, int]:
-    """GET JSON pidiendo gzip (Binance lo admite: ~5-10× menos bytes). (datos, bytes recibidos)."""
+def http_get_json(url: str, proxy: str = "", timeout: float = 15.0,
+                  headers_out: Optional[dict] = None) -> Tuple[object, int]:
+    """GET JSON pidiendo gzip (Binance lo admite: ~5-10× menos bytes). (datos, bytes recibidos).
+    Con headers_out (dict) devuelve ahí las cabeceras de la respuesta, en minúsculas."""
     handlers = [urllib.request.ProxyHandler({"http": proxy, "https": proxy})] if proxy else []
     opener = urllib.request.build_opener(*handlers)
     req = urllib.request.Request(url, headers={"User-Agent": "BOTKLINE/1.0", "Accept-Encoding": "gzip"})
     with opener.open(req, timeout=timeout) as resp:
         raw = resp.read()
+        if headers_out is not None:
+            headers_out.update({k.lower(): v for k, v in resp.headers.items()})
         if (resp.headers.get("Content-Encoding") or "").lower() == "gzip":
             body = gzip.decompress(raw)
         else:
@@ -977,6 +987,7 @@ class KlineBot:
         self._route_block: Dict[str, float] = {}        # ruta REST ("" = IP directa, o el proxy) → bloqueada hasta
         self._route_ok: Dict[str, int] = {}
         self._route_errors: Dict[str, int] = {}
+        self._route_weight: Dict[str, int] = {}    # último X-MBX-USED-WEIGHT-1M visto por ruta
         self._proxy_rr = 0
         self._rest_last_route: Optional[str] = None
         self._rest_times: Deque[float] = deque()      # peticiones de los últimos 5 min
@@ -2450,8 +2461,9 @@ class KlineBot:
         url = f"{BASE_URL}{path}" + (f"?{urlencode(params)}" if params else "")
         last_exc: Optional[Exception] = None
         for route in order:
+            hdrs: dict = {}
             try:
-                data, nbytes = http_get_json(url, route, timeout)
+                data, nbytes = http_get_json(url, route, timeout, headers_out=hdrs)
             except urllib.error.HTTPError as exc:
                 if exc.code not in (418, 429):
                     raise RuntimeError(f"HTTP {exc.code}")
@@ -2473,6 +2485,7 @@ class KlineBot:
                 continue
             self.rx_rest_bytes += nbytes
             self._route_ok[route] = self._route_ok.get(route, 0) + 1
+            self._note_weight(route, hdrs.get("x-mbx-used-weight-1m"))
             if route != self._rest_last_route:
                 if route or self._rest_last_route is not None:
                     self.log(f"[REST] Binance ahora por {proxy_label(route)}")
@@ -2482,10 +2495,31 @@ class KlineBot:
             raise last_exc
         raise RuntimeError(f"sin respuesta: {last_exc}")
 
+    def _note_weight(self, route: str, used) -> None:
+        """Peso del minuto que Binance cuenta para esa IP. Al pasar REST_WEIGHT_BUDGET la ruta no se usa
+        hasta el minuto siguiente (el contador se reinicia al cambiar de minuto)."""
+        try:
+            used = int(used)
+        except (TypeError, ValueError):
+            return
+        self._route_weight[route] = used
+        if used < REST_WEIGHT_BUDGET:
+            return
+        now = time.time()
+        until = (int(now) // 60 + 1) * 60 + 1.0
+        if self._route_block.get(route, 0.0) < until:
+            self._route_block[route] = until
+            self.log(f"[REST] Binance: {proxy_label(route)} lleva peso {used}/min (tope {REST_WEIGHT_BUDGET}); "
+                     f"descansa {until - now:.0f} s para no llegar al 429")
+            routes = [""] + REST_PROXIES
+            if not [r for r in routes if self._route_block.get(r, 0.0) <= now]:
+                self._rest_block_until = min(self._route_block[r] for r in routes)
+
     def rest_routes_snapshot(self) -> List[dict]:
         now = time.time()
         return [{"route": proxy_label(r), "blocked_s": max(0.0, self._route_block.get(r, 0.0) - now),
                  "ok": self._route_ok.get(r, 0), "errors": self._route_errors.get(r, 0),
+                 "weight": self._route_weight.get(r),
                  "current": r == self._rest_last_route} for r in [""] + REST_PROXIES]
 
     def _fetch_ratio(self, symbol: str) -> List[Tuple[int, float]]:
@@ -2783,17 +2817,32 @@ class KlineBot:
         for ex in IND_EXCHANGES:
             try:
                 if ex == "binance":
-                    self._rest_times.append(time.time())
-                    data = self._rest_get("/fapi/v1/klines", {"symbol": sym, "interval": "1m", "limit": n}, 10.0)
-                    if not isinstance(data, list) or not data:
-                        raise RuntimeError("respuesta de velas inesperada")
-                    return data, "binance"
+                    return self._binance_klines(sym, n), "binance"
                 return self._alt_klines(ex, sym, n), ex
             except Exception as exc:
                 errors.append(f"{EX_LABEL[ex]}: {exc}")
         raise RuntimeError(" · ".join(errors))
 
-    # ── Velas de otros exchanges (Bybit, KuCoin futuros, Coinbase) ────────────
+    def _binance_klines(self, sym: str, n: int) -> list:
+        """Las últimas `n` velas 1m de Binance en tramos de ≤BINANCE_KLINES_CHUNK con startTime/endTime
+        (peso 2 cada uno en vez de 10 por 1500 de golpe), del más viejo al más nuevo."""
+        now_min = int(time.time() * 1000) // 60_000 * 60_000
+        t, rows = now_min - (n - 1) * 60_000, {}
+        while t <= now_min:
+            end = min(now_min, t + (BINANCE_KLINES_CHUNK - 1) * 60_000)
+            self._rest_times.append(time.time())
+            data = self._rest_get("/fapi/v1/klines", {"symbol": sym, "interval": "1m", "startTime": t,
+                                                      "endTime": end + 59_999, "limit": BINANCE_KLINES_CHUNK}, 10.0)
+            if not isinstance(data, list):
+                raise RuntimeError("respuesta de velas inesperada")
+            for r in data:
+                rows[int(r[0])] = r
+            t = end + 60_000
+        if not rows:
+            raise RuntimeError("respuesta de velas vacía")
+        return [rows[k] for k in sorted(rows)]
+
+    # ── Velas de otros exchanges (Bybit, KuCoin futuros, Coinbase, MEXC futuros) ──
 
     @staticmethod
     def _alt_candidates(ex: str, sym: str) -> List[str]:
@@ -2809,6 +2858,8 @@ class KlineBot:
             return [b + "USDT" for b in bases]
         if ex == "kucoin":
             return [("XBT" if b == "BTC" else b) + "USDTM" for b in bases]
+        if ex == "mexc":
+            return [b + "_USDT" for b in bases]
         return [f"{b}-USD" for b in bases] + [f"{b}-USDT" for b in bases]
 
     def _alt_http(self, url: str, timeout: float = 10.0):
@@ -2842,6 +2893,15 @@ class KlineBot:
                 raise LookupError(f"{(d or {}).get('msg') if isinstance(d, dict) else d}")
             for r in d.get("data") or []:                             # [inicio, o, h, l, c, vol (lotes)]
                 out.append((int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])))
+        elif ex == "mexc":
+            q = urlencode({"interval": "Min1", "start": start_ms // 1000, "end": end_ms // 1000})
+            d = self._alt_http(f"{base}/api/v1/contract/kline/{symx}?{q}")
+            if not isinstance(d, dict) or not d.get("success") or not isinstance(d.get("data"), dict):
+                raise LookupError(f"{(d or {}).get('message') or (d or {}).get('code') if isinstance(d, dict) else d}")
+            c = d["data"]                                              # columnas: time (s), open, high…
+            for i, ts in enumerate(c.get("time") or []):
+                out.append((int(ts) * 1000, float(c["open"][i]), float(c["high"][i]), float(c["low"][i]),
+                            float(c["close"][i]), float(c["vol"][i])))
         else:
             iso = lambda ms: datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             q = urlencode({"granularity": 60, "start": iso(start_ms), "end": iso(end_ms)})
@@ -2873,7 +2933,7 @@ class KlineBot:
 
     def _alt_klines(self, ex: str, sym: str, n: int) -> list:
         """Las últimas `n` velas 1m (incluida la en curso) de otro exchange, en tantas peticiones
-        como pida su máximo por petición (Bybit 1000, KuCoin 500, Coinbase 290)."""
+        como pida su máximo por petición (Bybit 1000, KuCoin 500, Coinbase 290, MEXC 1000)."""
         symx = self._alt_symbol(ex, sym)
         now_min = int(time.time() * 1000) // 60_000 * 60_000
         t, rows = now_min - (n - 1) * 60_000, {}
@@ -4820,7 +4880,7 @@ function render(d) {
       + (r.filters === 0 ? ` · <span class="neg">sin filtros de cantidad (exchangeInfo): no se puede abrir</span>` : '')
       + (r.ticker_error && !r.ticker_connected ? ` · <span class="warn">24 h: ${esc(r.ticker_error)}</span>` : '')
       + (r.rest_blocked_s > 0 ? ` · <span class="neg">ratio en pausa ${dur(r.rest_blocked_s)} (418/429 en todas las rutas)</span>` : '')
-      + ((r.routes || []).length ? ` · REST Binance: ${esc((r.routes.find(x => x.current) || r.routes[0]).route)}, ${r.routes.filter(x => !x.blocked_s).length}/${r.routes.length} rutas libres` : '')
+      + ((r.routes || []).length ? ` · REST Binance: ${esc((r.routes.find(x => x.current) || r.routes[0]).route)}${(r.routes.find(x => x.current) || {}).weight != null ? ` (peso ${(r.routes.find(x => x.current)).weight}/min)` : ''}, ${r.routes.filter(x => !x.blocked_s).length}/${r.routes.length} rutas libres` : '')
       + (r.last_error ? ` · <span class="warn">${esc(r.last_error)}</span>` : '');
     q('tRt').innerHTML = r.rows.map(z => `<tr>
       <td><b>${esc(z.symbol)}</b></td><td>${z.pct24 === null ? '—' : pct(z.pct24)}</td><td>${num(z.price, 8)}</td>
