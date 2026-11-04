@@ -836,3 +836,23 @@ def test_el_libro_se_toma_del_websocket_depth20(tmp_path, monkeypatch):
     assert bids == [["0.99", "3"]] and asks == [["1.01", "4"]]
     assert urls == ["wss://fstream.binance.com/public/ws/ausdt@depth20@100ms",
                     "wss://fstream.binance.com/market/ws/ausdt@depth20@100ms"]
+
+
+def test_tp_por_precio_se_confirma_con_el_libro_antes_de_cerrar(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    enviados = []
+    bot.executor.send = lambda payload, *a, **k: enviados.append(payload)
+    p = _abierta_ratio(bot, st.ENGINE_RATIO_REV, 61)          # SHORT desde 1.0, TP al 0.5 %
+    p.tp_price = 0.995
+    eng = bot.engines[st.ENGINE_RATIO_REV]
+    bot._price = lambda sym: 0.9948                            # el mechazo toca el TP...
+    _libro(bot, [["0.997", "100"]], [["0.9974", "100"]])       # ...pero los asks están en +0.26 %
+    bot._check_take_profit("AUSDT")
+    assert 61 in eng.positions and not enviados and not eng.closed_trades   # rechazado: sigue abierta
+    assert p.tp_rejects == 1 and not bot._tp_checking
+    bot._books.clear()
+    _libro(bot, [["0.9945", "100"]], [["0.9949", "100"]])      # ahora sí hay asks al TP o mejor
+    bot._check_take_profit("AUSDT")
+    assert 61 not in eng.positions and enviados[-1]["action"] == "close"
+    assert enviados[-1]["close_price"] == pytest.approx(0.9949)
+    assert eng.closed_trades[0]["close_price"] == pytest.approx(0.9949) and eng.closed_trades[0]["reason"] == "TP"

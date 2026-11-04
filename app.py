@@ -252,6 +252,8 @@ MIN_HOLD_S = max(0.0, float(os.getenv("MIN_HOLD_S", "2")))
 # Precio de apertura/cierre en papel como el executor: libro de 20 niveles (asks para comprar, bids
 # para vender), medio ponderado de la cantidad; sin libro, mejor ask/bid; sin eso, el precio en vivo.
 BOOK_FILL = os.getenv("BOOK_FILL", "true").lower() in ("1", "true", "yes")
+# TP por precio: antes de cerrar se confirma con el libro que la salida llega al TP; si no, no cierra.
+TP_BOOK_CHECK = os.getenv("TP_BOOK_CHECK", "true").lower() in ("1", "true", "yes")
 BOOK_DEPTH = 20
 BOOK_MAX_AGE_S = float(os.getenv("BOOK_MAX_AGE_S", "1.5"))     # libro reutilizable (los 3 bots de ratio)
 BOOK_TIMEOUT_S = float(os.getenv("BOOK_TIMEOUT_S", "2"))
@@ -790,6 +792,7 @@ class Position:
     ex_tp:         float = 0.0      # TP puesto en Binance por el executor (0 = ninguno)
     signal_price:  float = 0.0      # precio de la señal (entry_price es el del libro)
     entry_src:     str = ""         # de dónde salió entry_price: libro | mejor ask/bid | precio
+    tp_rejects:    int = 0          # veces que el precio tocó el TP pero el libro no llegaba (no cerró)
 
     def update(self, price: float) -> float:
         """Actualiza precio y excursiones. Llamar con el lock del bot tomado."""
@@ -1019,6 +1022,8 @@ class KlineBot:
         # Libro de órdenes (REST, 20 niveles) para los precios en papel: símbolo → (ts, bids, asks, origen).
         self._books: Dict[str, Tuple[float, list, list, str]] = {}
         self._book_inflight: Dict[str, object] = {}
+        self._tp_checking: set = set()                  # TPs por precio esperando el libro
+        self._tp_reject_log: Dict[int, float] = {}
         self.book_fetches = 0
         self.book_errors = 0
         # TP por RSI + VWAP ±kσ (UTC) de los bots de ratio: parámetros comunes, encendido por bot.
@@ -1780,7 +1785,46 @@ class KlineBot:
             self._wake_after_hold(symbol, wait)
         if hits and self.store.can_act():
             for tid, reason in hits:
-                self._close(tid, price, reason)
+                if reason == "TP" and BOOK_FILL and TP_BOOK_CHECK:
+                    self._close_tp_checked(tid, price)
+                else:
+                    self._close(tid, price, reason)
+
+    def _close_tp_checked(self, trade_id: int, trigger: float) -> None:
+        """TP por precio confirmado con el libro: en un mechazo el último precio puede tocar el TP
+        sin que haya bids/asks a ese nivel. Antes de enviar el cierre se valora la salida con el
+        libro (bids si cierra un LONG, asks si cierra un SHORT); si no llega al TP (igual o mejor),
+        el cierre se rechaza y la posición sigue abierta hasta que el TP se cumpla de verdad."""
+        with self.lock:
+            _eng, pos = self._find(trade_id)
+            if pos is None or trade_id in self._closing or trade_id in self._tp_checking:
+                return
+            self._tp_checking.add(trade_id)
+            sym, direction, qty, tp = pos.symbol, pos.direction, pos.qty, pos.tp_price
+
+        def decide(px: float, src: str) -> None:
+            self._tp_checking.discard(trade_id)
+            _e, p = self._find(trade_id)
+            if p is None:
+                return
+            if exit_hit(px, tp, direction):
+                self._close(trade_id, px, "TP")
+                return
+            p.tp_rejects += 1
+            now = time.time()
+            if now - self._tp_reject_log.get(trade_id, 0.0) >= 30:
+                self._tp_reject_log[trade_id] = now
+                got = favorable_move_pct(px, p.entry_price, direction)
+                want = favorable_move_pct(tp, p.entry_price, direction)
+                self.log(f"[TP] #{trade_id} {sym} {direction}: el precio tocó el TP ({trigger:g}) pero el libro "
+                         f"da {px:g}{f' ({src})' if src else ''} = {got:+.2f}% < TP {want:+.2f}%: cierre rechazado, "
+                         f"sigue abierta (rechazos: {p.tp_rejects})")
+
+        try:
+            self._with_fill(sym, direction == SHORT, qty, trigger, decide)
+        except Exception:
+            self._tp_checking.discard(trade_id)
+            raise
 
     def _close(self, trade_id: int, price: float, reason: str, on_done=None) -> bool:
         """Cierra `trade_id`: la orden sale ya al executor (con `price`, el del disparo) y el cierre
@@ -1869,6 +1913,7 @@ class KlineBot:
         finally:
             with self.lock:
                 self._closing.discard(pos.trade_id)
+            self._tp_reject_log.pop(pos.trade_id, None)
             if on_done is not None:
                 on_done()
 
