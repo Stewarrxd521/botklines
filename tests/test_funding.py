@@ -35,6 +35,8 @@ def test_config_por_defecto_y_validacion(tmp_path, monkeypatch):
         bot.set_funding_config(notional=1)
     with pytest.raises(ValueError):
         bot.set_funding_config(open_before_s=40, scan_before_s=30)
+    with pytest.raises(ValueError):                         # menos que FUNDING_MIN_LEAD_S: nunca entraría
+        bot.set_funding_config(open_before_s=st.FUNDING_MIN_LEAD_S)
     again = st.KlineBot()                                   # se guarda en disco
     assert again.funding_cfg["notional"] == 50 and again.funding_cfg["min_pct"] == 0.5
 
@@ -54,21 +56,25 @@ def test_abre_en_el_lado_que_cobra_y_cierra_tras_el_cobro(tmp_path, monkeypatch)
     bot.executor.send = lambda payload, *a, **k: enviados.append((time.time(), payload))
     bot._price = lambda sym: {"AUSDT": 1.0, "BUSDT": 2.0}.get(sym)
     pedidos = _libro(bot, [["0.99", "1000"]], [["1.01", "1000"]])
-    bot.funding_cfg.update(open_before_s=0.3, close_after_s=0.15)
+    bot.funding_cfg.update(open_before_s=0.6, close_after_s=0.15)
     eng = bot.engines[st.ENGINE_FUNDING]
 
     async def run():
         bot.loop = asyncio.get_running_loop()
-        ts = time.time() + 0.6
-        bot._fetch_funding = lambda: [dict(r) for r in _filas(ts)]
+        ts = time.time() + 0.9
+
+        async def foto():
+            return [dict(r) for r in _filas(ts)]
+        bot._funding_ws_snapshot = foto
         await bot._funding_cycle(ts)
-        await asyncio.sleep(0.45)                                   # abiertas antes del cobro
+        await asyncio.sleep(0.6)                                    # abiertas antes del cobro
         opened = {p.symbol: p for p in eng.positions.values()}
-        await asyncio.sleep(0.6)                                    # cerradas tras el cobro
+        await asyncio.sleep(0.8)                                    # cerradas tras el cobro
         return ts, opened
 
     ts, opened = asyncio.run(run())
     assert set(opened) == {"AUSDT", "BUSDT"}
+    assert not bot._price_hold and not bot._bg_tasks                # precios soltados al terminar, sin tareas colgadas
     assert opened["AUSDT"].direction == st.SHORT and opened["BUSDT"].direction == st.LONG
     opens = [(t, p) for t, p in enviados if p["action"] == "open"]
     closes = [(t, p) for t, p in enviados if p["action"] == "close"]
@@ -131,15 +137,29 @@ def test_tras_un_reinicio_cierra_las_de_funding_vencidas(tmp_path, monkeypatch):
     assert cerradas == [(1, "FUNDING")]
 
 
-def test_premium_index_y_reloj_de_binance(tmp_path, monkeypatch):
+def test_mark_price_por_websocket_y_reloj(tmp_path, monkeypatch):
+    import json
+    raw = json.dumps({"stream": "!markPrice@arr", "data": [
+        {"e": "markPriceUpdate", "s": "AUSDT", "p": "1.1", "r": "0.0035", "T": 3600000},
+        {"e": "markPriceUpdate", "s": "ABTC", "p": "1", "r": "0.01", "T": 3600000}]})
+    assert st.KlineBot._parse_mark_rows(raw) == [
+        {"symbol": "AUSDT", "rate_pct": pytest.approx(0.35), "next_ts": 3600.0, "mark": 1.1}]
+    assert st.KlineBot._parse_mark_rows("no es json") is None
+    # Reloj: solo valen las muestras rápidas; si discrepan demasiado, no hay medición fiable.
+    off, rtt, _spread = st.pick_clock_offset([(0.05, 1.50), (0.06, 1.51), (0.055, 1.49), (0.9, 3.0)])
+    assert off == pytest.approx(1.50) and rtt == pytest.approx(0.05)
+    assert st.pick_clock_offset([(0.05, 1.0), (0.05, 2.0), (0.05, 3.0)]) is None
+    assert st.clock_compare(None, {"a": (1.0, 0.01, 0), "b": (1.2, 0.01, 0)})[:2] == (pytest.approx(1.1), "proveedores")
+
+
+def test_precio_pedido_por_dos_no_se_suelta_antes_de_tiempo(tmp_path, monkeypatch):
     bot = _bot_sin_red(tmp_path, monkeypatch)
-    srv = int((time.time() + 1.5) * 1000)
-    bot._rest_get = lambda path, *a, **k: [
-        {"symbol": "AUSDT", "markPrice": "1.1", "lastFundingRate": "0.0035", "nextFundingTime": 3600000, "time": srv},
-        {"symbol": "ABTC", "markPrice": "1", "lastFundingRate": "0.01", "nextFundingTime": 3600000, "time": srv}]
-    rows = bot._fetch_funding()
-    assert rows == [{"symbol": "AUSDT", "rate_pct": pytest.approx(0.35), "next_ts": 3600.0, "mark": 1.1}]
-    assert bot.funding_clock_off == pytest.approx(1.5, abs=0.2)
+    bot._hold_price(["AUSDT"])                     # p. ej. la consulta del ratio
+    bot._hold_price(["AUSDT"])                     # y la entrada de funding del mismo par
+    bot._release_price(["AUSDT"])                  # el ratio termina…
+    assert "AUSDT" in bot._price_hold              # …y el funding sigue teniendo su precio en vivo
+    bot._release_price(["AUSDT"])
+    assert not bot._price_hold
 
 
 def test_api_funding(tmp_path, monkeypatch):
