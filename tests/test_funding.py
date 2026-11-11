@@ -280,7 +280,8 @@ def test_la_consulta_une_rest_y_websocket(tmp_path, monkeypatch):
     async def ws(*a, **k):
         return [{"symbol": "AUSDT", "rate_pct": 0.36, "next_ts": 3600.0, "mark": 1.2}]
     bot._funding_ws_snapshot = ws
-    rows = {r["symbol"]: r for r in asyncio.run(bot._funding_full_snapshot())}
+    assert len(asyncio.run(bot._funding_full_snapshot())) == 1         # sin rest=True: solo WebSocket
+    rows = {r["symbol"]: r for r in asyncio.run(bot._funding_full_snapshot(rest=True))}
     assert set(rows) == {"AUSDT", "BUSDT"}
     assert rows["AUSDT"]["rate_pct"] == pytest.approx(0.36)          # del WebSocket (más reciente)
     assert rows["BUSDT"]["rate_pct"] == pytest.approx(-0.4) and rows["BUSDT"]["next_ts"] == 3600.0
@@ -288,5 +289,23 @@ def test_la_consulta_une_rest_y_websocket(tmp_path, monkeypatch):
 
     async def ws_caido(*a, **k):
         raise RuntimeError("sin WebSocket")
+    llamadas = []
+    rest0 = bot._rest_get
+    bot._rest_get = lambda *a, **k: llamadas.append(1) or rest0(*a, **k)
     bot._funding_ws_snapshot = ws_caido
-    assert len(asyncio.run(bot._funding_full_snapshot())) == 2           # con una sola fuente basta
+    with pytest.raises(RuntimeError):                                    # REST ya pedido esta hora: no repite
+        asyncio.run(bot._funding_full_snapshot(rest=True))
+    assert llamadas == []
+    bot._funding_rest_ts = 0.0
+    assert len(asyncio.run(bot._funding_full_snapshot(rest=True))) == 2  # con una sola fuente basta
+    assert llamadas == [1]
+
+
+def test_un_par_que_un_escaneo_no_trajo_no_desaparece(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    a = {"symbol": "AUSDT", "rate_pct": 0.5, "next_ts": 3600.0, "mark": 1.0}
+    b = {"symbol": "BUSDT", "rate_pct": -0.6, "next_ts": 3600.0, "mark": 1.0}
+    bot._funding_remember([a])
+    assert {r["symbol"] for r in bot._funding_remember([b])} == {"AUSDT", "BUSDT"}
+    monkeypatch.setattr(st, "FUNDING_CACHE_TTL_S", -1)                    # caducado: ya no cuenta
+    assert bot._funding_remember([]) == []

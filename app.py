@@ -227,9 +227,15 @@ FUNDING_SCAN_BEFORE_S = max(float(os.getenv("FUNDING_SCAN_BEFORE_S", "180")), FU
 # (mínimo FUNDING_COLLECT_MIN_S y como mucho FUNDING_COLLECT_MAX_S). Antes se tomaba solo el primer mensaje y,
 # si llegaba incompleto, un par que cumplía no aparecía o desaparecía de la tabla.
 FUNDING_COLLECT_MIN_S = float(os.getenv("FUNDING_COLLECT_MIN_S", "4"))
-# Además del WebSocket, cada consulta pide /fapi/v1/premiumIndex por REST (UNA petición, peso 10, ~40 KB con gzip):
-# trae TODOS los pares de una vez, así la lista no depende de qué pares traiga cada mensaje del stream.
+# REST: SOLO en la consulta final (3 min antes del cobro) y como mucho una vez cada FUNDING_REST_MIN_INTERVAL_S
+# (≈ 1 por hora): /fapi/v1/premiumIndex, UNA petición, peso 10, ~40 KB con gzip, trae TODOS los pares de una vez.
+# Se une a lo que traiga el WebSocket para que no falte ningún par; con esa lista se suscriben en vivo por
+# WebSocket los que cumplen o están cerca. El arranque, la exploración horaria y la manual van SOLO por WebSocket.
 FUNDING_REST_SNAPSHOT = os.getenv("FUNDING_REST_SNAPSHOT", "true").lower() in ("1", "true", "yes")
+FUNDING_REST_MIN_INTERVAL_S = float(os.getenv("FUNDING_REST_MIN_INTERVAL_S", "3000"))
+# La tabla de la web y la exploración horaria usan el último valor visto de cada par en los últimos
+# FUNDING_CACHE_TTL_S: un par que un escaneo por WebSocket no trajo no desaparece de la lista.
+FUNDING_CACHE_TTL_S = float(os.getenv("FUNDING_CACHE_TTL_S", "900"))
 FUNDING_COLLECT_MAX_S = float(os.getenv("FUNDING_COLLECT_MAX_S", "12"))
 # Seguimiento en vivo tras la consulta final: el funding de Binance es una ESTIMACIÓN que cambia hasta el cobro.
 # Los pares que cobran en esa hora y están a ≥ FUNDING_TRACK_RATIO del umbral se siguen por su stream propio
@@ -1274,6 +1280,8 @@ class KlineBot:
         self._funding_track_ok = ""                   # última base del stream combinado que respondió
         self._funding_snap_msgs = 0                   # mensajes que hizo falta juntar en la última consulta
         self._funding_src: dict = {}                  # cuántos pares trajo cada fuente en la última consulta
+        self._funding_rest_ts = 0.0                   # última vez que se pidió premiumIndex por REST (≤ 1 por hora)
+        self._funding_seen: Dict[str, tuple] = {}     # símbolo → (cuándo, última fila vista)
         self._funding_live: Dict[str, dict] = {}      # último funding visto de los pares del cobro en curso
         self._funding_live_for = 0.0                  # cobro al que corresponde _funding_live
         self._funding_launched: set = set()           # pares ya programados para el cobro en curso
@@ -3949,12 +3957,15 @@ class KlineBot:
             raise RuntimeError("premiumIndex: sin pares")
         return rows
 
-    async def _funding_full_snapshot(self, max_s: Optional[float] = None, cap: Optional[int] = None) -> List[dict]:
-        """TODOS los pares: premiumIndex por REST (lista completa) y el stream por WebSocket, en paralelo. Se unen:
-        de cada par vale el WebSocket si lo trajo (más reciente) y si no el REST. Con que uno responda, basta."""
+    async def _funding_full_snapshot(self, max_s: Optional[float] = None, cap: Optional[int] = None,
+                                     rest: bool = False) -> List[dict]:
+        """Pares por WebSocket y, solo si rest=True (consulta final) y no se pidió en la última
+        FUNDING_REST_MIN_INTERVAL_S, también premiumIndex por REST en paralelo (lista completa). Se unen: de cada par
+        vale el WebSocket si lo trajo (más reciente) y si no el REST. Con que uno responda, basta."""
         t0 = time.monotonic()
         tasks = [self._funding_ws_snapshot(max_s, cap)]
-        if FUNDING_REST_SNAPSHOT:
+        if rest and FUNDING_REST_SNAPSHOT and time.time() - self._funding_rest_ts >= FUNDING_REST_MIN_INTERVAL_S:
+            self._funding_rest_ts = time.time()
             tasks.append(asyncio.to_thread(self._funding_rest_rows))
         res = await asyncio.gather(*tasks, return_exceptions=True)
         ws = res[0] if isinstance(res[0], list) else []
@@ -3974,6 +3985,17 @@ class KlineBot:
             self.log(f"[funding] el WebSocket trajo {len(ws)} pares y el REST {len(rest)}: "
                      f"{only_rest} solo llegaron por REST (se incluyen)")
         return list(merged.values())
+
+    def _funding_remember(self, rows: List[dict]) -> List[dict]:
+        """Suma `rows` a la memoria de pares vistos y devuelve todos los vistos en los últimos FUNDING_CACHE_TTL_S
+        (de cada par, su valor más reciente)."""
+        now = time.time()
+        with self.lock:
+            for r in rows:
+                self._funding_seen[r["symbol"]] = (now, r)
+            for sym in [k for k, (t, _r) in self._funding_seen.items() if now - t > FUNDING_CACHE_TTL_S]:
+                del self._funding_seen[sym]
+            return [r for _t, r in self._funding_seen.values()]
 
     def _clock_sync_thread(self, full: bool = True) -> dict:
         """Corre en un hilo con su propio event loop (el retraso del loop principal no entra en la medición).
@@ -4108,12 +4130,13 @@ class KlineBot:
 
     async def _funding_scan(self) -> List[dict]:
         try:
-            rows = await self._funding_full_snapshot()
+            rows = await self._funding_full_snapshot(rest=True)
         except Exception as exc:
             self.funding_errors += 1
             self.funding_last_error = str(exc)
             self.log(f"[funding] ✗ no pude leer el funding: {exc}")
             return []
+        rows = self._funding_remember(rows)             # un par que esta vez no llegó no se pierde
         thr = self.funding_cfg["min_pct"]
         rows.sort(key=lambda r: abs(r["rate_pct"]), reverse=True)
         with self.lock:
@@ -4277,7 +4300,7 @@ class KlineBot:
             self.log(f"[funding] ✗ exploración {'manual' if manual else 'horaria' if warm else 'inicial'} sin datos tras {elapsed:.1f} s: {last_exc!r}")
             return
         thr = self.funding_cfg["min_pct"]
-        rows = sorted(seen.values(), key=lambda r: abs(r["rate_pct"]), reverse=True)
+        rows = sorted(self._funding_remember(list(seen.values())), key=lambda r: abs(r["rate_pct"]), reverse=True)
         cands = [r for r in rows if abs(r["rate_pct"]) >= thr and abs(r["next_ts"] - ts) <= 1.5]
         hot = ([r["symbol"] for r in cands if r["symbol"] in self.filters][:max(FUNDING_WATCH_PRICE_MAX, 0)]
                if warm else [])                              # la de arranque/reintento solo llena la tabla
