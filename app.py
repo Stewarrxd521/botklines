@@ -944,6 +944,7 @@ class KlineBot:
         self.started_at = time.time()
 
         self._pos_syms: frozenset = frozenset()     # copia para el hilo del WS (sin lock)
+        self._book_ws_ok = ""                       # última URL que dio el libro por WebSocket
         self._price_hold: set = set()               # símbolos con precio pedido antes de una entrada
         self._pending: set = set()                  # símbolos con tick de precio pendiente
         self._pending_lock = threading.Lock()
@@ -1064,6 +1065,8 @@ class KlineBot:
         # Ahorro de datos (web): precio en vivo de los vigilados y precio rápido de las abiertas.
         self.watch_live = bool(settings.get("watch_live_price", WATCH_LIVE_PRICE))
         self.fast_prices = bool(settings.get("fast_prices", True))
+        # Mandar el TP con cada apertura (el executor lo pone en Binance). Todos los bots.
+        self.send_tp = bool(settings.get("send_tp", SEND_TP))
         try:
             self.min_hold_s = max(0.0, float(settings.get("min_hold_s", MIN_HOLD_S)))
         except (TypeError, ValueError):
@@ -1173,7 +1176,7 @@ class KlineBot:
                 "executor_paused": self.executor_paused, "ratio": self.ratio_cfg, "ratio_rev": self.rev_cfg,
                 "klines_enabled": self.klines_enabled, "watch_live_price": self.watch_live,
                 "fast_prices": self.fast_prices, "min_hold_s": self.min_hold_s, "indicators": self.ind_cfg,
-                "funding": self.funding_cfg}
+                "funding": self.funding_cfg, "send_tp": self.send_tp}
         tmp = f"{SETTINGS_FILE}.tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as fh:
@@ -1259,7 +1262,8 @@ class KlineBot:
     def set_global(self, inverted: Optional[bool] = None, fee_pct: Optional[float] = None,
                    profit_target_usd: Optional[float] = None, max_open: Optional[int] = None,
                    executor_paused: Optional[bool] = None, watch_live_price: Optional[bool] = None,
-                   fast_prices: Optional[bool] = None, min_hold_s: Optional[float] = None) -> dict:
+                   fast_prices: Optional[bool] = None, min_hold_s: Optional[float] = None,
+                   send_tp: Optional[bool] = None) -> dict:
         """Ajustes comunes a los dos bots. Invertir aplica a las entradas
         nuevas; las abiertas siguen con el modo (TP o SL) con el que se abrieron."""
         changes = []
@@ -1293,6 +1297,11 @@ class KlineBot:
         if min_hold_s is not None and max(0.0, min_hold_s) != self.min_hold_s:
             changes.append(f"demora mínima antes de cerrar {self.min_hold_s:g} s → {max(0.0, min_hold_s):g} s")
             self.min_hold_s = max(0.0, min_hold_s)
+        if send_tp is not None and send_tp != self.send_tp:
+            self.send_tp = send_tp
+            n = self._sync_all_executor_tp()
+            changes.append(("TP con las aperturas ENCENDIDO" if send_tp else "TP con las aperturas APAGADO")
+                           + (f" ({n} abiertas actualizadas en el executor)" if n else ""))
         if changes:
             self._save_settings()
             self.store.mark_dirty(True)
@@ -1303,7 +1312,8 @@ class KlineBot:
         return {"inverted": self.inverted, "fee_pct": self.fee_pct, "klines_enabled": self.klines_enabled,
                 "profit_target_usd": self.profit_target_usd, "max_open": self.max_open,
                 "executor_paused": self.executor_paused, "watch_live_price": self.watch_live,
-                "fast_prices": self.fast_prices, "min_hold_s": self.min_hold_s, "book_fill": BOOK_FILL}
+                "fast_prices": self.fast_prices, "min_hold_s": self.min_hold_s, "book_fill": BOOK_FILL,
+                "send_tp": self.send_tp}
 
     def open_count(self) -> int:
         with self.lock:
@@ -1728,10 +1738,9 @@ class KlineBot:
             self.log(f"[{eng.label}] señal {direction} {symbol} ({body:+.2f}%) saltada: {why}")
             return skip(f"saltada: {why}")
 
-        # Entrada en papel al precio del libro (como el executor); el TP sale de ese precio.
-        self._with_fill(symbol, direction == LONG, qty, price,
-                        lambda px, src: self._open_kline(eng, symbol, direction, candle, body, age, qty,
-                                                         price, px, src, inverted, t0, skip))
+        # Sale ya al executor con el precio en vivo; la entrada en papel se corrige con el libro.
+        px, src = self._fill_from_book(symbol, direction == LONG, qty, price)
+        self._open_kline(eng, symbol, direction, candle, body, age, qty, price, px, src, inverted, t0, skip)
 
     def _open_kline(self, eng: Engine, symbol: str, direction: str, candle: Candle, body: float, age: float,
                     qty: float, signal_px: float, price: float, src: str, inverted: bool, t0: float, skip) -> None:
@@ -1771,6 +1780,7 @@ class KlineBot:
                 **self._open_tp(pos),
             }, t0)
         eng._decide_ms.append(decide_ms)
+        self._refine_entry(eng, pos)
 
     # ── Salidas: ticks de precio (hilo del WS de precios) ─────────────────────
 
@@ -1919,13 +1929,30 @@ class KlineBot:
                 self._closing.discard(trade_id)
             raise
         # Cerrar un LONG es vender (bids); cerrar un SHORT, comprar (asks).
+        revenged = False
+        if self._may_revenge(eng, pos, reason):
+            # La venganza no espera la foto del libro (abrir un WebSocket nuevo tarda segundos): la
+            # pérdida se estima ya con el libro reciente, el precio en vivo o el disparo, y sale al
+            # executor ahora. El cierre en papel se corrige después con el libro.
+            est, _src = self._fill_from_book(symbol, pos.direction == SHORT, pos.qty, price)
+            est_pnl = net_pnl_usd(est, pos.entry_price, pos.qty, pos.direction, self.fee_pct)
+            if est_pnl < 0:
+                revenged = True
+                self._open_revenge(eng, pos, est, -est_pnl, reason)
         self._with_fill(symbol, pos.direction == SHORT, pos.qty, price,
-                        lambda px, src: self._finish_close(eng, pos, px, src, price, reason, on_done))
+                        lambda px, src: self._finish_close(eng, pos, px, src, price, reason, on_done,
+                                                           revenged))
         return True
 
+    def _may_revenge(self, eng: Engine, pos: Position, reason: str) -> bool:
+        """Este cierre puede abrir una venganza (si termina en pérdida)."""
+        return (eng.name == ENGINE_RATIO_REV and not pos.revenge and bool(self.rev_cfg.get("revenge"))
+                and reason not in REVENGE_SKIP_REASONS)
+
     def _finish_close(self, eng: Engine, pos: Position, price: float, src: str,
-                      trigger: float, reason: str, on_done=None) -> None:
-        """Contabiliza el cierre en papel al precio del libro y, si toca, abre la venganza."""
+                      trigger: float, reason: str, on_done=None, revenged: bool = False) -> None:
+        """Contabiliza el cierre en papel al precio del libro y, si toca (y no salió ya al
+        cerrar), abre la venganza."""
         try:
             with self.lock:
                 pos.update(price)
@@ -1965,7 +1992,7 @@ class KlineBot:
                      f"{price:g}{px_note} ({rec['move_pct']:+.2f}%) | PnL neto {pnl:+.4f} USDT (fees {fees:.4f}"
                      f"{f' · funding {funding:+.4f}' if pos.funding_ts else ''}) | "
                      f"{rec['duration_s']:.1f} s | trade #{pos.trade_id}")
-            if pnl < 0 and eng.name == ENGINE_RATIO_REV and not pos.revenge and reason not in REVENGE_SKIP_REASONS:
+            if pnl < 0 and not revenged and self._may_revenge(eng, pos, reason):
                 self._open_revenge(eng, pos, price, -pnl, reason)
         finally:
             with self.lock:
@@ -1991,7 +2018,9 @@ class KlineBot:
         primer mensaje y se cierra). No usa REST ni consume peso de la IP en Binance."""
         stream = f"{sym.lower()}@depth20@100ms"
         last_exc: Optional[Exception] = None
-        for base in BOOK_WS_URLS:
+        # Primero la URL que funcionó la última vez: las que no dan libro cuestan BOOK_TIMEOUT_S cada una.
+        urls = sorted(BOOK_WS_URLS, key=lambda u: u != self._book_ws_ok)
+        for base in urls:
             try:
                 agen = _ws_messages(f"{base}/{stream}")
                 try:
@@ -2002,6 +2031,7 @@ class KlineBot:
                 d = d.get("data", d) if isinstance(d, dict) else {}
                 bids, asks = d.get("b") or d.get("bids") or [], d.get("a") or d.get("asks") or []
                 if bids or asks:
+                    self._book_ws_ok = base
                     return bids, asks
             except Exception as exc:
                 last_exc = exc
@@ -2057,6 +2087,27 @@ class KlineBot:
             self._book_inflight[sym] = fut
             fut.add_done_callback(lambda _f: self._book_inflight.pop(sym, None))
         fut.add_done_callback(done)
+
+    def _refine_entry(self, eng: Engine, pos: Position) -> None:
+        """La orden ya salió al executor con el precio en vivo; en papel se pide el libro en
+        segundo plano y se corrige la entrada cuando llega (el TP/SL puesto no cambia)."""
+        if not BOOK_FILL or pos.entry_src == "libro":
+            return
+
+        def fix(px: float, src: str) -> None:
+            if src != "libro" or not px:
+                return
+            with self.lock:
+                if eng.positions.get(pos.trade_id) is not pos:
+                    return                              # ya cerró
+                old = pos.entry_price
+                pos.entry_price, pos.notional, pos.entry_src = px, pos.qty * px, src
+            self.store.mark_dirty(True)
+            if px != old:
+                self.log(f"[libro] #{pos.trade_id} {pos.symbol} {pos.direction}: entrada en papel "
+                         f"{old:g} → {px:g} (libro)")
+
+        self._with_fill(pos.symbol, pos.direction == LONG, pos.qty, pos.entry_price, fix)
 
     # ── Demora mínima antes de cerrar ─────────────────────────────────────────
 
@@ -2164,7 +2215,7 @@ class KlineBot:
         """Campo "tp" de la apertura. El executor pone un TP POR trade_id, con la cantidad de
         esa posición (su lote), aunque haya otros bots en el mismo par y dirección."""
         tp = 0.0 if pos.inverted else pos.tp_price          # invertida: tp_price es su SL
-        if tp > 0 and SEND_TP:
+        if tp > 0 and self.send_tp:
             pos.ex_tp = tp
             return {"tp": tp}
         return {}
@@ -2172,9 +2223,9 @@ class KlineBot:
     def _sync_executor_tp(self, pos: Position) -> None:
         """Tras cambiar el TP de una abierta (o al recuperarla tras un reinicio): mueve su TP en
         Binance (open_tp de ese trade_id) o lo quita (close_tp) si ya no tiene TP por precio."""
-        if not pos.sent or not SEND_TP:
+        if not pos.sent:
             return
-        tp = 0.0 if pos.inverted else pos.tp_price
+        tp = 0.0 if pos.inverted or not self.send_tp else pos.tp_price
         if tp == pos.ex_tp:
             return
         base = {"trade_id": pos.trade_id, "symbol": pos.symbol, "direction": pos.direction, "strategy": pos.strategy}
@@ -2183,6 +2234,17 @@ class KlineBot:
         elif pos.ex_tp > 0:
             self.executor.send({"action": "close_tp", **base})
         pos.ex_tp = tp
+
+    def _sync_all_executor_tp(self) -> int:
+        """Al encender/apagar el envío del TP: pone o quita el TP en Binance de las abiertas."""
+        with self.lock:
+            open_pos = [p for e in self.engines.values() for p in e.positions.values() if p.sent]
+        n = 0
+        for p in open_pos:
+            before = p.ex_tp
+            self._sync_executor_tp(p)
+            n += p.ex_tp != before
+        return n
 
     def _apply_ratio_exits(self, names: Tuple[str, ...] = RATIO_ENGINES) -> None:
         """Recalcula TP/SL por precio de las posiciones abiertas de los bots de ratio con la
@@ -2271,10 +2333,10 @@ class KlineBot:
             f.get("minNotional", 5.0), MAX_NOTIONAL_OVER)
         if qty <= 0:
             return note(f"venganza saltada: {why}")
-        # Entrada al precio del libro (el del cierre que la dispara sigue fresco: sin otro REST).
-        self._with_fill(sym, side == LONG, qty, ref,
-                        lambda px, src: self._open_revenge_at(eng, lost, side, qty, ref, px, src,
-                                                              price, loss, reason, note))
+        # Sale YA al executor: sin esperar una foto nueva del libro. En papel entra con el libro
+        # si está reciente; si no, con el precio en vivo, y se corrige cuando llega el libro.
+        px, src = self._fill_from_book(sym, side == LONG, qty, ref)
+        self._open_revenge_at(eng, lost, side, qty, ref, px, src, price, loss, reason, note)
 
     def _open_revenge_at(self, eng: Engine, lost: Position, side: str, qty: float, ref: float, px: float,
                          src: str, price: float, loss: float, reason: str, note) -> None:
@@ -2316,6 +2378,7 @@ class KlineBot:
                 "price": ref, "quantity": qty, "notional": round(eff, 4),
                 "level": round(-loss, 4), "strategy": eng.name, **self._open_tp(pos),
             }, time.perf_counter())
+        self._refine_entry(eng, pos)
 
     async def _refresh_tickers(self) -> None:
         """Exploración de todo el mercado por WebSocket (TICKER_SCAN_S segundos): 24 h de cada
@@ -3238,9 +3301,9 @@ class KlineBot:
         if qty <= 0:
             self.log(f"[{eng.label}] señal {side} {sym} saltada: {why}")
             return skip(f"saltada: {why}")
-        self._with_fill(sym, side == LONG, qty, price,
-                        lambda px, src: self._ratio_open_at(eng, sym, side, prev, last, chg, pct24, qty,
-                                                            price, px, src, skip))
+        # Sale ya al executor con el precio en vivo; la entrada en papel se corrige con el libro.
+        px, src = self._fill_from_book(sym, side == LONG, qty, price)
+        self._ratio_open_at(eng, sym, side, prev, last, chg, pct24, qty, price, px, src, skip)
 
     def _ratio_open_at(self, eng: Engine, sym: str, side: str, prev: Tuple[int, float], last: Tuple[int, float],
                        chg: float, pct24: float, qty: float, signal_px: float, price: float, src: str, skip) -> None:
@@ -3279,6 +3342,7 @@ class KlineBot:
                 "price": signal_px, "quantity": qty, "notional": round(eff, 4),
                 "level": round(chg, 4), "strategy": eng.name, **self._open_tp(pos),
             }, time.perf_counter())
+        self._refine_entry(eng, pos)
 
     def _ratio_snapshot(self, all_rows: bool = True) -> dict:
         eng = self.engines[ENGINE_RATIO]
@@ -3582,17 +3646,7 @@ class KlineBot:
                  f"funding {rate:+.4f}% → cobra ~{gain:+.4f} USDT a las {_utc(ts, '%H:%M:%S')} UTC "
                  f"({left:.2f} s antes) | px={price:g} ({src}) qty={qty:g} ({eff:.2f} USDT) | trade #{pos.trade_id}")
         self._funding_schedule_close(pos)
-        # En papel: la entrada se corrige con el libro cuando llegue (el executor ya salió).
-        if BOOK_FILL:
-            def fix(px: float, fsrc: str) -> None:
-                with self.lock:
-                    if pos.trade_id not in eng.positions or fsrc != "libro" or not px:
-                        return
-                    pos.entry_price, pos.entry_src = px, fsrc
-                    pos.notional = qty * px
-                    pos.mfe_pct = pos.mae_pct = pos.mfe_usd = pos.mae_usd = 0.0
-                    pos.update(pos.last_price or px)
-            self._with_fill(sym, side == LONG, qty, price, fix)
+        self._refine_entry(eng, pos)          # en papel: la entrada se corrige con el libro cuando llegue
         return pos
 
     def _funding_schedule_close(self, pos: Position) -> None:
@@ -4082,7 +4136,7 @@ def api_global_set():
         vals["inverted"] = _flag(data["inverted"])
     if "executor_paused" in data:
         vals["executor_paused"] = _flag(data["executor_paused"])
-    for key in ("watch_live_price", "fast_prices"):
+    for key in ("watch_live_price", "fast_prices", "send_tp"):
         if key in data:
             vals[key] = _flag(data[key])
     if data.get("max_open") not in (None, ""):
@@ -4749,6 +4803,7 @@ HTML = r"""<!doctype html>
           <div class="row c">
             <button type="button" data-act="watchLive" id="btnWatchLive">—</button>
             <button type="button" data-act="fastPx" id="btnFastPx">—</button>
+            <button type="button" data-act="sendTp" id="btnSendTp">—</button>
           </div>
           <div class="note" id="ecoNote"></div>
         </div>
@@ -5303,6 +5358,10 @@ function render(d) {
   bw.textContent = g.watch_live_price ? 'Vigilados: precio en vivo (3 s) · apagar' : 'Vigilados: sin precio en vivo · encender';
   bf.textContent = g.fast_prices ? 'Abiertas: precio rápido (~100 ms) · pasar a 1 s' : 'Abiertas: precio cada 1 s · pasar a rápido';
   bw.className = 'small ' + (g.watch_live_price ? 'ok' : 'ghost'); bf.className = 'small ' + (g.fast_prices ? 'ok' : 'ghost');
+  const bt = q('btnSendTp');
+  bt.dataset.on = g.send_tp ? '1' : '';
+  bt.textContent = g.send_tp ? 'TP al executor con cada apertura · apagar' : 'TP al executor apagado · encender';
+  bt.className = 'small ' + (g.send_tp ? 'ok' : 'ghost');
   q('ecoNote').textContent = `Vigilados ahora: ${r.watch_count || 0}. Con su precio en vivo apagado, su 24 h se lee en la exploración de cada 5 min y el precio para entrar se pide solo cuando el ratio da señal. Con las abiertas a 1 s, el TP que cada posición lleva puesto en Binance cubre los picos.`;
   const ind = r.ind;
   if (ind) {
@@ -5497,6 +5556,12 @@ const ACTIONS = {
       glb({klines_enabled: on}, '/api/global', 'cfgMsg', r => r.klines_enabled ? 'Velas encendidas.' : 'Velas apagadas.');
   },
   watchLive(b) { const on = !b.dataset.on; glb({watch_live_price: on}, '/api/global', 'rtMsg', r => r.watch_live_price ? 'Precio en vivo de los vigilados encendido (cada 3 s).' : 'Precio en vivo de los vigilados apagado: menos tráfico.'); },
+  sendTp(b) {
+    const on = !b.dataset.on;
+    if (confirm(on ? '¿Mandar el TP con cada apertura (todos los bots)? Las abiertas reciben su TP en Binance ahora.'
+                   : '¿Dejar de mandar el TP con las aperturas (todos los bots)? Se quita el TP en Binance de las abiertas; el bot sigue cerrando por su TP en papel.'))
+      glb({send_tp: on}, '/api/global', 'rtMsg', r => r.send_tp ? 'TP con las aperturas encendido.' : 'TP con las aperturas apagado.');
+  },
   fastPx(b) { const on = !b.dataset.on; glb({fast_prices: on}, '/api/global', 'rtMsg', r => r.fast_prices ? 'Abiertas con precio rápido (~100 ms).' : 'Abiertas con precio cada 1 s: menos tráfico.'); },
   indBot(b) {
     const on = !b.dataset.on;
