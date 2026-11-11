@@ -56,16 +56,16 @@ def test_abre_en_el_lado_que_cobra_y_cierra_tras_el_cobro(tmp_path, monkeypatch)
     bot.executor.send = lambda payload, *a, **k: enviados.append((time.time(), payload))
     bot._price = lambda sym: {"AUSDT": 1.0, "BUSDT": 2.0}.get(sym)
     pedidos = _libro(bot, [["0.99", "1000"]], [["1.01", "1000"]])
-    bot.funding_cfg.update(open_before_s=0.6, close_after_s=0.15)
+    bot.funding_cfg.update(open_before_s=0.6, close_after_s=0.15)   # más que FUNDING_MIN_LEAD_S (0.4 s)
+    monkeypatch.setattr(st, "FUNDING_TRACK", False)
     eng = bot.engines[st.ENGINE_FUNDING]
 
     async def run():
         bot.loop = asyncio.get_running_loop()
         ts = time.time() + 0.9
-
-        async def foto():
+        async def snap(*a, **k):
             return [dict(r) for r in _filas(ts)]
-        bot._funding_ws_snapshot = foto
+        bot._funding_ws_snapshot = snap
         await bot._funding_cycle(ts)
         await asyncio.sleep(0.6)                                    # abiertas antes del cobro
         opened = {p.symbol: p for p in eng.positions.values()}
@@ -160,6 +160,96 @@ def test_precio_pedido_por_dos_no_se_suelta_antes_de_tiempo(tmp_path, monkeypatc
     assert "AUSDT" in bot._price_hold              # …y el funding sigue teniendo su precio en vivo
     bot._release_price(["AUSDT"])
     assert not bot._price_hold
+def _mark(sym, rate, ts, p=1.0):
+    return {"s": sym, "r": str(rate / 100), "T": int(ts * 1000), "p": str(p)}
+
+
+def test_la_consulta_junta_mensajes_hasta_tener_todos_los_pares(tmp_path, monkeypatch):
+    """Si un mensaje de !markPrice@arr llega incompleto, se siguen leyendo hasta que dejan de aparecer pares."""
+    import json
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    monkeypatch.setattr(st, "FUNDING_COLLECT_MIN_S", 0.0)
+    ts = 3600 * 1000
+    lotes = [[_mark(f"S{i}USDT", 0.01, ts) for i in range(400)],
+             [_mark(f"S{i}USDT", 0.01, ts) for i in range(380, 650)] + [_mark("XUSDT", 0.5, ts)],
+             [_mark("S1USDT", 0.02, ts), _mark("ABTC", 1.0, ts)], [_mark("S2USDT", 0.01, ts)],
+             [_mark("TARDEUSDT", 0.9, ts)]]
+    leidos = []
+
+    async def fake_ws(url):
+        for lote in lotes:
+            leidos.append(len(lote))
+            yield json.dumps(lote)
+
+    monkeypatch.setattr(st, "_ws_messages", fake_ws)
+    rows = {r["symbol"]: r for r in asyncio.run(bot._funding_ws_snapshot(5))}
+    assert len(leidos) == 4                         # dos mensajes seguidos sin pares nuevos: corta
+    assert len(rows) == 651 and "XUSDT" in rows and "ABTC" not in rows
+    assert rows["S1USDT"]["rate_pct"] == pytest.approx(0.02)   # el último valor gana
+    assert rows["XUSDT"]["next_ts"] == ts
+
+
+def test_seguimiento_entra_si_cruza_y_no_abre_si_baja(tmp_path, monkeypatch):
+    import json
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    for s in ("AUSDT", "BUSDT", "CUSDT"):
+        bot.filters[s] = {"stepSize": 1, "minQty": 0, "minNotional": 5}
+    bot.executor.send = lambda *a, **k: None
+    bot._price = lambda sym: 1.0
+    bot._refine_entry = lambda *a, **k: None
+    bot.funding_cfg.update(open_before_s=0.6, close_after_s=0.1)
+    monkeypatch.setattr(st, "FUNDING_TRACK_END_S", 0.05)
+    eng = bot.engines[st.ENGINE_FUNDING]
+    urls = []
+
+    async def run():
+        bot.loop = asyncio.get_running_loop()
+        ts = time.time() + 1.3
+
+        async def snap(*a, **k):
+            return [{"symbol": "AUSDT", "rate_pct": 0.45, "next_ts": ts, "mark": 1.0},     # cumple, luego baja
+                    {"symbol": "BUSDT", "rate_pct": 0.25, "next_ts": ts, "mark": 1.0},     # cerca: luego cruza
+                    {"symbol": "CUSDT", "rate_pct": 0.05, "next_ts": ts, "mark": 1.0}]     # lejos: no se sigue
+        bot._funding_ws_snapshot = snap
+
+        async def fake_ws(url):
+            urls.append(url)
+            await asyncio.sleep(0.1)
+            yield json.dumps({"stream": "a", "data": _mark("BUSDT", 0.33, ts)})
+            yield json.dumps({"stream": "b", "data": _mark("AUSDT", 0.2, ts)})
+            await asyncio.sleep(5)
+
+        monkeypatch.setattr(st, "_ws_messages", fake_ws)
+        await bot._funding_cycle(ts)
+        await asyncio.sleep(0.85)
+        return {p.symbol: p for p in eng.positions.values()}
+
+    opened = asyncio.run(run())
+    assert set(opened) == {"BUSDT"} and opened["BUSDT"].funding_rate == pytest.approx(0.33)
+    assert len(urls) == 1 and "ausdt@markPrice@1s" in urls[0] and "busdt@markPrice@1s" in urls[0]
+    assert "cusdt" not in urls[0]
+    assert any(s["symbol"] == "AUSDT" and "bajó" in s["action"] for s in eng.signals)
+    assert not bot._price_hold                     # cada petición de precio en vivo se soltó
+
+
+def test_par_nuevo_sin_filtros_pide_exchange_info(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    pedidos = []
+
+    async def xi():
+        pedidos.append(1)
+        return {"NUEVOUSDT": {"stepSize": 1, "minQty": 0, "minNotional": 5}}
+
+    bot._fetch_exchange_info = xi
+
+    async def run():
+        bot.loop = asyncio.get_running_loop()
+        bot._funding_ensure_filters(["NUEVOUSDT"])
+        bot._funding_ensure_filters(["NUEVOUSDT"])        # no repite mientras está en curso / recién hecho
+        await asyncio.sleep(0.05)
+
+    asyncio.run(run())
+    assert pedidos == [1] and "NUEVOUSDT" in bot.filters
 
 
 def test_api_funding(tmp_path, monkeypatch):
@@ -171,3 +261,51 @@ def test_api_funding(tmp_path, monkeypatch):
     assert c.post("/api/funding", json={"close_after_s": 999}).status_code == 400
     assert c.get("/api/funding").get_json()["cfg"]["notional"] == 25
     assert "funding" in c.get("/api/status?view=bots").get_json()
+
+
+def test_la_consulta_final_es_3_min_antes_aunque_se_guardara_menos():
+    assert st.KlineBot._load_funding_cfg({})["scan_before_s"] == 180
+    assert st.KlineBot._load_funding_cfg({"scan_before_s": 120})["scan_before_s"] == 180   # valor viejo: se ignora
+    assert st.KlineBot._load_funding_cfg({"scan_before_s": 240})["scan_before_s"] == 240
+
+
+def test_la_consulta_une_rest_y_websocket(tmp_path, monkeypatch):
+    """El REST de premiumIndex trae todos los pares; los que el WebSocket no trajo no se pierden."""
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    bot._rest_get = lambda path, *a, **k: [
+        {"symbol": "AUSDT", "markPrice": "1.1", "lastFundingRate": "0.0035", "nextFundingTime": 3600000},
+        {"symbol": "BUSDT", "markPrice": "2", "lastFundingRate": "-0.004", "nextFundingTime": 3600000},
+        {"symbol": "ABTC", "markPrice": "1", "lastFundingRate": "0.01", "nextFundingTime": 3600000}]
+
+    async def ws(*a, **k):
+        return [{"symbol": "AUSDT", "rate_pct": 0.36, "next_ts": 3600.0, "mark": 1.2}]
+    bot._funding_ws_snapshot = ws
+    assert len(asyncio.run(bot._funding_full_snapshot())) == 1         # sin rest=True: solo WebSocket
+    rows = {r["symbol"]: r for r in asyncio.run(bot._funding_full_snapshot(rest=True))}
+    assert set(rows) == {"AUSDT", "BUSDT"}
+    assert rows["AUSDT"]["rate_pct"] == pytest.approx(0.36)          # del WebSocket (más reciente)
+    assert rows["BUSDT"]["rate_pct"] == pytest.approx(-0.4) and rows["BUSDT"]["next_ts"] == 3600.0
+    assert bot._funding_src["only_rest"] == 1
+
+    async def ws_caido(*a, **k):
+        raise RuntimeError("sin WebSocket")
+    llamadas = []
+    rest0 = bot._rest_get
+    bot._rest_get = lambda *a, **k: llamadas.append(1) or rest0(*a, **k)
+    bot._funding_ws_snapshot = ws_caido
+    with pytest.raises(RuntimeError):                                    # REST ya pedido esta hora: no repite
+        asyncio.run(bot._funding_full_snapshot(rest=True))
+    assert llamadas == []
+    bot._funding_rest_ts = 0.0
+    assert len(asyncio.run(bot._funding_full_snapshot(rest=True))) == 2  # con una sola fuente basta
+    assert llamadas == [1]
+
+
+def test_un_par_que_un_escaneo_no_trajo_no_desaparece(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    a = {"symbol": "AUSDT", "rate_pct": 0.5, "next_ts": 3600.0, "mark": 1.0}
+    b = {"symbol": "BUSDT", "rate_pct": -0.6, "next_ts": 3600.0, "mark": 1.0}
+    bot._funding_remember([a])
+    assert {r["symbol"] for r in bot._funding_remember([b])} == {"AUSDT", "BUSDT"}
+    monkeypatch.setattr(st, "FUNDING_CACHE_TTL_S", -1)                    # caducado: ya no cuenta
+    assert bot._funding_remember([]) == []

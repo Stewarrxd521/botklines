@@ -219,14 +219,42 @@ FUNDING_MIN_PCT       = abs(float(os.getenv("FUNDING_MIN_PCT", "0.3")))    # |fu
 FUNDING_NOTIONAL      = float(os.getenv("FUNDING_NOTIONAL", "20"))         # USDT por entrada
 FUNDING_OPEN_BEFORE_S = float(os.getenv("FUNDING_OPEN_BEFORE_S", "2"))     # abre N s antes del cobro
 FUNDING_CLOSE_AFTER_S = float(os.getenv("FUNDING_CLOSE_AFTER_S", "1"))     # cierra N s después del cobro
-# Consulta final del funding: SIEMPRE con anticipación (mínimo FUNDING_SCAN_MIN_S, 2 min), para tener los pares, el
+# Consulta final del funding: SIEMPRE con anticipación (mínimo FUNDING_SCAN_MIN_S, 3 min), para tener los pares, el
 # precio en vivo y el reloj listos mucho antes de abrir. Un valor guardado por debajo del mínimo se ignora.
-FUNDING_SCAN_MIN_S = float(os.getenv("FUNDING_SCAN_MIN_S", "120"))
-FUNDING_SCAN_BEFORE_S = max(float(os.getenv("FUNDING_SCAN_BEFORE_S", "120")), FUNDING_SCAN_MIN_S)
+FUNDING_SCAN_MIN_S = float(os.getenv("FUNDING_SCAN_MIN_S", "180"))
+FUNDING_SCAN_BEFORE_S = max(float(os.getenv("FUNDING_SCAN_BEFORE_S", "180")), FUNDING_SCAN_MIN_S)
+# Una consulta lee TODOS los pares: junta mensajes del stream hasta que dos seguidos no traen pares nuevos
+# (mínimo FUNDING_COLLECT_MIN_S y como mucho FUNDING_COLLECT_MAX_S). Antes se tomaba solo el primer mensaje y,
+# si llegaba incompleto, un par que cumplía no aparecía o desaparecía de la tabla.
+FUNDING_COLLECT_MIN_S = float(os.getenv("FUNDING_COLLECT_MIN_S", "4"))
+# REST: SOLO en la consulta final (3 min antes del cobro) y como mucho una vez cada FUNDING_REST_MIN_INTERVAL_S
+# (≈ 1 por hora): /fapi/v1/premiumIndex, UNA petición, peso 10, ~40 KB con gzip, trae TODOS los pares de una vez.
+# Se une a lo que traiga el WebSocket para que no falte ningún par; con esa lista se suscriben en vivo por
+# WebSocket los que cumplen o están cerca. El arranque, la exploración horaria y la manual van SOLO por WebSocket.
+FUNDING_REST_SNAPSHOT = os.getenv("FUNDING_REST_SNAPSHOT", "true").lower() in ("1", "true", "yes")
+FUNDING_REST_MIN_INTERVAL_S = float(os.getenv("FUNDING_REST_MIN_INTERVAL_S", "3000"))
+# La tabla de la web y la exploración horaria usan el último valor visto de cada par en los últimos
+# FUNDING_CACHE_TTL_S: un par que un escaneo por WebSocket no trajo no desaparece de la lista.
+FUNDING_CACHE_TTL_S = float(os.getenv("FUNDING_CACHE_TTL_S", "900"))
+FUNDING_COLLECT_MAX_S = float(os.getenv("FUNDING_COLLECT_MAX_S", "12"))
+# Seguimiento en vivo tras la consulta final: el funding de Binance es una ESTIMACIÓN que cambia hasta el cobro.
+# Los pares que cobran en esa hora y están a ≥ FUNDING_TRACK_RATIO del umbral se siguen por su stream propio
+# (<par>@markPrice@1s, pocos pares: poco ancho de banda) hasta FUNDING_TRACK_END_S antes de abrir. Si uno cruza
+# el umbral entra; si uno que cumplía baja del umbral, no se abre.
+FUNDING_TRACK = os.getenv("FUNDING_TRACK", "true").lower() in ("1", "true", "yes")
+FUNDING_TRACK_RATIO = float(os.getenv("FUNDING_TRACK_RATIO", "0.5"))
+FUNDING_TRACK_MAX = int(os.getenv("FUNDING_TRACK_MAX", "40"))
+FUNDING_TRACK_END_S = float(os.getenv("FUNDING_TRACK_END_S", "0.5"))
+FUNDING_TRACK_WS_BASES = [u.strip() for u in os.getenv(
+    "FUNDING_TRACK_WS_BASES", "wss://fstream.binance.com/market/stream?streams=,"
+                              "wss://fstream.binance.com/stream?streams=").split(",") if u.strip()]
+# Pares nuevos con funding alto sin filtros de cantidad (la caché de exchangeInfo dura días): se pide
+# exchangeInfo otra vez, como mucho una vez cada FUNDING_FILTERS_RETRY_S.
+FUNDING_FILTERS_RETRY_S = float(os.getenv("FUNDING_FILTERS_RETRY_S", "1800"))
 FUNDING_PERIOD_S      = 3600            # Binance cobra en horas en punto (cada 1, 4 u 8 h según el par)
 # El funding se lee por WebSocket (!markPrice@arr: tasa "r", próximo cobro "T", mark "p" y hora "E" de
-# TODOS los pares en un solo mensaje). Se abre unos segundos antes del cobro, se toma el primer mensaje
-# y se cierra: nada de REST. Se prueban en orden; la que funcione se recuerda.
+# todos los pares). Se abre antes del cobro, se juntan mensajes hasta tener todos los pares y se cierra:
+# nada de REST. Se prueban en orden; la que funcione se recuerda.
 FUNDING_WS_URLS = [u.strip() for u in os.getenv(
     "FUNDING_WS_URLS", "wss://fstream.binance.com/market/ws/!markPrice@arr@1s,"
                        "wss://fstream.binance.com/market/ws/!markPrice@arr,"
@@ -258,7 +286,7 @@ FUNDING_CLOCK_TOLERANCE_S = float(os.getenv("FUNDING_CLOCK_TOLERANCE_S", "0.15")
 # la lista de los que ya cumplen el umbral (se les calienta el precio en vivo antes de la consulta final).
 FUNDING_HOURLY_SCAN = os.getenv("FUNDING_HOURLY_SCAN", "true").lower() in ("1", "true", "yes")
 FUNDING_HOURLY_BEFORE_S = float(os.getenv("FUNDING_HOURLY_BEFORE_S", "300"))      # cuánto antes de cada hora en punto
-FUNDING_HOURLY_MAX_SYMBOLS = int(os.getenv("FUNDING_HOURLY_MAX_SYMBOLS", "700"))
+FUNDING_HOURLY_MAX_SYMBOLS = int(os.getenv("FUNDING_HOURLY_MAX_SYMBOLS", "3000"))   # tope de seguridad, no de diseño
 FUNDING_HOURLY_MAX_S = float(os.getenv("FUNDING_HOURLY_MAX_S", "30"))
 FUNDING_WATCH_PRICE_MAX = int(os.getenv("FUNDING_WATCH_PRICE_MAX", "10"))         # precios en vivo que se calientan
 FUNDING_CLOCK_SAMPLES = int(os.getenv("FUNDING_CLOCK_SAMPLES", "12"))
@@ -1249,6 +1277,16 @@ class KlineBot:
         self.loop_lag_ms = 0.0                        # mayor retraso reciente del event loop
         self.funding_scans = 0
         self._funding_ws_ok = ""                      # última URL del stream de funding que respondió
+        self._funding_track_ok = ""                   # última base del stream combinado que respondió
+        self._funding_snap_msgs = 0                   # mensajes que hizo falta juntar en la última consulta
+        self._funding_src: dict = {}                  # cuántos pares trajo cada fuente en la última consulta
+        self._funding_rest_ts = 0.0                   # última vez que se pidió premiumIndex por REST (≤ 1 por hora)
+        self._funding_seen: Dict[str, tuple] = {}     # símbolo → (cuándo, última fila vista)
+        self._funding_live: Dict[str, dict] = {}      # último funding visto de los pares del cobro en curso
+        self._funding_live_for = 0.0                  # cobro al que corresponde _funding_live
+        self._funding_launched: set = set()           # pares ya programados para el cobro en curso
+        self._filters_retry_ts = 0.0                  # último reintento de exchangeInfo por un par sin filtros
+        self._filters_busy = False
         self._filters_from_file = False               # los filtros vienen del archivo de respaldo, no de Binance
         self.funding_errors = 0
         self.funding_last_error = ""
@@ -3843,35 +3881,121 @@ class KlineBot:
             return 0.0
         return funding_income_usd(p.notional, p.funding_rate, p.direction)
 
-    async def _funding_ws_snapshot(self) -> List[dict]:
-        """Funding de todos los perpetuos por WebSocket (!markPrice@arr): se conecta, toma el primer
-        mensaje (trae todos los pares) y se cierra. Sin REST. NO toca el reloj (ver _funding_clock_sync)."""
+    async def _funding_ws_snapshot(self, max_s: Optional[float] = None, cap: Optional[int] = None) -> List[dict]:
+        """Funding de TODOS los perpetuos por WebSocket (!markPrice@arr): se conecta y junta mensajes (el último valor
+        de cada par gana) hasta que dos seguidos no traen pares nuevos (mínimo FUNDING_COLLECT_MIN_S, máximo `max_s`),
+        y se cierra. Un solo mensaje no basta: puede llegar incompleto y entonces faltaban pares que cumplían.
+        Sin REST. NO toca el reloj (ver _funding_clock_sync)."""
+        max_s = FUNDING_COLLECT_MAX_S if max_s is None else max_s
+        cap = max(cap or FUNDING_HOURLY_MAX_SYMBOLS, 1)
+        t0 = time.monotonic()
+        deadline = t0 + max(max_s, 1.0)
         last_exc: Optional[Exception] = None
         for url in sorted(FUNDING_WS_URLS, key=lambda u: u != self._funding_ws_ok):
-            t0 = time.time()
+            if deadline - time.monotonic() <= 0.5:
+                break
+            seen: Dict[str, dict] = {}
+            msgs, stale = 0, 0
             agen = _ws_messages(url)
             try:
-                raw = await asyncio.wait_for(agen.__anext__(), FUNDING_WS_TIMEOUT_S)
-                t1 = time.time()                     # al RECIBIR: el cierre del socket ya no infla la medida
+                while len(seen) < cap:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    try:
+                        raw = await asyncio.wait_for(agen.__anext__(), min(left, FUNDING_WS_TIMEOUT_S))
+                    except (asyncio.TimeoutError, StopAsyncIteration) as exc:
+                        if not seen:
+                            last_exc = exc if isinstance(exc, asyncio.TimeoutError) else RuntimeError("cerrado")
+                        break
+                    rows = self._parse_mark_rows(raw)
+                    if rows is None:
+                        last_exc = RuntimeError("markPrice: respuesta inesperada")
+                        break
+                    msgs += 1
+                    before = len(seen)
+                    for r in rows:
+                        if r["symbol"] in seen or len(seen) < cap:
+                            seen[r["symbol"]] = r                   # el último mensaje gana
+                    stale = stale + 1 if len(seen) == before else 0
+                    if seen and stale >= 2 and time.monotonic() - t0 >= FUNDING_COLLECT_MIN_S:
+                        break                                       # dos mensajes sin pares nuevos: ya están todos
             except Exception as exc:
                 last_exc = exc
-                continue
             finally:
                 try:
                     await asyncio.wait_for(agen.aclose(), 2.0)
                 except Exception:
                     pass
-            rows = self._parse_mark_rows(raw)
-            if rows is None:
-                last_exc = RuntimeError("markPrice: respuesta inesperada")
+            if not seen:
+                if last_exc is None:
+                    last_exc = RuntimeError("markPrice: sin pares")
                 continue
-            if not rows:
-                last_exc = RuntimeError("markPrice: sin pares")
-                continue
-            self.funding_last_scan_ms = (t1 - t0) * 1000
+            self.funding_last_scan_ms = (time.monotonic() - t0) * 1000
             self._funding_ws_ok = url
-            return rows
+            self._funding_snap_msgs = msgs
+            return list(seen.values())
         raise RuntimeError(f"sin funding por WebSocket: {last_exc!r}")
+
+    def _funding_rest_rows(self) -> List[dict]:
+        """premiumIndex por REST (con las rutas/proxies de _rest_get): todos los perpetuos en una sola respuesta."""
+        data = self._rest_get("/fapi/v1/premiumIndex", timeout=10.0)
+        if not isinstance(data, list):
+            raise RuntimeError("premiumIndex: respuesta inesperada")
+        rows = []
+        for d in data:
+            try:
+                sym = str(d["symbol"])
+                if not sym.endswith(QUOTE_ASSET):
+                    continue
+                rows.append({"symbol": sym, "rate_pct": float(d.get("lastFundingRate") or 0) * 100.0,
+                             "next_ts": int(d.get("nextFundingTime") or 0) / 1000.0,
+                             "mark": float(d.get("markPrice") or 0)})
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not rows:
+            raise RuntimeError("premiumIndex: sin pares")
+        return rows
+
+    async def _funding_full_snapshot(self, max_s: Optional[float] = None, cap: Optional[int] = None,
+                                     rest: bool = False) -> List[dict]:
+        """Pares por WebSocket y, solo si rest=True (consulta final) y no se pidió en la última
+        FUNDING_REST_MIN_INTERVAL_S, también premiumIndex por REST en paralelo (lista completa). Se unen: de cada par
+        vale el WebSocket si lo trajo (más reciente) y si no el REST. Con que uno responda, basta."""
+        t0 = time.monotonic()
+        tasks = [self._funding_ws_snapshot(max_s, cap)]
+        if rest and FUNDING_REST_SNAPSHOT and time.time() - self._funding_rest_ts >= FUNDING_REST_MIN_INTERVAL_S:
+            self._funding_rest_ts = time.time()
+            tasks.append(asyncio.to_thread(self._funding_rest_rows))
+        res = await asyncio.gather(*tasks, return_exceptions=True)
+        ws = res[0] if isinstance(res[0], list) else []
+        rest = res[1] if len(res) > 1 and isinstance(res[1], list) else []
+        errs = [f"{n}: {r!r}" for n, r in zip(("WebSocket", "REST"), res) if isinstance(r, BaseException)]
+        if not ws and not rest:
+            raise RuntimeError(" | ".join(errs) or "sin datos")
+        merged: Dict[str, dict] = {r["symbol"]: r for r in rest}
+        merged.update({r["symbol"]: r for r in ws})
+        only_rest = len(set(merged) - {r["symbol"] for r in ws}) if ws else 0
+        self._funding_src = {"ws": len(ws), "rest": len(rest), "total": len(merged), "only_rest": only_rest,
+                             "errors": errs}
+        self.funding_last_scan_ms = (time.monotonic() - t0) * 1000
+        if errs:
+            self.log(f"[funding] consulta con una sola fuente ({len(merged)} pares): {' | '.join(errs)}")
+        elif only_rest:
+            self.log(f"[funding] el WebSocket trajo {len(ws)} pares y el REST {len(rest)}: "
+                     f"{only_rest} solo llegaron por REST (se incluyen)")
+        return list(merged.values())
+
+    def _funding_remember(self, rows: List[dict]) -> List[dict]:
+        """Suma `rows` a la memoria de pares vistos y devuelve todos los vistos en los últimos FUNDING_CACHE_TTL_S
+        (de cada par, su valor más reciente)."""
+        now = time.time()
+        with self.lock:
+            for r in rows:
+                self._funding_seen[r["symbol"]] = (now, r)
+            for sym in [k for k, (t, _r) in self._funding_seen.items() if now - t > FUNDING_CACHE_TTL_S]:
+                del self._funding_seen[sym]
+            return [r for _t, r in self._funding_seen.values()]
 
     def _clock_sync_thread(self, full: bool = True) -> dict:
         """Corre en un hilo con su propio event loop (el retraso del loop principal no entra en la medición).
@@ -4006,12 +4130,13 @@ class KlineBot:
 
     async def _funding_scan(self) -> List[dict]:
         try:
-            rows = await self._funding_ws_snapshot()
+            rows = await self._funding_full_snapshot(rest=True)
         except Exception as exc:
             self.funding_errors += 1
             self.funding_last_error = str(exc)
             self.log(f"[funding] ✗ no pude leer el funding: {exc}")
             return []
+        rows = self._funding_remember(rows)             # un par que esta vez no llegó no se pierde
         thr = self.funding_cfg["min_pct"]
         rows.sort(key=lambda r: abs(r["rate_pct"]), reverse=True)
         with self.lock:
@@ -4161,45 +4286,13 @@ class KlineBot:
         cuáles cumplen el umbral para el cobro `ts`. A los de mayor |funding| les calienta el precio en vivo."""
         self._release_watch()
         t0 = time.monotonic()
-        deadline = t0 + FUNDING_HOURLY_MAX_S
         cap = max(FUNDING_HOURLY_MAX_SYMBOLS, 1)
-        seen: Dict[str, dict] = {}
         last_exc: Optional[Exception] = None
-        for url in sorted(FUNDING_WS_URLS, key=lambda u: u != self._funding_ws_ok):
-            if deadline - time.monotonic() <= 1.0:
-                break
-            agen = _ws_messages(url)
-            first = True
-            try:
-                while len(seen) < cap:
-                    left = deadline - time.monotonic()
-                    if left <= 0:
-                        break
-                    try:
-                        raw = await asyncio.wait_for(agen.__anext__(), min(left, FUNDING_WS_TIMEOUT_S) if first else left)
-                    except (asyncio.TimeoutError, StopAsyncIteration):
-                        break
-                    first = False
-                    rows = self._parse_mark_rows(raw)
-                    if rows is None:
-                        last_exc = RuntimeError("markPrice: respuesta inesperada")
-                        break
-                    before = len(seen)
-                    for r in rows:
-                        if r["symbol"] in seen or len(seen) < cap:
-                            seen[r["symbol"]] = r                   # el último mensaje gana
-                    if len(seen) == before:                           # un mensaje sin pares nuevos: ya se vio todo
-                        break
-            except Exception as exc:
-                last_exc = exc
-            finally:
-                try:
-                    await asyncio.wait_for(agen.aclose(), 2.0)
-                except Exception:
-                    pass
-            if seen:
-                self._funding_ws_ok = url
-                break
+        try:
+            got = await self._funding_full_snapshot(max_s=FUNDING_HOURLY_MAX_S, cap=cap)
+        except Exception as exc:
+            got, last_exc = [], exc
+        seen: Dict[str, dict] = {r["symbol"]: r for r in got}
         elapsed = time.monotonic() - t0
         if not seen:
             self.funding_errors += 1
@@ -4207,7 +4300,7 @@ class KlineBot:
             self.log(f"[funding] ✗ exploración {'manual' if manual else 'horaria' if warm else 'inicial'} sin datos tras {elapsed:.1f} s: {last_exc!r}")
             return
         thr = self.funding_cfg["min_pct"]
-        rows = sorted(seen.values(), key=lambda r: abs(r["rate_pct"]), reverse=True)
+        rows = sorted(self._funding_remember(list(seen.values())), key=lambda r: abs(r["rate_pct"]), reverse=True)
         cands = [r for r in rows if abs(r["rate_pct"]) >= thr and abs(r["next_ts"] - ts) <= 1.5]
         hot = ([r["symbol"] for r in cands if r["symbol"] in self.filters][:max(FUNDING_WATCH_PRICE_MAX, 0)]
                if warm else [])                              # la de arranque/reintento solo llena la tabla
@@ -4224,38 +4317,180 @@ class KlineBot:
             }
         if hot:
             self._refresh_pos_syms(force=True)
+        if warm:
+            self._funding_ensure_filters([r["symbol"] for r in cands])
         self.log(f"[funding] exploración {'MANUAL' if manual else 'horaria' if warm else 'inicial'}: {len(seen)} pares en {elapsed:.1f} s"
                  f"{' (tope ' + str(cap) + ')' if len(seen) >= cap else ''} · cobro {_utc(ts, '%H:%M')} UTC: "
                  + (f"{len(cands)} ≥ ±{thr:g}%: " + ", ".join(f"{r['symbol']} {r['rate_pct']:+.3f}%" for r in cands[:10])
                     if cands else f"ninguno ≥ ±{thr:g}%"))
 
+    def _funding_ensure_filters(self, syms) -> None:
+        """Pares con funding alto sin filtros de cantidad (p. ej. listados después de la última caché de exchangeInfo):
+        pide exchangeInfo otra vez en segundo plano (como mucho una vez cada FUNDING_FILTERS_RETRY_S)."""
+        missing = sorted(s for s in syms if s not in self.filters)
+        if not missing or self._filters_busy or time.time() - self._filters_retry_ts < FUNDING_FILTERS_RETRY_S:
+            return
+        if not self._on_loop():
+            return
+        self._filters_retry_ts = time.time()
+        self._filters_busy = True
+
+        async def run() -> None:
+            try:
+                self.log(f"[funding] sin filtros de cantidad para {', '.join(missing[:10])}: pido exchangeInfo de nuevo")
+                got = await self._fetch_exchange_info()
+                if self._filters_from_file:
+                    self.log("[funding] exchangeInfo no respondió (solo el archivo de respaldo): sigo sin esos filtros")
+                    got = {k: v for k, v in got.items() if k not in self.filters}   # el archivo solo suma, no pisa
+                added = sorted(set(got) - set(self.filters))
+                with self.lock:
+                    self.filters.update(got)
+                    self.symbols = sorted(self.filters)
+                if added:
+                    self.log(f"[funding] filtros nuevos: {', '.join(added[:15])}")
+            except Exception as exc:
+                self.log(f"[funding] ✗ exchangeInfo: {exc}")
+            finally:
+                self._filters_busy = False
+
+        self._spawn(run())
+
+    def _funding_launch(self, r: dict, ts: float, held: bool = False) -> None:
+        """Programa la entrada de un par que cumple (una sola vez por cobro). held=True: quien llama ya tomó la
+        petición de precio en vivo del par; si no se lanza la entrada, se suelta aquí."""
+        sym = r["symbol"]
+        side = funding_side(r["rate_pct"])
+        if sym in self._funding_launched or side is None or self.engines[ENGINE_FUNDING].paused:
+            if held:
+                self._release_price((sym,))
+            if side is not None and sym not in self._funding_launched:
+                self._funding_launched.add(sym)
+                self._funding_signal(sym, side, r["rate_pct"], ts, r["mark"], "pausado")
+            return
+        self._funding_launched.add(sym)
+        self._spawn(self._funding_trade(sym, side, r["rate_pct"], ts, r["mark"], held=held))
+
     async def _funding_cycle(self, ts: float) -> None:
-        """Consulta el funding antes del cobro `ts` y programa las entradas de los que lo superan."""
-        eng = self.engines[ENGINE_FUNDING]
+        """Consulta el funding de TODOS los pares antes del cobro `ts`, programa las entradas de los que superan el
+        umbral y deja el seguimiento en vivo de los que están cerca (el funding cambia hasta el cobro)."""
         rows = await self._funding_scan()
         thr = self.funding_cfg["min_pct"]
-        cands = [r for r in rows if abs(r["next_ts"] - ts) <= 1.5 and abs(r["rate_pct"]) >= thr]
-        trades = [(r, side) for r in cands if (side := funding_side(r["rate_pct"])) is not None]
-        if not eng.paused:
-            self._hold_price(r["symbol"] for r, _side in trades)   # antes de soltar los calentados: sin cortes
+        due = [r for r in rows if abs(r["next_ts"] - ts) <= 1.5]
+        cands = [r for r in due if abs(r["rate_pct"]) >= thr]
+        later = [r for r in rows if abs(r["rate_pct"]) >= thr and abs(r["next_ts"] - ts) > 1.5]
+        with self.lock:
+            self._funding_live = {r["symbol"]: dict(r) for r in due}
+            self._funding_live_for = ts
+            self._funding_launched = set()
+        if not self.engines[ENGINE_FUNDING].paused:
+            self._hold_price(r["symbol"] for r in cands)    # antes de soltar los calentados: sin cortes
+        held = not self.engines[ENGINE_FUNDING].paused
         self._release_watch()
-        if not cands:
-            if rows:
+        self._funding_ensure_filters([r["symbol"] for r in cands])
+        extra = (f" · {len(later)} con funding alto cobran más tarde (intervalo 4/8 h): "
+                 + ", ".join(f"{r['symbol']} {_utc(r['next_ts'], '%H:%M')}" for r in later[:5])) if later else ""
+        if rows:
+            src = self._funding_src
+            info = (f"{len(rows)} pares leídos (WebSocket {src.get('ws', 0)} en {self._funding_snap_msgs} mensajes"
+                    f" · REST {src.get('rest', 0)})")
+            if cands:
+                self.log(f"[funding] cobro {_utc(ts, '%H:%M')} UTC · {info}: {len(cands)} con funding ≥ ±{thr:g}%: "
+                         + ", ".join(f"{r['symbol']} {r['rate_pct']:+.3f}%" for r in cands[:10]) + extra)
+            else:
                 top = rows[0]
-                self.log(f"[funding] cobro {_utc(ts, '%H:%M')} UTC: ninguno ≥ ±{thr:g}% "
-                         f"(mayor {top['symbol']} {top['rate_pct']:+.4f}%)")
+                self.log(f"[funding] cobro {_utc(ts, '%H:%M')} UTC · {info}: ninguno ≥ ±{thr:g}% "
+                         f"(mayor {top['symbol']} {top['rate_pct']:+.4f}%){extra}")
+        for r in cands:
+            self._funding_launch(r, ts, held=held)
+        if not FUNDING_TRACK or self.engines[ENGINE_FUNDING].paused:
             return
-        self.log(f"[funding] cobro {_utc(ts, '%H:%M')} UTC: {len(cands)} con funding ≥ ±{thr:g}%: "
-                 + ", ".join(f"{r['symbol']} {r['rate_pct']:+.3f}%" for r in cands[:10]))
-        for r, side in trades:
-            if eng.paused:
-                self._funding_signal(r["symbol"], side, r["rate_pct"], ts, r["mark"], "pausado")
-                continue
-            self._spawn(self._funding_trade(r["symbol"], side, r["rate_pct"], ts, r["mark"], held=True))
+        near = sorted((r for r in due if abs(r["rate_pct"]) >= thr * max(FUNDING_TRACK_RATIO, 0.0)),
+                      key=lambda r: abs(r["rate_pct"]), reverse=True)[:max(FUNDING_TRACK_MAX, 0)]
+        if near:
+            self._spawn(self._funding_track(ts, [r["symbol"] for r in near]))
+
+    @staticmethod
+    def _parse_mark_one(raw) -> Optional[dict]:
+        """Un mensaje del stream combinado <par>@markPrice@1s → fila {symbol, rate_pct, next_ts, mark}."""
+        try:
+            d = json.loads(raw)
+            d = d.get("data", d) if isinstance(d, dict) else None
+            if not isinstance(d, dict) or "s" not in d:
+                return None
+            return {"symbol": str(d["s"]), "rate_pct": float(d.get("r") or 0) * 100.0,
+                    "next_ts": int(d.get("T") or 0) / 1000.0, "mark": float(d.get("p") or 0)}
+        except (ValueError, TypeError, KeyError):
+            return None
+
+    async def _funding_track(self, ts: float, syms: List[str]) -> None:
+        """Sigue en vivo el funding de `syms` (solo esos pares, 1 msg/s cada uno) hasta FUNDING_TRACK_END_S antes de
+        abrir. Un par que cruza el umbral entra; los que bajan se descartan al abrir (ver _funding_trade)."""
+        streams = "/".join(f"{s.lower()}@markPrice@1s" for s in syms)
+        thr0 = self.funding_cfg["min_pct"]
+        joined: List[str] = []
+        msgs = 0
+        start_rates = {s: self._funding_live.get(s, {}).get("rate_pct", 0.0) for s in syms}
+        bases = sorted(FUNDING_TRACK_WS_BASES, key=lambda b: b != self._funding_track_ok)
+        tries = 0
+        while tries < 6:
+            end = ts - self.funding_cfg["open_before_s"] - FUNDING_TRACK_END_S
+            if end - self._srv_now() <= 0.2:
+                break
+            base = bases[tries % len(bases)]
+            tries += 1
+            agen = _ws_messages(base + streams)
+            try:
+                while True:
+                    left = (ts - self.funding_cfg["open_before_s"] - FUNDING_TRACK_END_S) - self._srv_now()
+                    if left <= 0:
+                        break
+                    try:
+                        raw = await asyncio.wait_for(agen.__anext__(), min(left, FUNDING_WS_TIMEOUT_S))
+                    except (asyncio.TimeoutError, StopAsyncIteration):
+                        break
+                    r = self._parse_mark_one(raw)
+                    if r is None or abs(r["next_ts"] - ts) > 1.5:
+                        continue
+                    msgs += 1
+                    self._funding_track_ok = base
+                    thr = self.funding_cfg["min_pct"]
+                    with self.lock:
+                        if self._funding_live_for != ts:
+                            return                                  # ya es otro cobro
+                        self._funding_live[r["symbol"]] = r
+                        for row in self._funding_rows:              # la tabla de la web, al día
+                            if row["symbol"] == r["symbol"]:
+                                row["rate_pct"], row["mark"] = r["rate_pct"], r["mark"]
+                                break
+                    if abs(r["rate_pct"]) >= thr and r["symbol"] not in self._funding_launched:
+                        joined.append(r["symbol"])
+                        self.log(f"[funding] {r['symbol']} cruzó el umbral en el seguimiento: "
+                                 f"{start_rates.get(r['symbol'], 0.0):+.4f}% → {r['rate_pct']:+.4f}% (≥ ±{thr:g}%)")
+                        self._funding_launch(r, ts)
+            except Exception as exc:
+                self.log(f"[funding] seguimiento: {exc!r}")
+            finally:
+                try:
+                    await asyncio.wait_for(agen.aclose(), 2.0)
+                except Exception:
+                    pass
+            if msgs:
+                break
+            await asyncio.sleep(1.0)
+        thr = self.funding_cfg["min_pct"]
+        with self.lock:
+            fell = [s for s in self._funding_launched
+                    if s in self._funding_live and abs(self._funding_live[s]["rate_pct"]) < thr]
+            self._funding_over = sum(1 for row in self._funding_rows if abs(row["rate_pct"]) >= thr)
+        self.log(f"[funding] seguimiento en vivo de {len(syms)} par(es) cerca de ±{thr0:g}%: {msgs} actualizaciones"
+                 + (f" · entraron {', '.join(joined)}" if joined else "")
+                 + (f" · bajaron del umbral (no se abren): {', '.join(sorted(fell))}" if fell else "")
+                 + ("" if msgs else " · ✗ el stream no respondió: se opera con la consulta de 3 min antes"))
 
     async def _funding_trade(self, sym: str, side: str, rate: float, ts: float, mark: float,
                              held: bool = False) -> None:
-        """Precio en vivo del par desde ya (aggTrade) y, al llegar el momento, abre sin esperar nada.
+        """Precio en vivo del par desde ya (aggTrade) y, al llegar el momento, abre sin esperar nada. Usa el último
+        funding visto en el seguimiento: si bajó del umbral no abre, y si cambió de signo cambia de lado.
         held=True: la petición de precio ya la tomó quien la lanzó; aquí solo se suelta al terminar."""
         if not held:
             self._hold_price((sym,))
@@ -4270,6 +4505,15 @@ class KlineBot:
                 if wait <= 0:
                     break
                 await asyncio.sleep(min(wait, 0.5))
+            live = self._funding_live.get(sym) if self._funding_live_for == ts else None
+            if live:
+                rate, mark = live["rate_pct"], live["mark"] or mark
+                thr = self.funding_cfg["min_pct"]
+                if abs(rate) < thr:
+                    self._funding_signal(sym, side, rate, ts, mark,
+                                         f"descartada: el funding bajó a {rate:+.4f}% (< ±{thr:g}%) antes de abrir")
+                    return
+                side = funding_side(rate) or side
             self._funding_open(sym, side, rate, ts, mark)
         finally:
             self._release_price((sym,))
@@ -4386,7 +4630,7 @@ class KlineBot:
                 "clock_diff_ms": self.funding_clock_info.get("diff_ms"),
                 "clock_agree": self.funding_clock_info.get("agree"),
                 "clock_providers": self.funding_clock_info.get("providers", {}),
-                "watch": dict(self._funding_watch), "scan_busy": self._scan_busy,
+                "watch": dict(self._funding_watch), "scan_busy": self._scan_busy, "src": dict(self._funding_src),
                 "clock_rtt_ms": round(self.funding_clock_rtt_ms),
                 "clock_age_s": round(time.time() - self.funding_clock_ts) if self.funding_clock_ts else None,
                 "loop_lag_ms": round(self.loop_lag_ms),
@@ -4979,7 +5223,7 @@ def api_funding_get():
 @app.post("/api/funding")
 def api_funding_set():
     """Bot de funding alto, en caliente. Body JSON (todo opcional): {"min_pct": 0.3, "notional": 20,
-    "open_before_s": 2, "close_after_s": 1, "scan_before_s": 120}. Pausar con /api/pause y bloquear
+    "open_before_s": 2, "close_after_s": 1, "scan_before_s": 180}. Pausar con /api/pause y bloquear
     LONG/SHORT con /api/block ({"engine": "funding", ...})."""
     busy = _guard()
     if busy:
@@ -5628,7 +5872,7 @@ HTML = r"""<!doctype html>
               <label class="f">Cerrar, segundos después del cobro <span id="fdCurClose"></span>
                 <input id="fdClose" type="number" step="0.1" min="0" max="60" placeholder="ej. 1"></label>
               <label class="f">Consultar el funding, segundos antes del cobro <span id="fdCurScan"></span>
-                <input id="fdScan" type="number" step="1" min="120" max="900" placeholder="ej. 120 (mínimo 120)"></label>
+                <input id="fdScan" type="number" step="1" min="180" max="900" placeholder="ej. 180 (mínimo 180)"></label>
               <button type="submit">Guardar</button>
             </form>
             <h4 style="margin-top:16px">Direcciones y estado</h4><div class="row c" id="rb_funding"></div>
@@ -6042,10 +6286,10 @@ function render(d) {
   q('fdCurMin').textContent = `(ahora ±${fdc.min_pct}%)`; q('fdCurNot').textContent = `(ahora ${fdc.notional})`;
   q('fdCurOpen').textContent = `(ahora ${fdc.open_before_s} s)`; q('fdCurClose').textContent = `(ahora ${fdc.close_after_s} s)`;
   q('fdCurScan').textContent = `(ahora ${fdc.scan_before_s} s)`;
-  q('fdNote').innerHTML = `Antes de cada cobro (horas en punto UTC) consulta el funding de todos los pares <b>una vez</b> (${fdc.scan_before_s} s antes, un mensaje por WebSocket, sin REST). `
+  q('fdNote').innerHTML = `Antes de cada cobro (horas en punto UTC) consulta el funding de <b>todos</b> los pares ${fdc.scan_before_s} s antes (WebSocket, sin REST) y sigue en vivo hasta abrir los que están cerca del umbral: si uno lo cruza entra, si baja no se abre. `
     + `Si un par tiene funding ≥ +${fdc.min_pct}% abre <b>SHORT</b> (los LONG le pagan); si es ≤ −${fdc.min_pct}%, <b>LONG</b>. Entra ${fdc.open_before_s} s antes del cobro, `
     + `manda la orden al executor al instante con el precio en vivo (la entrada en papel se corrige después con el libro) y cierra ${fdc.close_after_s} s después. El PnL suma el funding cobrado. `
-    + `Próximo cobro ${esc(fd.next || '—')} UTC (en <b data-cd="${fd.next_ts || 0}" data-off="0" data-done="cobrando">${cdFmt(fd.next_in_s || 0)}</b>) · última consulta ${esc(fd.last_scan || '—')}${fd.scan_ms ? ' (' + fd.scan_ms + ' ms)' : ''} · `
+    + `Próximo cobro ${esc(fd.next || '—')} UTC (en <b data-cd="${fd.next_ts || 0}" data-off="0" data-done="cobrando">${cdFmt(fd.next_in_s || 0)}</b>) · última consulta ${esc(fd.last_scan || '—')}${fd.scan_ms ? ' (' + fd.scan_ms + ' ms)' : ''}${fd.src && fd.src.total ? ': ' + fd.src.total + ' pares (WebSocket ' + fd.src.ws + ' · REST ' + fd.src.rest + ')' : ''} · `
     + `${fd.over || 0} par(es) ≥ umbral · reloj Binance ${fd.clock_off_ms >= 0 ? '+' : ''}${fd.clock_off_ms || 0} ms${fd.clock_age_s == null ? ' <span class="neg">(sin sincronizar)</span>' : ' (medido hace ' + dur(fd.clock_age_s) + ', latencia ' + (fd.clock_rtt_ms || 0) + ' ms)'}${fd.clock_diff_ms != null ? ' · vs proveedores ' + (fd.clock_diff_ms >= 0 ? '+' : '') + fd.clock_diff_ms + ' ms ' + (fd.clock_agree ? '✓' : '<span class=\"neg\">⚠ difieren</span>') : (fd.clock_age_s != null ? ' · sin proveedores externos' : '')}${fd.watch && fd.watch.ts ? ' · exploración horaria: ' + fd.watch.scanned + ' pares en ' + fd.watch.elapsed_s + ' s, ' + fd.watch.n + ' ≥ umbral' : ''}${fd.loop_lag_ms > 500 ? ` · <span class="neg">loop con retraso ${fd.loop_lag_ms} ms</span>` : ''}${fd.last_error ? ` · <span class="neg">${esc(fd.last_error)}</span>` : ''}`;
   if (view === 'bots') q('fdTbl').innerHTML = (fd.rows || []).map(z => {
       const cobro = z.next_ts ? `<b data-cd="${z.next_ts}" data-off="0" data-done="cobrado">${cdFmt(z.in_s || 0)}</b>` : '—';
