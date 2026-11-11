@@ -414,7 +414,8 @@ def test_las_aperturas_de_ratio_entran_al_precio_del_libro(tmp_path, monkeypatch
     for p in abiertas:
         assert p.entry_price == pytest.approx(esperado) and p.entry_src == "libro" and p.signal_price == 1.0
     pos = next(iter(bot.engines[st.ENGINE_RATIO].positions.values()))
-    assert pos.tp_price == pytest.approx(esperado * 0.9)                    # TP desde la entrada real
+    # La orden salió sin esperar el libro, con el precio en vivo; su TP es el que tiene Binance.
+    assert pos.tp_price == pytest.approx(1.0 * 0.9)
     assert enviados[0]["price"] == 1.0 and enviados[0]["tp"] == pytest.approx(pos.tp_price)
 
 
@@ -868,17 +869,43 @@ def test_la_venganza_sale_sin_esperar_el_libro(tmp_path, monkeypatch):
     bot.executor.send = lambda payload, *a, **k: enviados.append(payload)
     bot._on_loop = lambda: True
     pedidos = []
-    bot._with_fill = lambda *a, **k: pedidos.append(a)   # si se usara, la venganza quedaría esperando
+    bot._with_fill = lambda *a, **k: pedidos.append(a)   # el libro "no llega": nada lo espera
     eng = bot.engines[st.ENGINE_RATIO_REV]
     eng.positions[1] = st.Position(trade_id=1, symbol="AUSDT", direction=st.SHORT, entry_price=1.0, qty=5,
                                    notional=5.0, tp_price=0.9, sl_price=1.05, signal_pct=-27, candle_open=1.18,
                                    candle_close=0.86, candle_time=0, last_price=1.0, strategy=st.ENGINE_RATIO_REV)
     bot._price = lambda sym: 1.06
     bot._close(1, 1.05, "SL")
-    assert not pedidos
-    assert [p["action"] for p in enviados] == ["close", "open"]
+    assert [p["action"] for p in enviados] == ["close", "open"]        # ambas ya salieron
     v = [p for p in eng.positions.values() if p.revenge]
     assert len(v) == 1 and v[0].entry_src == "precio en vivo"
+    assert len(pedidos) == 2 and not eng.closed_trades                   # el papel espera el libro
+    # Llega el libro: se corrige la entrada en papel de la venganza (no su TP) y el cierre.
+    tp = v[0].tp_price
+    bot._books["AUSDT"] = (time.time(), [["1.05", "100"]], [["1.07", "100"]], "libro")
+    for sym, buy, qty, fb, cont in pedidos:
+        cont(*bot._fill_from_book(sym, buy, qty, fb))
+    assert v[0].entry_price == pytest.approx(1.07) and v[0].entry_src == "libro" and v[0].tp_price == tp
+    assert eng.closed_trades[0]["close_price"] == pytest.approx(1.07)
+    assert len([p for p in eng.positions.values() if p.revenge]) == 1  # no abre una segunda venganza
+
+
+def test_el_tp_con_las_aperturas_se_enciende_y_apaga(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    enviados = []
+    bot.executor.send = lambda payload, *a, **k: enviados.append(payload)
+    eng = bot.engines[st.ENGINE_RATIO]
+    pos = st.Position(trade_id=9, symbol="AUSDT", direction=st.SHORT, entry_price=1.0, qty=5,
+                      notional=5.0, tp_price=0.9, sl_price=1.05, signal_pct=-27, candle_open=1.18,
+                      candle_close=0.86, candle_time=0, last_price=1.0, strategy=st.ENGINE_RATIO)
+    eng.positions[9] = pos
+    assert bot._open_tp(pos) == {"tp": 0.9}
+    bot.set_global(send_tp=False)
+    assert bot.global_settings()["send_tp"] is False
+    assert enviados[-1]["action"] == "close_tp" and pos.ex_tp == 0     # se quita de Binance
+    assert bot._open_tp(pos) == {}                                     # aperturas nuevas sin TP
+    bot.set_global(send_tp=True)
+    assert enviados[-1]["action"] == "open_tp" and enviados[-1]["trigger_price"] == 0.9
 
 
 def test_el_libro_prueba_primero_la_url_que_funciono(tmp_path, monkeypatch):
