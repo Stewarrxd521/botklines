@@ -4300,11 +4300,12 @@ class KlineBot:
         with self.lock:
             top = [dict(r) for r in self._funding_rows[:20]] if rows else []
         now = self._srv_now()
+        ts = self._funding_target_ts or next_funding_ts(now, c["open_before_s"])
         for r in top:
             r["next"] = _utc(r["next_ts"], "%H:%M") if r["next_ts"] else ""
             r["in_s"] = round(r["next_ts"] - now) if r["next_ts"] else None
             r["over"] = abs(r["rate_pct"]) >= c["min_pct"]
-        ts = self._funding_target_ts or next_funding_ts(now, c["open_before_s"])
+            r["due"] = bool(r["next_ts"]) and abs(r["next_ts"] - ts) <= 1.5   # cobra en el cobro que apunta el bot
         return {"cfg": c, "rows": top, "over": self._funding_over, "scans": self.funding_scans,
                 "errors": self.funding_errors, "last_error": self.funding_last_error,
                 "last_scan": _utc(self.funding_last_scan_ts, "%H:%M:%S") if self.funding_last_scan_ts else "",
@@ -4318,6 +4319,7 @@ class KlineBot:
                 "clock_age_s": round(time.time() - self.funding_clock_ts) if self.funding_clock_ts else None,
                 "loop_lag_ms": round(self.loop_lag_ms),
                 "next": _utc(ts, "%H:%M"), "next_in_s": round(ts - now),
+                "next_ts": ts, "srv_now": now,                      # para la cuenta regresiva del navegador
                 "scan_in_s": round(ts - c["scan_before_s"] - now)}
 
     # ── Recuperación tras reinicio ────────────────────────────────────────────
@@ -5552,7 +5554,7 @@ HTML = r"""<!doctype html>
           <div class="box">
             <h4>Cómo funciona</h4>
             <div class="note" style="margin-top:0" id="fdNote"></div>
-            <div class="scroll" style="margin-top:10px"><table><thead><tr><th>Par</th><th>Funding</th><th>Cobro (UTC)</th><th>Mark</th><th></th></tr></thead><tbody id="fdTbl"></tbody></table></div>
+            <div class="scroll" style="margin-top:10px"><table><thead><tr><th>Par</th><th>Funding</th><th>Cobro (UTC)</th><th>Cobra en</th><th>Mark</th><th>Elegido</th></tr></thead><tbody id="fdTbl"></tbody></table></div>
           </div>
         </div>
         <div id="fdMsg" class="muted msg"></div>
@@ -5744,6 +5746,22 @@ async function post(url, body) {
 
 // ── Consulta del estado: solo con la pestaña visible, sin solapar peticiones ──
 let timer = null, inflight = false, again = false;
+// Cuenta regresiva del funding: hora de Binance en el navegador = hora del navegador + srvSkew (se recalcula en cada
+// respuesta con el punto medio de la petición) y se repinta cada 250 ms sin esperar al siguiente refresco.
+let srvSkew = 0, fetchMid = 0;
+const srvNow = () => Date.now() / 1000 + srvSkew;
+const cdFmt = s => { s = Math.max(0, Math.ceil(s)); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+                     return (h ? h + ':' + String(m).padStart(2, '0') : String(m)) + ':' + String(x).padStart(2, '0'); };
+function tickCountdowns() {
+  const now = srvNow();
+  document.querySelectorAll('[data-cd]').forEach(el => {
+    const left = (+el.dataset.cd) - (+el.dataset.off || 0) - now;
+    const done = el.dataset.done || 'ya pasó';
+    el.textContent = left > 0 ? cdFmt(left) : done;
+    el.classList.toggle('neg', left > 0 && left <= 30);
+  });
+}
+setInterval(tickCountdowns, 250);
 function detailEngine() {
   if (view === 'mercado') return evEngine;
   return cur;
@@ -5753,8 +5771,10 @@ async function refresh() {
   if (inflight) { again = true; return; }
   inflight = true;
   try {
+    const t0 = Date.now();
     const r = await fetch(`/api/status?view=${view}&engine=${encodeURIComponent(detailEngine())}`, {cache: 'no-store'});
     last = await r.json();
+    fetchMid = (t0 + Date.now()) / 2;
     render(last);
   } catch (e) { /* sin conexión: se reintenta en el siguiente ciclo */ }
   finally { inflight = false; }
@@ -5932,6 +5952,7 @@ function render(d) {
       + `<button type="button" class="small ${bc.paused ? 'ok' : 'warnb'}" data-pause="${n}">${bc.paused ? 'Reanudar bot' : 'Pausar bot'}</button>`; };
   for (const n of [...RATIO, 'funding']) q('rb_' + n).innerHTML = dirBtns(n);
   const fd = d.funding || {}, fdc = fd.cfg || {};
+  if (fd.srv_now && fetchMid) srvSkew = fd.srv_now - fetchMid / 1000;
   q('fdState').innerHTML = stateOf('funding');
   q('fdSum').textContent = `≥ ±${fdc.min_pct}% · ${fdc.notional} USDT · −${fdc.open_before_s} s / +${fdc.close_after_s} s`;
   q('fdCurMin').textContent = `(ahora ±${fdc.min_pct}%)`; q('fdCurNot').textContent = `(ahora ${fdc.notional})`;
@@ -5940,11 +5961,17 @@ function render(d) {
   q('fdNote').innerHTML = `Antes de cada cobro (horas en punto UTC) consulta el funding de todos los pares <b>una vez</b> (${fdc.scan_before_s} s antes, un mensaje por WebSocket, sin REST). `
     + `Si un par tiene funding ≥ +${fdc.min_pct}% abre <b>SHORT</b> (los LONG le pagan); si es ≤ −${fdc.min_pct}%, <b>LONG</b>. Entra ${fdc.open_before_s} s antes del cobro, `
     + `manda la orden al executor al instante con el precio en vivo (la entrada en papel se corrige después con el libro) y cierra ${fdc.close_after_s} s después. El PnL suma el funding cobrado. `
-    + `Próximo cobro ${esc(fd.next || '—')} UTC (en ${dur(fd.next_in_s || 0)}) · última consulta ${esc(fd.last_scan || '—')}${fd.scan_ms ? ' (' + fd.scan_ms + ' ms)' : ''} · `
+    + `Próximo cobro ${esc(fd.next || '—')} UTC (en <b data-cd="${fd.next_ts || 0}" data-off="0" data-done="cobrando">${cdFmt(fd.next_in_s || 0)}</b>) · última consulta ${esc(fd.last_scan || '—')}${fd.scan_ms ? ' (' + fd.scan_ms + ' ms)' : ''} · `
     + `${fd.over || 0} par(es) ≥ umbral · reloj Binance ${fd.clock_off_ms >= 0 ? '+' : ''}${fd.clock_off_ms || 0} ms${fd.clock_age_s == null ? ' <span class="neg">(sin sincronizar)</span>' : ' (medido hace ' + dur(fd.clock_age_s) + ', latencia ' + (fd.clock_rtt_ms || 0) + ' ms)'}${fd.clock_diff_ms != null ? ' · vs proveedores ' + (fd.clock_diff_ms >= 0 ? '+' : '') + fd.clock_diff_ms + ' ms ' + (fd.clock_agree ? '✓' : '<span class=\"neg\">⚠ difieren</span>') : (fd.clock_age_s != null ? ' · sin proveedores externos' : '')}${fd.watch && fd.watch.ts ? ' · exploración horaria: ' + fd.watch.scanned + ' pares en ' + fd.watch.elapsed_s + ' s, ' + fd.watch.n + ' ≥ umbral' : ''}${fd.loop_lag_ms > 500 ? ` · <span class="neg">loop con retraso ${fd.loop_lag_ms} ms</span>` : ''}${fd.last_error ? ` · <span class="neg">${esc(fd.last_error)}</span>` : ''}`;
-  if (view === 'bots') q('fdTbl').innerHTML = (fd.rows || []).map(z => `<tr><td><b>${esc(z.symbol)}</b></td><td class="${z.over ? (z.rate_pct > 0 ? 'neg' : 'pos') : 'muted'}">${z.rate_pct > 0 ? '+' : ''}${(+z.rate_pct).toFixed(4)}%</td>
-      <td>${esc(z.next)}${z.in_s != null && z.in_s >= 0 ? ` <span class="muted">(${dur(z.in_s)})</span>` : ''}</td><td>${num(z.mark, 8)}</td><td>${z.over ? tag(z.rate_pct > 0 ? 'SHORT' : 'LONG') : ''}</td></tr>`).join('')
-    || '<tr><td colspan="5" class="muted">Aún no hay consulta del funding</td></tr>';
+  if (view === 'bots') q('fdTbl').innerHTML = (fd.rows || []).map(z => {
+      const cobro = z.next_ts ? `<b data-cd="${z.next_ts}" data-off="0" data-done="cobrado">${cdFmt(z.in_s || 0)}</b>` : '—';
+      const pick = z.over && z.due;
+      const abre = pick ? ` <span class="muted">abre en <span data-cd="${z.next_ts}" data-off="${fdc.open_before_s || 0}" data-done="abriendo">${cdFmt((z.in_s || 0) - (fdc.open_before_s || 0))}</span></span>` : '';
+      return `<tr><td><b>${esc(z.symbol)}</b></td><td class="${z.over ? (z.rate_pct > 0 ? 'neg' : 'pos') : 'muted'}">${z.rate_pct > 0 ? '+' : ''}${(+z.rate_pct).toFixed(4)}%</td>
+      <td>${esc(z.next)}</td><td>${cobro}</td><td>${num(z.mark, 8)}</td><td>${pick ? tag(z.rate_pct > 0 ? 'SHORT' : 'LONG') + abre : z.over ? '<span class="muted">funding alto, pero cobra más tarde</span>' : '<span class="muted">no cumple</span>'}</td></tr>`;
+    }).join('')
+    || '<tr><td colspan="6" class="muted">Aún no hay consulta del funding</td></tr>';
+  tickCountdowns();
   const rv = r.rev || {};
   q('r3Sum').textContent = `${tpsl(rv)} · venganza ${rv.revenge ? 'ON ×' + rv.rev_mult : 'OFF'}`;
   q('rvCurTp').textContent = `(ahora ${rv.tp_pct > 0 ? '+' + rv.tp_pct + '%' : 'apagado'})`;
@@ -6329,3 +6356,4 @@ PAGE_ETAG = hashlib.sha1(PAGE).hexdigest()[:16]
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")), threaded=True)
+
