@@ -201,6 +201,15 @@ REVENGE_RECOVER_PCT = float(os.getenv("REVENGE_RECOVER_PCT", "64"))   # TP = est
 REVENGE_SL_PCT      = float(os.getenv("REVENGE_SL_PCT", "150"))       # SL = este % de (pérdida × N) en USD
 REVENGE_DIR         = os.getenv("REVENGE_DIR", "opposite")            # opposite | same (respecto a la perdedora)
 REVENGE_SKIP_REASONS = ("OBJETIVO", "CERRAR_TODAS")                   # cierres que no disparan venganza
+
+# Bot de funding alto: abre en el lado que COBRA el funding justo antes del cobro y cierra justo después.
+FUNDING_ENABLED       = os.getenv("FUNDING_ENABLED", "true").lower() in ("1", "true", "yes")
+FUNDING_MIN_PCT       = abs(float(os.getenv("FUNDING_MIN_PCT", "0.3")))    # |funding| mínimo para entrar (%)
+FUNDING_NOTIONAL      = float(os.getenv("FUNDING_NOTIONAL", "20"))         # USDT por entrada
+FUNDING_OPEN_BEFORE_S = float(os.getenv("FUNDING_OPEN_BEFORE_S", "2"))     # abre N s antes del cobro
+FUNDING_CLOSE_AFTER_S = float(os.getenv("FUNDING_CLOSE_AFTER_S", "1"))     # cierra N s después del cobro
+FUNDING_SCAN_BEFORE_S = float(os.getenv("FUNDING_SCAN_BEFORE_S", "30"))    # consulta del funding antes del cobro
+FUNDING_PERIOD_S      = 3600            # Binance cobra en horas en punto (cada 1, 4 u 8 h según el par)
 # Fuente del 24 h, siempre por WebSocket: "scan" = exploración de TICKER_SCAN_S por ciclo de
 # 5 min (~10 % del tiempo conectado); "ws" = !miniTicker@arr abierto siempre (~80 KB/s).
 TICKER_MODE         = os.getenv("TICKER_MODE", "scan").strip().lower()
@@ -399,6 +408,26 @@ def price_exit(price: float, direction: str, tp_price: float, sl_price: float) -
     if exit_hit(price, tp_price, direction):
         return "TP"
     return None
+
+
+def funding_side(rate: float) -> Optional[str]:
+    """Lado que COBRA el funding: con tasa positiva los LONG pagan a los SHORT, y al revés."""
+    if rate > 0:
+        return SHORT
+    if rate < 0:
+        return LONG
+    return None
+
+
+def funding_income_usd(notional: float, rate_pct: float, direction: str) -> float:
+    """Funding cobrado (+) o pagado (−) por una posición de `notional` con la tasa `rate_pct` (%)."""
+    return notional * rate_pct / 100.0 * (1.0 if direction == SHORT else -1.0)
+
+
+def next_funding_ts(now: float, lead_s: float = 0.0, period_s: int = FUNDING_PERIOD_S) -> int:
+    """Próximo cobro (hora en punto, segundos Unix) al que aún le quedan más de `lead_s` segundos."""
+    t = (int(now) // period_s + 1) * period_s
+    return t + period_s if t - now <= lead_s else t
 
 
 def take_profit_hit(price: float, entry: float, direction: str, tp_pct: float) -> bool:
@@ -793,6 +822,9 @@ class Position:
     signal_price:  float = 0.0      # precio de la señal (entry_price es el del libro)
     entry_src:     str = ""         # de dónde salió entry_price: libro | mejor ask/bid | precio
     tp_rejects:    int = 0          # veces que el precio tocó el TP pero el libro no llegaba (no cerró)
+    # ── Solo bot de funding ──
+    funding_rate:  float = 0.0      # tasa de funding (%) vista al entrar
+    funding_ts:    float = 0.0      # momento del cobro (s Unix, hora de Binance); 0 = no es de funding
 
     def update(self, price: float) -> float:
         """Actualiza precio y excursiones. Llamar con el lock del bot tomado."""
@@ -818,9 +850,11 @@ ENGINE_RATIO = "ratio"
 ENGINE_RATIO_TP = "ratio_tp"       # mismas entradas; sale SOLO por el TP del ratio (sin TP/SL de precio)
 ENGINE_RATIO_REV = "ratio_rev"     # mismas entradas; TP/SL propios + trade de venganza tras una pérdida
 RATIO_ENGINES = (ENGINE_RATIO, ENGINE_RATIO_TP, ENGINE_RATIO_REV)
+ENGINE_FUNDING = "funding"         # cobra funding alto: entra justo antes del cobro y sale justo después
+KLINE_ENGINES = (ENGINE_CLOSE, ENGINE_LIVE)
 ENGINE_LABELS = {ENGINE_CLOSE: "Bot al cierre", ENGINE_LIVE: "Bot en vivo",
                  ENGINE_RATIO: "Bot ratio TP/SL", ENGINE_RATIO_TP: "Bot ratio solo TP ratio",
-                 ENGINE_RATIO_REV: "Bot ratio + venganza"}
+                 ENGINE_RATIO_REV: "Bot ratio + venganza", ENGINE_FUNDING: "Bot funding alto"}
 _RATIO_ENTRY_HINT = ("SHORT cuando el ratio de los top traders CAE en un ganador (24 h ≥ +X %); LONG cuando SUBE en "
                      "un perdedor (24 h ≤ −X %)")
 ENGINE_HINTS = {
@@ -829,6 +863,8 @@ ENGINE_HINTS = {
     ENGINE_RATIO_REV: _RATIO_ENTRY_HINT + ". TP/SL propios; si cierra en pérdida abre un trade de venganza para recuperarla",
     ENGINE_CLOSE: "entra cuando la vela 1m CIERRA con cuerpo ≥ umbral",
     ENGINE_LIVE:  "entra en cuanto la vela 1m EN CURSO supera el umbral, sin esperar al cierre",
+    ENGINE_FUNDING: ("con funding ≥ ±X % abre en el lado que cobra (SHORT si es positivo, LONG si es negativo) "
+                     "unos segundos antes del cobro y cierra justo después"),
 }
 
 
@@ -972,6 +1008,20 @@ class KlineBot:
                         "rev_dir":         rv.get("rev_dir") if rv.get("rev_dir") in ("opposite", "same") else
                                            (REVENGE_DIR if REVENGE_DIR in ("opposite", "same") else "opposite")}
         self.revenge_count = 0
+        # Bot de funding alto: su motor y sus parámetros (editables en caliente desde la web).
+        self.engines[ENGINE_FUNDING] = Engine(ENGINE_FUNDING, saved.get(ENGINE_FUNDING)
+                                              or {"paused": not FUNDING_ENABLED}, 1.0, 1.0)
+        self.funding_cfg = self._load_funding_cfg(settings.get("funding"))
+        self._funding_rows: List[dict] = []           # última consulta: los de mayor |funding|
+        self._funding_over = 0                        # cuántos pasaban el umbral en esa consulta
+        self._funding_done_ts = 0                     # último cobro ya consultado y programado
+        self._funding_target_ts = 0                   # cobro al que apunta ahora el bot
+        self.funding_clock_off = 0.0                  # hora de Binance − hora local (s)
+        self.funding_scans = 0
+        self.funding_errors = 0
+        self.funding_last_error = ""
+        self.funding_last_scan_ts = 0.0
+        self.funding_last_scan_ms = 0.0
         # Estado del bot de ratio (se toca solo desde el loop del bot).
         self._tick: Dict[str, Tuple[float, float, float]] = {}     # símbolo → (24 h %, último precio, ts)
         self.ticker_connected = False
@@ -1122,7 +1172,8 @@ class KlineBot:
                 "profit_target_usd": self.profit_target_usd, "max_open": self.max_open,
                 "executor_paused": self.executor_paused, "ratio": self.ratio_cfg, "ratio_rev": self.rev_cfg,
                 "klines_enabled": self.klines_enabled, "watch_live_price": self.watch_live,
-                "fast_prices": self.fast_prices, "min_hold_s": self.min_hold_s, "indicators": self.ind_cfg}
+                "fast_prices": self.fast_prices, "min_hold_s": self.min_hold_s, "indicators": self.ind_cfg,
+                "funding": self.funding_cfg}
         tmp = f"{SETTINGS_FILE}.tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as fh:
@@ -1263,7 +1314,7 @@ class KlineBot:
             return sum(e.total_realized_pnl for e in self.engines.values())
 
     def _net_pnl(self, p: Position, price: float) -> float:
-        return net_pnl_usd(price, p.entry_price, p.qty, p.direction, self.fee_pct)
+        return net_pnl_usd(price, p.entry_price, p.qty, p.direction, self.fee_pct) + self._funding_paid(p)
 
     def session_pnl(self) -> Tuple[float, float]:
         """(realizado, abierto) desde el último objetivo o reinicio, netos de fees."""
@@ -1393,7 +1444,7 @@ class KlineBot:
 
     async def _main(self) -> None:
         for eng in self.engines.values():
-            if eng.name in RATIO_ENGINES or not self.klines_enabled:
+            if eng.name not in KLINE_ENGINES or not self.klines_enabled:
                 continue
             self.log(f"{eng.label} | {ENGINE_HINTS[eng.name]} | señal ≥ {eng.threshold_pct:g}% | "
                      f"{'SL' if self.inverted else 'TP'} {eng.tp_pct:g}% | {NOTIONAL_USDT:g} USDT")
@@ -1410,6 +1461,8 @@ class KlineBot:
                  f"{' · TP por ratio (recupera el % que se movió)' if rc['ratio_exit'] else ''}")
         self.log(f"{ENGINE_LABELS[ENGINE_RATIO_TP]} | sale solo por el TP del ratio")
         self.log(f"{ENGINE_LABELS[ENGINE_RATIO_REV]} | {self._rev_desc()}")
+        self.log(f"{ENGINE_LABELS[ENGINE_FUNDING]} | {self._funding_desc()}"
+                 f"{' | PAUSADO' if self.engines[ENGINE_FUNDING].paused else ''}")
         self.log(f"Red: 24 h por {f'WebSocket, exploración de {TICKER_SCAN_S:g} s cada 5 min' if TICKER_MODE != 'ws' else 'WebSocket continuo'} · "
                  f"precio en vivo: con posición {price_stream_for(self.klines_enabled, self.fast_prices)}"
                  f"{', vigilados markPrice cada 3 s' if self.watch_live else ''}")
@@ -1446,6 +1499,7 @@ class KlineBot:
             self._supervised(self._maintenance_loop, "maintenance"),
             *([self._supervised(self._ticker_loop, "ticker")] if TICKER_MODE == "ws" else []),
             self._supervised(self._ratio_loop, "ratio"),
+            self._supervised(self._funding_loop, "funding"),
             self._supervised(self._ind_alt_loop, "velas de otros exchanges"),
             self._supervised(self._symbols_retry_loop, "symbols"),
         )
@@ -1854,7 +1908,7 @@ class KlineBot:
                     "direction":   pos.direction,
                     "reason":      reason,
                     "close_price": price,
-                    "pnl":         round(net_pnl_usd(price, pos.entry_price, pos.qty, pos.direction, self.fee_pct), 6),
+                    "pnl":         round(self._net_pnl(pos, price), 6),
                     "strategy":    eng.name,
                 }
                 if shared:
@@ -1877,7 +1931,8 @@ class KlineBot:
                 pos.update(price)
                 gross = pnl_usd(price, pos.entry_price, pos.qty, pos.direction)
                 fees = fees_usd(pos.entry_price, price, pos.qty, self.fee_pct)
-                pnl = gross - fees                          # neto: fees de entrada y salida
+                funding = self._funding_paid(pos)
+                pnl = gross - fees + funding                # neto: fees de entrada y salida (+ funding cobrado)
                 now = time.time()
                 rec = {
                     **asdict(pos),
@@ -1891,6 +1946,7 @@ class KlineBot:
                     "pnl_gross": gross,
                     "fees": fees,
                     "fee_pct": self.fee_pct,
+                    "funding_usd": funding,
                     "pnl_pct": pnl / pos.notional * 100.0 if pos.notional else 0.0,
                     "reason": reason,
                     "time_to_mfe_s": (pos.mfe_ts - pos.opened_ts) if pos.mfe_ts else 0.0,
@@ -1906,7 +1962,8 @@ class KlineBot:
             self.store.mark_dirty(True)
             px_note = f" ({src}; disparo {trigger:g})" if src and price != trigger else ""
             self.log(f"[{eng.label}] CIERRA {pos.direction} {pos.symbol} ({reason}) | entrada {pos.entry_price:g} → "
-                     f"{price:g}{px_note} ({rec['move_pct']:+.2f}%) | PnL neto {pnl:+.4f} USDT (fees {fees:.4f}) | "
+                     f"{price:g}{px_note} ({rec['move_pct']:+.2f}%) | PnL neto {pnl:+.4f} USDT (fees {fees:.4f}"
+                     f"{f' · funding {funding:+.4f}' if pos.funding_ts else ''}) | "
                      f"{rec['duration_s']:.1f} s | trade #{pos.trade_id}")
             if pnl < 0 and eng.name == ENGINE_RATIO_REV and not pos.revenge and reason not in REVENGE_SKIP_REASONS:
                 self._open_revenge(eng, pos, price, -pnl, reason)
@@ -3287,6 +3344,302 @@ class KlineBot:
             if self.store.restore_pending():
                 self._restore_from_store(late=True)
 
+    # ── Bot de funding alto ───────────────────────────────────────────────────
+    # Una consulta REST de premiumIndex (todos los pares, gzip) unos segundos antes de cada hora en
+    # punto. Los pares con |funding| ≥ umbral y cobro en esa hora se abren en el lado que cobra
+    # FUNDING_OPEN_BEFORE_S antes del cobro (al executor YA, con el precio en vivo; la entrada en
+    # papel se corrige después con el libro) y se cierran FUNDING_CLOSE_AFTER_S después.
+
+    _FUNDING_LIMITS = {"min_pct": (0.01, 10.0), "notional": (5.0, 100000.0), "open_before_s": (0.2, 60.0),
+                       "close_after_s": (0.0, 60.0), "scan_before_s": (5.0, 900.0)}
+
+    @classmethod
+    def _load_funding_cfg(cls, raw) -> dict:
+        raw = raw if isinstance(raw, dict) else {}
+        cfg = {"min_pct": FUNDING_MIN_PCT, "notional": FUNDING_NOTIONAL, "open_before_s": FUNDING_OPEN_BEFORE_S,
+               "close_after_s": FUNDING_CLOSE_AFTER_S, "scan_before_s": FUNDING_SCAN_BEFORE_S}
+        for key, (lo, hi) in cls._FUNDING_LIMITS.items():
+            try:
+                v = abs(float(raw[key])) if key == "min_pct" else float(raw[key])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if lo <= v <= hi:
+                cfg[key] = v
+        if cfg["scan_before_s"] < cfg["open_before_s"] + 3:
+            cfg["scan_before_s"] = cfg["open_before_s"] + 3
+        return cfg
+
+    def _funding_desc(self, c: Optional[dict] = None) -> str:
+        c = c or self.funding_cfg
+        return (f"funding ≥ ±{c['min_pct']:g}% · {c['notional']:g} USDT · abre {c['open_before_s']:g} s antes del "
+                f"cobro y cierra {c['close_after_s']:g} s después · consulta {c['scan_before_s']:g} s antes")
+
+    def set_funding_config(self, **kw) -> dict:
+        """Cambia en caliente el umbral, el notional y los tiempos del bot de funding."""
+        new = dict(self.funding_cfg)
+        for key, val in kw.items():
+            if key not in self._FUNDING_LIMITS or val is None:
+                continue
+            lo, hi = self._FUNDING_LIMITS[key]
+            v = abs(float(val)) if key == "min_pct" else float(val)
+            if not lo <= v <= hi:
+                raise ValueError(f"{key} debe estar entre {lo:g} y {hi:g}")
+            new[key] = v
+        if new["scan_before_s"] < new["open_before_s"] + 3:
+            raise ValueError("la consulta debe hacerse al menos 3 s antes que la apertura")
+        with self.lock:
+            self.funding_cfg = new
+        self._save_settings()
+        self.log(f"[config] {ENGINE_LABELS[ENGINE_FUNDING]}: {self._funding_desc(new)}")
+        return dict(new)
+
+    def _srv_now(self) -> float:
+        """Hora de Binance (la local corregida con la que devuelve premiumIndex)."""
+        return time.time() + self.funding_clock_off
+
+    def _funding_paid(self, p: Position, now: Optional[float] = None) -> float:
+        """Funding cobrado por la posición: solo si estaba abierta en el momento del cobro."""
+        if not p.funding_ts:
+            return 0.0
+        srv = (now if now is not None else time.time()) + self.funding_clock_off
+        if srv < p.funding_ts or p.opened_ts + self.funding_clock_off >= p.funding_ts:
+            return 0.0
+        return funding_income_usd(p.notional, p.funding_rate, p.direction)
+
+    def _fetch_funding(self) -> List[dict]:
+        """premiumIndex de todos los perpetuos (una petición, peso 10, gzip). Ajusta el reloj con Binance."""
+        t0 = time.time()
+        data = self._rest_get("/fapi/v1/premiumIndex")
+        t1 = time.time()
+        if not isinstance(data, list):
+            raise RuntimeError("premiumIndex: respuesta inesperada")
+        rows, srv_ms = [], 0
+        for d in data:
+            try:
+                sym = str(d["symbol"])
+                if not sym.endswith(QUOTE_ASSET):
+                    continue
+                rows.append({"symbol": sym, "rate_pct": float(d.get("lastFundingRate") or 0) * 100.0,
+                             "next_ts": int(d.get("nextFundingTime") or 0) / 1000.0,
+                             "mark": float(d.get("markPrice") or 0)})
+                srv_ms = max(srv_ms, int(d.get("time") or 0))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if srv_ms:
+            off = srv_ms / 1000.0 - (t0 + t1) / 2
+            if abs(off) < 300:
+                self.funding_clock_off = off
+        self.funding_last_scan_ms = (t1 - t0) * 1000
+        return rows
+
+    async def _funding_scan(self) -> List[dict]:
+        try:
+            rows = await asyncio.to_thread(self._fetch_funding)
+        except Exception as exc:
+            self.funding_errors += 1
+            self.funding_last_error = str(exc)
+            self.log(f"[funding] ✗ no pude leer el funding: {exc}")
+            return []
+        thr = self.funding_cfg["min_pct"]
+        rows.sort(key=lambda r: abs(r["rate_pct"]), reverse=True)
+        with self.lock:
+            self._funding_rows = rows[:25]
+            self._funding_over = sum(1 for r in rows if abs(r["rate_pct"]) >= thr)
+            self.funding_scans += 1
+            self.funding_last_scan_ts = time.time()
+            self.funding_last_error = ""
+        return rows
+
+    def _funding_signal(self, sym: str, side: str, rate: float, ts: float, mark: float, action: str) -> None:
+        eng = self.engines[ENGINE_FUNDING]
+        now = time.time()
+        with self.lock:
+            eng.signals.appendleft({
+                "ts": now, "time": _utc(now, "%H:%M:%S"), "symbol": sym, "direction": side,
+                "body_pct": rate, "open": mark, "close": mark, "candle": _utc(ts, "%H:%M"),
+                "candle_age_s": 0.0, "action": action,
+            })
+
+    async def _funding_loop(self) -> None:
+        if not self._funding_rows:
+            await self._funding_scan()                       # para la web (y el reloj de Binance)
+        while self.running:
+            self._funding_overdue()
+            c = self.funding_cfg
+            now = self._srv_now()
+            ts = next_funding_ts(now, c["open_before_s"] + 0.3)
+            self._funding_target_ts = ts
+            if self._funding_done_ts == ts:              # ya programado: espera a que pase este cobro
+                await asyncio.sleep(min(max(ts - now, 0.2), 5.0))
+                continue
+            wait = ts - c["scan_before_s"] - now
+            if wait > 0:
+                await asyncio.sleep(min(wait, 5.0))
+                continue
+            self._funding_done_ts = ts
+            await self._funding_cycle(ts)
+
+    async def _funding_cycle(self, ts: float) -> None:
+        """Consulta el funding antes del cobro `ts` y programa las entradas de los que lo superan."""
+        eng = self.engines[ENGINE_FUNDING]
+        rows = await self._funding_scan()
+        thr = self.funding_cfg["min_pct"]
+        cands = [r for r in rows if abs(r["next_ts"] - ts) <= 1.5 and abs(r["rate_pct"]) >= thr]
+        if not cands:
+            if rows:
+                top = rows[0]
+                self.log(f"[funding] cobro {_utc(ts, '%H:%M')} UTC: ninguno ≥ ±{thr:g}% "
+                         f"(mayor {top['symbol']} {top['rate_pct']:+.4f}%)")
+            return
+        self.log(f"[funding] cobro {_utc(ts, '%H:%M')} UTC: {len(cands)} con funding ≥ ±{thr:g}%: "
+                 + ", ".join(f"{r['symbol']} {r['rate_pct']:+.3f}%" for r in cands[:10]))
+        for r in cands:
+            side = funding_side(r["rate_pct"])
+            if side is None:
+                continue
+            if eng.paused:
+                self._funding_signal(r["symbol"], side, r["rate_pct"], ts, r["mark"], "pausado")
+                continue
+            asyncio.ensure_future(self._funding_trade(r["symbol"], side, r["rate_pct"], ts, r["mark"]))
+
+    async def _funding_trade(self, sym: str, side: str, rate: float, ts: float, mark: float) -> None:
+        """Precio en vivo del par desde ya (aggTrade) y, al llegar el momento, abre sin esperar nada."""
+        with self.lock:
+            self._price_hold.add(sym)
+        try:
+            self._refresh_pos_syms(force=True)
+            try:
+                await self._prefetch_price(sym)
+            except Exception:
+                pass
+            wait = ts - self.funding_cfg["open_before_s"] - self._srv_now()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._funding_open(sym, side, rate, ts, mark)
+        finally:
+            with self.lock:
+                self._price_hold.discard(sym)
+            self._refresh_pos_syms(force=True)
+
+    def _funding_open(self, sym: str, side: str, rate: float, ts: float, mark: float) -> Optional[Position]:
+        eng = self.engines[ENGINE_FUNDING]
+        eng.signal_count += 1
+        t0 = time.perf_counter()
+
+        def skip(action: str) -> None:
+            self._funding_signal(sym, side, rate, ts, mark, action)
+
+        left = ts - self._srv_now()
+        if left <= 0.05:
+            return skip(f"ignorada: llegó tarde al cobro ({-left:.2f} s)")
+        if eng.paused:
+            return skip("pausado")
+        if eng.blocked.get(side):
+            return skip(f"bloqueada: {side} desactivados")
+        if self.max_open > 0 and self.open_count() >= self.max_open:
+            return skip(f"ignorada: límite de {self.max_open} abiertas")
+        if not self.store.can_open():
+            return skip("ignorada: estado sin confirmar")
+        with self.lock:
+            dup = any(p.symbol == sym and p.funding_ts == ts for p in eng.positions.values())
+        if dup:
+            return skip("ya hay una abierta para este cobro")
+        if sym not in self.filters:
+            return skip("saltada: sin filtros del símbolo (exchangeInfo no cargó)")
+        price = self._live_price(sym)
+        src = "precio en vivo"
+        if not price:
+            price, src = mark, "mark de la consulta"
+        if not price:
+            return skip("sin precio")
+        f = self.filters[sym]
+        qty, eff, why = size_order(self.funding_cfg["notional"], price, f.get("stepSize", 0.001),
+                                   f.get("minQty", 0.0), f.get("minNotional", 5.0), MAX_NOTIONAL_OVER)
+        if qty <= 0:
+            self.log(f"[{eng.label}] {side} {sym} saltada: {why}")
+            return skip(f"saltada: {why}")
+        pos = Position(
+            trade_id=self._next_trade_id(), symbol=sym, direction=side, entry_price=price, qty=qty,
+            notional=eff, tp_price=0.0, sl_price=0.0, signal_pct=rate, candle_open=mark, candle_close=price,
+            candle_time=int(ts * 1000), last_price=price, strategy=eng.name, sent=not self.executor_paused,
+            signal_price=price, entry_src=src, funding_rate=rate, funding_ts=ts,
+        )
+        with self.lock:
+            eng.positions[pos.trade_id] = pos
+            eng.opened_count += 1
+            eng._decide_ms.append((time.perf_counter() - t0) * 1000)
+        if pos.sent:                                # al executor YA, con el precio en vivo
+            self.executor.send({
+                "action": "open", "trade_id": pos.trade_id, "symbol": sym, "direction": side,
+                "price": price, "quantity": qty, "notional": round(eff, 4),
+                "level": round(rate, 6), "strategy": eng.name,
+            }, t0)
+        self._refresh_pos_syms()
+        self.store.mark_dirty(True)
+        skip(f"abierta #{pos.trade_id}")
+        gain = funding_income_usd(eff, rate, side)
+        self.log(f"[{eng.label}] ABRE {side} {sym}{'' if pos.sent else ' [SIMULADA: envíos al executor pausados]'} | "
+                 f"funding {rate:+.4f}% → cobra ~{gain:+.4f} USDT a las {_utc(ts, '%H:%M:%S')} UTC "
+                 f"({left:.2f} s antes) | px={price:g} ({src}) qty={qty:g} ({eff:.2f} USDT) | trade #{pos.trade_id}")
+        self._funding_schedule_close(pos)
+        # En papel: la entrada se corrige con el libro cuando llegue (el executor ya salió).
+        if BOOK_FILL:
+            def fix(px: float, fsrc: str) -> None:
+                with self.lock:
+                    if pos.trade_id not in eng.positions or fsrc != "libro" or not px:
+                        return
+                    pos.entry_price, pos.entry_src = px, fsrc
+                    pos.notional = qty * px
+                    pos.mfe_pct = pos.mae_pct = pos.mfe_usd = pos.mae_usd = 0.0
+                    pos.update(pos.last_price or px)
+            self._with_fill(sym, side == LONG, qty, price, fix)
+        return pos
+
+    def _funding_schedule_close(self, pos: Position) -> None:
+        loop = self.loop
+        if loop is None or not self._on_loop():
+            return
+        delay = pos.funding_ts + self.funding_cfg["close_after_s"] - self._srv_now()
+        loop.call_later(max(delay, 0.0), self._funding_close, pos.trade_id)
+
+    def _funding_close(self, trade_id: int) -> None:
+        """Cierra tras el cobro, al precio en vivo (la orden sale ya; el libro, en paralelo)."""
+        _eng, pos = self._find(trade_id)
+        if pos is None:
+            return
+        if not self.store.can_act():
+            if self._on_loop():
+                self.loop.call_later(1.0, self._funding_close, trade_id)
+            return
+        price = self._live_price(pos.symbol) or pos.last_price or pos.entry_price
+        self._close(trade_id, price, "FUNDING")
+
+    def _funding_overdue(self) -> None:
+        """Red de seguridad (p. ej. tras un reinicio): cierra las de funding cuyo cobro ya pasó."""
+        late = self._srv_now() - self.funding_cfg["close_after_s"] - 3.0
+        with self.lock:
+            due = [t for t, p in self.engines[ENGINE_FUNDING].positions.items()
+                   if p.funding_ts and p.funding_ts < late and t not in self._closing]
+        for tid in due:
+            self._funding_close(tid)
+
+    def funding_snapshot(self, rows: bool = True) -> dict:
+        c = dict(self.funding_cfg)
+        with self.lock:
+            top = [dict(r) for r in self._funding_rows[:20]] if rows else []
+        now = self._srv_now()
+        for r in top:
+            r["next"] = _utc(r["next_ts"], "%H:%M") if r["next_ts"] else ""
+            r["in_s"] = round(r["next_ts"] - now) if r["next_ts"] else None
+            r["over"] = abs(r["rate_pct"]) >= c["min_pct"]
+        ts = self._funding_target_ts or next_funding_ts(now, c["open_before_s"])
+        return {"cfg": c, "rows": top, "over": self._funding_over, "scans": self.funding_scans,
+                "errors": self.funding_errors, "last_error": self.funding_last_error,
+                "last_scan": _utc(self.funding_last_scan_ts, "%H:%M:%S") if self.funding_last_scan_ts else "",
+                "scan_ms": round(self.funding_last_scan_ms), "clock_off_ms": round(self.funding_clock_off * 1000),
+                "next": _utc(ts, "%H:%M"), "next_in_s": round(ts - now),
+                "scan_in_s": round(ts - c["scan_before_s"] - now)}
+
     # ── Recuperación tras reinicio ────────────────────────────────────────────
 
     def _recovery_doc(self) -> Tuple[dict, List[dict]]:
@@ -3401,19 +3754,19 @@ class KlineBot:
     _POS_FIELDS = ("trade_id", "symbol", "direction", "entry_price", "notional", "tp_price", "sl_price",
                    "signal_pct", "candle_age_s", "inverted", "sent", "mfe_pct", "mae_pct", "mfe_usd",
                    "mae_usd", "ratio_trigger", "ratio_entry", "ratio_change_pct", "ratio_target", "revenge",
-                   "rev_parent", "rev_tp_usd", "rev_sl_usd")
+                   "rev_parent", "rev_tp_usd", "rev_sl_usd", "funding_rate", "funding_ts")
     _CLOSED_FIELDS = ("symbol", "direction", "entry_price", "close_price", "move_pct", "pnl", "fees",
-                      "mfe_pct", "mae_pct", "duration_s", "reason", "sent", "revenge")
+                      "mfe_pct", "mae_pct", "duration_s", "reason", "sent", "revenge", "funding_usd")
     _SIGNAL_FIELDS = ("time", "symbol", "direction", "candle", "open", "close", "body_pct",
                       "candle_age_s", "action")
     WEB_CLOSED_ROWS = 100
     WEB_SIGNAL_ROWS = 60
     # Partes pesadas del estado: la web pide solo las de la vista abierta (?view=).
-    ALL_PARTS = frozenset({"signals", "closed", "exc", "eval", "ratio_rows", "events"})
+    ALL_PARTS = frozenset({"signals", "closed", "exc", "eval", "ratio_rows", "events", "funding_rows"})
     VIEW_PARTS = {
         "resumen":     frozenset(),
         "operaciones": frozenset({"signals"}),
-        "bots":        frozenset(),
+        "bots":        frozenset({"funding_rows"}),
         "mercado":     frozenset({"ratio_rows", "eval"}),
         "historial":   frozenset({"closed", "exc"}),
         "sistema":     frozenset({"events"}),
@@ -3460,7 +3813,7 @@ class KlineBot:
             "signals":        signals,
             "excursions":     self.excursion_stats(eng) if "exc" in parts else None,
             "evaluations":    (self.evaluations(eng.threshold_pct)
-                               if "eval" in parts and eng.name not in RATIO_ENGINES else empty_eval),
+                               if "eval" in parts and eng.name in KLINE_ENGINES else empty_eval),
         }
 
     def network_stats(self) -> dict:
@@ -3525,6 +3878,7 @@ class KlineBot:
             "prices_connected": bool(pc and pc.is_connected()),
             "eval_total":      self.eval_count,
             "ratio":           self._ratio_snapshot("ratio_rows" in parts),
+            "funding":         self.funding_snapshot("funding_rows" in parts),
             "global":          self._global_snapshot(),
             "engines":         {n: self._engine_snapshot(e, now, parts if detail is None or n == detail
                                                          else frozenset())
@@ -3685,6 +4039,8 @@ def api_config_set():
         return err
     if eng.name in RATIO_ENGINES:
         return jsonify({"ok": False, "error": "Los bots de ratio se ajustan en /api/ratio"}), 400
+    if eng.name == ENGINE_FUNDING:
+        return jsonify({"ok": False, "error": "El bot de funding se ajusta en /api/funding"}), 400
     vals = {}
     for key in ("threshold_pct", "tp_pct"):
         if data.get(key) in (None, ""):
@@ -3861,6 +4217,37 @@ def _rev_set(data: dict):
     return jsonify({"ok": True, **cfg})
 
 
+@app.get("/api/funding")
+def api_funding_get():
+    return _no_store(jsonify({"ok": True, **bot.funding_snapshot()}))
+
+
+@app.post("/api/funding")
+def api_funding_set():
+    """Bot de funding alto, en caliente. Body JSON (todo opcional): {"min_pct": 0.3, "notional": 20,
+    "open_before_s": 2, "close_after_s": 1, "scan_before_s": 30}. Pausar con /api/pause y bloquear
+    LONG/SHORT con /api/block ({"engine": "funding", ...})."""
+    busy = _guard()
+    if busy:
+        return busy
+    data = request.get_json(silent=True) or {}
+    vals = {}
+    for key in KlineBot._FUNDING_LIMITS:
+        if data.get(key) in (None, ""):
+            continue
+        try:
+            vals[key] = float(data[key])
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": f"{key} inválido"}), 400
+    if not vals:
+        return jsonify({"ok": False, "error": "Nada que cambiar"}), 400
+    try:
+        cfg = bot.set_funding_config(**vals)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, **cfg})
+
+
 @app.post("/api/session/reset")
 def api_session_reset():
     """Pone a cero el contador del objetivo global (realizado + abierto)."""
@@ -3989,6 +4376,7 @@ TRADE_CSV_COLS = [
     "sent", "move_pct", "pnl", "pnl_gross", "fees", "pnl_pct", "mfe_pct", "mae_pct", "mfe_usd", "mae_usd", "time_to_mfe_s",
     "time_to_mae_s", "high_price", "low_price", "sl_price", "ratio_target", "ratio_trigger", "ratio_entry", "ratio_change_pct",
     "revenge", "rev_parent", "rev_tp_usd", "rev_sl_usd", "signal_price", "entry_src", "trigger_price", "close_src",
+    "funding_rate", "funding_ts", "funding_usd",
 ]
 
 
@@ -4459,6 +4847,37 @@ HTML = r"""<!doctype html>
       </div>
     </details>
 
+    <details class="panel" data-key="b_funding" open>
+      <summary>Bot funding alto <span class="hint" id="fdSum"></span><span class="right" id="fdState"></span></summary>
+      <div class="body">
+        <div class="cols2">
+          <div class="box">
+            <h4>Parámetros <span class="muted" style="font-weight:400">· se aplican desde el próximo cobro</span></h4>
+            <form id="fdForm">
+              <label class="f">Funding mínimo, ± % <span id="fdCurMin"></span>
+                <input id="fdMin" type="number" step="0.01" min="0.01" max="10" placeholder="ej. 0.3"></label>
+              <label class="f">Notional por entrada, USDT <span id="fdCurNot"></span>
+                <input id="fdNot" type="number" step="1" min="5" max="100000" placeholder="ej. 20"></label>
+              <label class="f">Abrir, segundos antes del cobro <span id="fdCurOpen"></span>
+                <input id="fdOpen" type="number" step="0.1" min="0.2" max="60" placeholder="ej. 2"></label>
+              <label class="f">Cerrar, segundos después del cobro <span id="fdCurClose"></span>
+                <input id="fdClose" type="number" step="0.1" min="0" max="60" placeholder="ej. 1"></label>
+              <label class="f">Consultar el funding, segundos antes del cobro <span id="fdCurScan"></span>
+                <input id="fdScan" type="number" step="1" min="5" max="900" placeholder="ej. 30"></label>
+              <button type="submit">Guardar</button>
+            </form>
+            <h4 style="margin-top:16px">Direcciones y estado</h4><div class="row c" id="rb_funding"></div>
+          </div>
+          <div class="box">
+            <h4>Cómo funciona</h4>
+            <div class="note" style="margin-top:0" id="fdNote"></div>
+            <div class="scroll" style="margin-top:10px"><table><thead><tr><th>Par</th><th>Funding</th><th>Cobro (UTC)</th><th>Mark</th><th></th></tr></thead><tbody id="fdTbl"></tbody></table></div>
+          </div>
+        </div>
+        <div id="fdMsg" class="muted msg"></div>
+      </div>
+    </details>
+
     <details class="panel" data-key="b_klines" open>
       <summary>Bots de velas 1m <span class="hint">al cierre y en vivo · comparten velas y modo</span><span class="right" id="klState"></span></summary>
       <div class="body">
@@ -4584,10 +5003,11 @@ const bytes = b => b >= 1073741824 ? (b/1073741824).toFixed(2) + ' GB' : b >= 10
 const tag = d => `<span class="tag ${esc(d)}">${esc(d)}</span>`;
 const store = {get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } },
                set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }};
-const ENGINES = ['ratio', 'ratio_tp', 'ratio_rev', 'close', 'live'];
+const ENGINES = ['ratio', 'ratio_tp', 'ratio_rev', 'funding', 'close', 'live'];
 const RATIO = ['ratio', 'ratio_tp', 'ratio_rev'];
-const SHORT_LABEL = {ratio: 'Ratio TP/SL', ratio_tp: 'Ratio solo TP', ratio_rev: 'Ratio venganza', close: 'Al cierre', live: 'En vivo'};
-const PANEL_OF = {ratio: 'b_ratio1', ratio_tp: 'b_ratio_tp', ratio_rev: 'b_ratio_rev', close: 'b_klines', live: 'b_klines'};
+const SHORT_LABEL = {ratio: 'Ratio TP/SL', ratio_tp: 'Ratio solo TP', ratio_rev: 'Ratio venganza', funding: 'Funding', close: 'Al cierre', live: 'En vivo'};
+const PANEL_OF = {ratio: 'b_ratio1', ratio_tp: 'b_ratio_tp', ratio_rev: 'b_ratio_rev', funding: 'b_funding', close: 'b_klines', live: 'b_klines'};
+const hms = ts => ts ? new Date(ts * 1000).toISOString().slice(11, 19) : '—';
 // Salida de cada bot de ratio: {tp_pct, sl_pct, ratio_exit}.
 const exitOf = (d, n) => n === 'ratio_tp' ? {tp_pct: 0, sl_pct: 0, ratio_exit: true} : ((n === 'ratio_rev' ? (d.ratio || {}).rev : (d.ratio || {}).cfg) || {});
 const tpsl = c => `TP ${c.tp_pct > 0 ? '+' + c.tp_pct + '%' : 'off'} · SL ${c.sl_pct > 0 ? '−' + c.sl_pct + '%' : 'off'}${c.ratio_exit ? ' · TP ratio' : ''}`;
@@ -4684,6 +5104,7 @@ function rangeBar(p) {
 function tradeCard(p, d, compact) {
   const isR = RATIO.includes(p._eng), xc = exitOf(d, p._eng);
   const sig = p.revenge ? `venganza de #${p.rev_parent} · TP +${num(p.rev_tp_usd, 4)} / SL −${num(p.rev_sl_usd, 4)} USD`
+            : p._eng === 'funding' ? `funding ${pct(p.funding_rate || 0)} · cobro ${hms(p.funding_ts)} UTC`
             : isR ? `ratio ${num(p.ratio_trigger, 4)}→${num(p.ratio_entry, 4)} ${pct(p.ratio_change_pct || 0)}`
                   : `vela ${pct(p.signal_pct)}${p._eng === 'live' ? ` a los ${Math.round(p.candle_age_s || 0)}s` : ''}`;
   const ratioExit = isR && !p.revenge && xc.ratio_exit ? `<span>TP ratio<b>${p.direction === 'SHORT' ? '≥' : '≤'} ${num(p.ratio_target || p.ratio_trigger, 4)}</b></span>` : '';
@@ -4742,13 +5163,15 @@ function render(d) {
 
   q('botCards').innerHTML = ENGINES.map(n => { const b = E[n], bc = b.config, isR = RATIO.includes(n), xc = exitOf(d, n);
     const bl = [bc.block_long && 'LONG', bc.block_short && 'SHORT'].filter(Boolean).join(', ');
-    const off = !isR && !k.running;
+    const isF = n === 'funding', fc = (d.funding || {}).cfg || {};
+    const off = (n === 'close' || n === 'live') && !k.running;
     const state = bc.paused ? ['off', 'PAUSADO'] : off ? ['idle', 'SIN VELAS'] : ['on', 'EN MARCHA'];
     return `<div class="bot ${bc.paused ? 'paused' : ''} ${off ? 'off' : ''}">
       <div class="top"><h3>${esc(b.label)}</h3><span class="st ${state[0]}">${state[1]}</span></div>
       <div class="hint">${esc(b.hint)}</div>
       <div class="kv">
-        ${isR ? `<div>Salida<b>${n === 'ratio_tp' ? 'solo TP ratio' : tpsl(xc)}</b></div><div>${n === 'ratio_rev' ? 'Venganza' : 'Ratio ↓ SHORT / ↑ LONG'}<b>${n === 'ratio_rev' ? ((r.rev || {}).revenge ? `ON ×${r.rev.rev_mult} · ${r.revenge_count || 0} disparadas` : 'OFF') : rc.drop_min_pct + '–' + rc.drop_max_pct + '%'}</b></div>`
+        ${isF ? `<div>Funding<b>≥ ±${fc.min_pct}%</b></div><div>Entra / sale<b>−${fc.open_before_s} s / +${fc.close_after_s} s · ${fc.notional} USDT</b></div>`
+        : isR ? `<div>Salida<b>${n === 'ratio_tp' ? 'solo TP ratio' : tpsl(xc)}</b></div><div>${n === 'ratio_rev' ? 'Venganza' : 'Ratio ↓ SHORT / ↑ LONG'}<b>${n === 'ratio_rev' ? ((r.rev || {}).revenge ? `ON ×${r.rev.rev_mult} · ${r.revenge_count || 0} disparadas` : 'OFF') : rc.drop_min_pct + '–' + rc.drop_max_pct + '%'}</b></div>`
               : `<div>Señal<b>±${bc.threshold_pct}%</b></div><div>${xk}<b>${bc.tp_pct}%</b></div>`}
         <div>Bloqueados<b class="${bl ? 'neg' : ''}">${bl || '—'}</b></div>
         <div>Abiertas<b>${b.positions.length}</b></div><div>Señales / entradas<b>${b.signal_count} / ${b.opened_count}</b></div><div>Cerradas<b>${b.closed_count} (${b.wins} gan.)</b></div>
@@ -4789,12 +5212,13 @@ function render(d) {
   const rn = {}; (r.rows || []).forEach(z => rn[z.symbol] = z);
   q('tPos').innerHTML = shown.map(row => {
     const isR = RATIO.includes(row._eng);
-    const exits = isR ? [row.tp_price > 0 ? `<span class="pos">TP</span> ${num(row.tp_price, 8)}` : '', row.sl_price > 0 ? `<span class="neg">SL</span> ${num(row.sl_price, 8)}` : '',
+    const isF = row._eng === 'funding';
+    const exits = isF ? `<span class="muted">sale al cobro +${((d.funding || {}).cfg || {}).close_after_s} s</span>` : isR ? [row.tp_price > 0 ? `<span class="pos">TP</span> ${num(row.tp_price, 8)}` : '', row.sl_price > 0 ? `<span class="neg">SL</span> ${num(row.sl_price, 8)}` : '',
                          !row.revenge && exitOf(d, row._eng).ratio_exit ? `<span class="muted">ratio ${row.direction === 'SHORT' ? '≥' : '≤'}</span> ${num(row.ratio_target || row.ratio_trigger, 4)}${rn[row.symbol] && rn[row.symbol].last != null ? ` <span class="muted">(ahora ${num(rn[row.symbol].last, 4)})</span>` : ''}` : ''].filter(Boolean).join(' · ')
                       : `<span class="muted">${row.inverted ? 'SL' : 'TP'}</span> ${num(row.tp_price, 8)}`;
     return `<tr><td><b>${esc(row.symbol)}</b> <span class="muted">#${row.trade_id}</span>${row.sent === false ? ' <span class="st off">SIMULADA</span>' : ''}</td>
       <td>${esc(SHORT_LABEL[row._eng])}</td><td>${tag(row.direction)}${row.revenge ? ' <span class="tag REV">VENGANZA</span>' : ''}</td>
-      <td>${row.revenge ? `venganza de #${row.rev_parent}` : isR ? `${num(row.ratio_trigger, 4)}→${num(row.ratio_entry, 4)} ${pct(row.ratio_change_pct || 0)}` : pct(row.signal_pct)}</td>
+      <td>${row.revenge ? `venganza de #${row.rev_parent}` : isF ? `funding ${pct(row.funding_rate || 0)} · ${hms(row.funding_ts)}` : isR ? `${num(row.ratio_trigger, 4)}→${num(row.ratio_entry, 4)} ${pct(row.ratio_change_pct || 0)}` : pct(row.signal_pct)}</td>
       <td>${num(row.entry_price, 8)}</td><td>${num(row.price, 8)}</td><td>${pct(row.move_pct)}</td><td>${exits || '—'}</td>
       <td>${num(row.notional, 2)}</td><td>${usd(row.pnl)}</td>
       <td>${pct(row.mfe_pct)} <span class="muted">${usd(row.mfe_usd)}</span></td><td>${pct(row.mae_pct)} <span class="muted">${usd(row.mae_usd)}</span></td>
@@ -4806,14 +5230,15 @@ function render(d) {
   document.querySelectorAll('.engName').forEach(el => el.textContent = e.label);
   q('sigSeg').innerHTML = seg(ENGINES.map(n => [n, SHORT_LABEL[n]]), cur, 'eng');
   q('nSig').textContent = e.signal_count;
-  q('thSigC').textContent = isRatio ? 'Ratio' : 'Vela';
-  q('thSigB').textContent = isRatio ? 'Cambio' : 'Cuerpo';
-  q('thSigS').textContent = isRatio ? '' : 'Segundo';
+  const isFund = cur === 'funding';
+  q('thSigC').textContent = isFund ? 'Cobro · mark' : isRatio ? 'Ratio' : 'Vela';
+  q('thSigB').textContent = isFund ? 'Funding' : isRatio ? 'Cambio' : 'Cuerpo';
+  q('thSigS').textContent = isRatio || isFund ? '' : 'Segundo';
   if (view === 'operaciones') q('tSig').innerHTML = e.signals.map(s => `<tr><td>${esc(s.time)}</td><td>${esc(s.symbol)}</td><td>${tag(s.direction)}</td>
     <td>${esc(s.candle)} <span class="muted">${num(s.open, 8)}→${num(s.close, 8)}</span></td><td>${pct(s.body_pct)}</td>
-    <td class="muted">${isRatio ? '' : Math.round(s.candle_age_s || 0) + 's'}</td>
+    <td class="muted">${isRatio || isFund ? '' : Math.round(s.candle_age_s || 0) + 's'}</td>
     <td class="${/^(venganza )?abierta/.test(s.action) ? 'pos' : 'muted'}">${esc(s.action)}</td></tr>`).join('')
-    || `<tr><td colspan="7" class="muted">${isRatio ? 'Esperando una caída (SHORT) o subida (LONG) del ratio dentro del rango' : (k.running ? 'Esperando velas con cuerpo ≥ ±' + ec.threshold_pct + '%' : 'Las velas están apagadas (Bots → Encender velas)')}</td></tr>`;
+    || `<tr><td colspan="7" class="muted">${isFund ? 'Esperando un funding ≥ ±' + (((d.funding || {}).cfg || {}).min_pct) + '% antes de un cobro' : isRatio ? 'Esperando una caída (SHORT) o subida (LONG) del ratio dentro del rango' : (k.running ? 'Esperando velas con cuerpo ≥ ±' + ec.threshold_pct + '%' : 'Las velas están apagadas (Bots → Encender velas)')}</td></tr>`;
 
   // ── Bots ──
   q('rtSum').textContent = `24 h ≥ ±${rc.watch_min_pct}% · ratio ↓ SHORT / ↑ LONG ${rc.drop_min_pct}–${rc.drop_max_pct}%`;
@@ -4824,7 +5249,21 @@ function render(d) {
     return ['SHORT', 'LONG'].map(dir => { const bl = dir === 'LONG' ? bc.block_long : bc.block_short;
       return `<button type="button" class="small ${bl ? 'danger' : 'ok'}" data-block="${dir}" data-eng="${n}" data-on="${bl ? '1' : ''}">${dir} ${bl ? 'desactivado · activar' : 'activo · desactivar'}</button>`; }).join('')
       + `<button type="button" class="small ${bc.paused ? 'ok' : 'warnb'}" data-pause="${n}">${bc.paused ? 'Reanudar bot' : 'Pausar bot'}</button>`; };
-  for (const n of RATIO) q('rb_' + n).innerHTML = dirBtns(n);
+  for (const n of [...RATIO, 'funding']) q('rb_' + n).innerHTML = dirBtns(n);
+  const fd = d.funding || {}, fdc = fd.cfg || {};
+  q('fdState').innerHTML = stateOf('funding');
+  q('fdSum').textContent = `≥ ±${fdc.min_pct}% · ${fdc.notional} USDT · −${fdc.open_before_s} s / +${fdc.close_after_s} s`;
+  q('fdCurMin').textContent = `(ahora ±${fdc.min_pct}%)`; q('fdCurNot').textContent = `(ahora ${fdc.notional})`;
+  q('fdCurOpen').textContent = `(ahora ${fdc.open_before_s} s)`; q('fdCurClose').textContent = `(ahora ${fdc.close_after_s} s)`;
+  q('fdCurScan').textContent = `(ahora ${fdc.scan_before_s} s)`;
+  q('fdNote').innerHTML = `Antes de cada cobro (horas en punto UTC) consulta el funding de todos los pares <b>una vez</b> (${fdc.scan_before_s} s antes, una petición REST con gzip). `
+    + `Si un par tiene funding ≥ +${fdc.min_pct}% abre <b>SHORT</b> (los LONG le pagan); si es ≤ −${fdc.min_pct}%, <b>LONG</b>. Entra ${fdc.open_before_s} s antes del cobro, `
+    + `manda la orden al executor al instante con el precio en vivo (la entrada en papel se corrige después con el libro) y cierra ${fdc.close_after_s} s después. El PnL suma el funding cobrado. `
+    + `Próximo cobro ${esc(fd.next || '—')} UTC (en ${dur(fd.next_in_s || 0)}) · última consulta ${esc(fd.last_scan || '—')}${fd.scan_ms ? ' (' + fd.scan_ms + ' ms)' : ''} · `
+    + `${fd.over || 0} par(es) ≥ umbral · reloj Binance ${fd.clock_off_ms >= 0 ? '+' : ''}${fd.clock_off_ms || 0} ms${fd.last_error ? ` · <span class="neg">${esc(fd.last_error)}</span>` : ''}`;
+  if (view === 'bots') q('fdTbl').innerHTML = (fd.rows || []).map(z => `<tr><td><b>${esc(z.symbol)}</b></td><td class="${z.over ? (z.rate_pct > 0 ? 'neg' : 'pos') : 'muted'}">${z.rate_pct > 0 ? '+' : ''}${(+z.rate_pct).toFixed(4)}%</td>
+      <td>${esc(z.next)}${z.in_s != null && z.in_s >= 0 ? ` <span class="muted">(${dur(z.in_s)})</span>` : ''}</td><td>${num(z.mark, 8)}</td><td>${z.over ? tag(z.rate_pct > 0 ? 'SHORT' : 'LONG') : ''}</td></tr>`).join('')
+    || '<tr><td colspan="5" class="muted">Aún no hay consulta del funding</td></tr>';
   const rv = r.rev || {};
   q('r3Sum').textContent = `${tpsl(rv)} · venganza ${rv.revenge ? 'ON ×' + rv.rev_mult : 'OFF'}`;
   q('rvCurTp').textContent = `(ahora ${rv.tp_pct > 0 ? '+' + rv.tp_pct + '%' : 'apagado'})`;
@@ -4954,7 +5393,7 @@ function render(d) {
     q('tClosed').innerHTML = e.closed_trades.map(t => `<tr><td>${esc(t.closed)}</td><td>${esc(t.symbol)}</td><td>${tag(t.direction)}${t.revenge ? ' <span class="tag REV">VENGANZA</span>' : ''}</td>
       <td>${num(t.entry_price, 8)}</td><td>${num(t.close_price, 8)}</td><td>${pct(t.move_pct)}</td><td>${usd(t.pnl)}</td>
       <td class="muted">${num(t.fees || 0, 4)}</td><td>${pct(t.mfe_pct || 0)}</td><td>${pct(t.mae_pct || 0)}</td>
-      <td>${dur(t.duration_s || 0)}</td><td>${esc(t.reason)}${t.sent === false ? ' <span class="st off">SIMULADA</span>' : ''}</td></tr>`).join('')
+      <td>${dur(t.duration_s || 0)}</td><td>${esc(t.reason)}${t.funding_usd ? ` <span class="muted">funding ${usd(t.funding_usd)}</span>` : ''}${t.sent === false ? ' <span class="st off">SIMULADA</span>' : ''}</td></tr>`).join('')
       || '<tr><td colspan="12" class="muted">Aún no hay cierres</td></tr>';
     const exc = e.excursions || {};
     q('tExc').innerHTML = ['all', 'LONG', 'SHORT'].map(kk => {
@@ -5152,6 +5591,13 @@ q('rvExitForm').addEventListener('submit', async ev => {
 for (const [id, key] of [['revMult', 'rev_mult'], ['revRecover', 'rev_recover_pct'], ['revSl', 'rev_sl_pct']]) {
   q(id).addEventListener('change', ev => { if (ev.target.value) revPost({[key]: ev.target.value}, revMsg).then(() => ev.target.blur()); });
 }
+q('fdForm').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const ids = {min_pct: 'fdMin', notional: 'fdNot', open_before_s: 'fdOpen', close_after_s: 'fdClose', scan_before_s: 'fdScan'};
+  const body = {}; for (const [k, id] of Object.entries(ids)) if (q(id).value !== '') body[k] = q(id).value;
+  if (await glb(body, '/api/funding', 'fdMsg', r => `funding ≥ ±${r.min_pct}% · ${r.notional} USDT · abre ${r.open_before_s} s antes y cierra ${r.close_after_s} s después · consulta ${r.scan_before_s} s antes`))
+    for (const id of Object.values(ids)) q(id).value = '';
+});
 q('indForm').addEventListener('submit', async ev => {
   ev.preventDefault();
   if (await glb({rsi_period: q('indPeriod').value, rsi_level: q('indLevel').value, vwap_k: q('indK').value}, '/api/indicators', 'rtMsg', indText)) {
