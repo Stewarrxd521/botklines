@@ -114,7 +114,7 @@ from state_store import StateStore, make_owner_id                    # noqa: E40
 
 BASE_URL    = os.getenv("BASE_URL", "https://fapi.binance.com")
 QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDT")
-# Proxy HTTP opcional para el REST de Binance (hoy solo el ratio; exchangeInfo va por WebSocket).
+# Proxy HTTP opcional para el REST de Binance (el ratio y, una vez cada varios días, exchangeInfo).
 REST_PROXY_URL = os.getenv("REST_PROXY_URL", "").strip()   # http://usuario:clave@host:puerto (variable de entorno)
 # Proxies SOLO para el REST de Binance (ratio de top traders): se usan, rotando, mientras la IP
 # directa esté vetada (418/429). REST_PROXY_URLS (separadas por comas) reemplaza esta lista.
@@ -142,6 +142,13 @@ SYMBOLS_CACHE_FILE = os.getenv(
 # exchangeInfo (filtros de cantidad) se pide cada 10 días como mucho; los nombres de los
 # símbolos se descubren por WebSocket (ver SYMBOL_SCAN_HOURS).
 SYMBOL_REFRESH_HOURS = float(os.getenv("SYMBOL_REFRESH_HOURS", "240"))
+# exchangeInfo por PROXY (REST GET /fapi/v1/exchangeInfo, solo esa petición): la IP pública normal del servidor no
+# la hace. Si los proxies fallan, se vuelve a la IP normal (API WebSocket, un intento) y, si tampoco, al archivo.
+EXCHANGE_INFO_VIA_PROXY = os.getenv("EXCHANGE_INFO_VIA_PROXY", "true").lower() in ("1", "true", "yes")
+EXCHANGE_INFO_DIRECT_FALLBACK = os.getenv("EXCHANGE_INFO_DIRECT_FALLBACK", "true").lower() in ("1", "true", "yes")
+EXCHANGE_INFO_PROXY_TRIES = max(int(os.getenv("EXCHANGE_INFO_PROXY_TRIES", "2")), 1)   # proxies distintos por intento
+# Tras un fallo no se vuelve a pedir en seguida: 60 s, 2 min, 4 min… hasta este tope (s). Evita el "cada rato".
+EXCHANGE_INFO_MAX_BACKOFF_S = float(os.getenv("EXCHANGE_INFO_MAX_BACKOFF_S", "1800"))
 
 # ── Estrategia ────────────────────────────────────────────────────────────────
 SIGNAL_THRESHOLD_PCT = float(os.getenv("SIGNAL_THRESHOLD_PCT", "3"))    # cuerpo mínimo de la vela
@@ -1257,6 +1264,8 @@ class KlineBot:
         self._rest_times: Deque[float] = deque()      # peticiones de los últimos 5 min
         self._scan_seen: Optional[set] = None         # símbolos vistos en la exploración en curso
         self._filters_ts = 0.0                        # cuándo se obtuvieron los filtros de cantidad
+        self._xi_next_try = 0.0                       # no pedir exchangeInfo a la red antes de esta hora
+        self._xi_fail = 0                             # fallos seguidos pidiendo exchangeInfo (para el backoff)
         self._load_known_symbols()
         # Tráfico de entrada propio (bytes): REST a Binance y snapshots/stream del 24 h.
         self.rx_rest_bytes = 0
@@ -1799,18 +1808,83 @@ class KlineBot:
                  f"{os.path.basename(EXCHANGE_INFO_FILE)} (del {when}): {len(out)} perpetuos")
         return out
 
+    def _exchange_info_via_proxy(self) -> dict:
+        """exchangeInfo por REST a través de un proxy (rotando, saltando los vetados). Solo esta petición usa el
+        proxy: el resto del bot sigue por la IP pública normal."""
+        now = time.time()
+        free = [r for r in REST_PROXIES if self._route_block.get(r, 0.0) <= now]
+        if not free:
+            raise RuntimeError("todos los proxies están en pausa")
+        k = self._proxy_rr % len(free)
+        self._proxy_rr += 1
+        order = (free[k:] + free[:k])[:EXCHANGE_INFO_PROXY_TRIES]
+        url = f"{BASE_URL}/fapi/v1/exchangeInfo"
+        last_exc: Optional[Exception] = None
+        for route in order:
+            hdrs: dict = {}
+            try:
+                data, nbytes = http_get_json(url, route, 25.0, headers_out=hdrs)
+            except urllib.error.HTTPError as exc:
+                if exc.code in (418, 429):
+                    try:
+                        wait = float(exc.headers.get("Retry-After") or 60)
+                    except (TypeError, ValueError):
+                        wait = 60.0
+                    self._route_block[route] = time.time() + max(wait, 30.0)
+                last_exc = RuntimeError(f"HTTP {exc.code} por {proxy_label(route)}")
+                self._route_errors[route] = self._route_errors.get(route, 0) + 1
+                continue
+            except Exception as exc:
+                last_exc = RuntimeError(f"{proxy_label(route)}: {exc}")
+                self._route_errors[route] = self._route_errors.get(route, 0) + 1
+                continue
+            if not isinstance(data, dict) or not data.get("symbols"):
+                last_exc = RuntimeError(f"{proxy_label(route)}: respuesta sin símbolos")
+                continue
+            self.rx_rest_bytes += nbytes
+            self._route_ok[route] = self._route_ok.get(route, 0) + 1
+            self._note_weight(route, hdrs.get("x-mbx-used-weight-1m"))
+            self.log(f"exchangeInfo por {proxy_label(route)} ({nbytes / 1024:.0f} KB)")
+            return data
+        raise RuntimeError(f"exchangeInfo por proxy falló: {last_exc}")
+
     async def _fetch_exchange_info(self) -> Dict[str, Dict[str, float]]:
+        """Orden: proxy (REST) → IP normal (WebSocket, 1 intento) → archivo del repositorio. Con backoff: tras un
+        fallo no se toca la red otra vez hasta pasado 60 s, 2 min, 4 min… (tope EXCHANGE_INFO_MAX_BACKOFF_S)."""
         self._filters_from_file = False
-        try:
-            return exchange_filters(await self._ws_exchange_info())
-        except Exception as exc:
-            out = self._exchange_info_from_file(exc)
-            self._filters_from_file = True
-            return out
+        now = time.time()
+        errors: List[str] = []
+        if now < self._xi_next_try:
+            errors.append(f"en espera {self._xi_next_try - now:.0f} s tras un fallo (sin tocar la red)")
+        else:
+            if EXCHANGE_INFO_VIA_PROXY and REST_PROXIES:
+                try:
+                    return self._exchange_filters_checked(await asyncio.to_thread(self._exchange_info_via_proxy))
+                except Exception as exc:
+                    errors.append(str(exc))
+            if EXCHANGE_INFO_DIRECT_FALLBACK or not (EXCHANGE_INFO_VIA_PROXY and REST_PROXIES):
+                try:
+                    if errors:
+                        self.log(f"[símbolos] {errors[-1]}: vuelvo a la IP normal (WebSocket)")
+                    return self._exchange_filters_checked(await self._ws_exchange_info())
+                except Exception as exc:
+                    errors.append(str(exc))
+            self._xi_fail += 1
+            self._xi_next_try = time.time() + min(60.0 * 2 ** (self._xi_fail - 1), EXCHANGE_INFO_MAX_BACKOFF_S)
+        out = self._exchange_info_from_file(RuntimeError(" | ".join(errors)))
+        self._filters_from_file = True
+        return out
+
+    def _exchange_filters_checked(self, raw: dict) -> Dict[str, Dict[str, float]]:
+        out = exchange_filters(raw)
+        if not out:
+            raise RuntimeError(f"exchangeInfo sin perpetuos {QUOTE_ASSET}")
+        self._xi_fail, self._xi_next_try = 0, 0.0
+        return out
 
     async def _init_symbols(self) -> None:
         """Filtros de cantidad (stepSize, mínimos) de exchangeInfo, cacheados en disco
-        SYMBOL_REFRESH_HOURS (10 días). Por WebSocket (API de futuros): el único REST es el del ratio."""
+        SYMBOL_REFRESH_HOURS (10 días). exchangeInfo sale por proxy; si falla, por la IP normal (WebSocket)."""
         cached = None
         try:
             with open(SYMBOLS_CACHE_FILE, "r", encoding="utf-8") as fh:
