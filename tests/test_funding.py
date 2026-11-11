@@ -267,3 +267,26 @@ def test_la_consulta_final_es_3_min_antes_aunque_se_guardara_menos():
     assert st.KlineBot._load_funding_cfg({})["scan_before_s"] == 180
     assert st.KlineBot._load_funding_cfg({"scan_before_s": 120})["scan_before_s"] == 180   # valor viejo: se ignora
     assert st.KlineBot._load_funding_cfg({"scan_before_s": 240})["scan_before_s"] == 240
+
+
+def test_la_consulta_une_rest_y_websocket(tmp_path, monkeypatch):
+    """El REST de premiumIndex trae todos los pares; los que el WebSocket no trajo no se pierden."""
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    bot._rest_get = lambda path, *a, **k: [
+        {"symbol": "AUSDT", "markPrice": "1.1", "lastFundingRate": "0.0035", "nextFundingTime": 3600000},
+        {"symbol": "BUSDT", "markPrice": "2", "lastFundingRate": "-0.004", "nextFundingTime": 3600000},
+        {"symbol": "ABTC", "markPrice": "1", "lastFundingRate": "0.01", "nextFundingTime": 3600000}]
+
+    async def ws(*a, **k):
+        return [{"symbol": "AUSDT", "rate_pct": 0.36, "next_ts": 3600.0, "mark": 1.2}]
+    bot._funding_ws_snapshot = ws
+    rows = {r["symbol"]: r for r in asyncio.run(bot._funding_full_snapshot())}
+    assert set(rows) == {"AUSDT", "BUSDT"}
+    assert rows["AUSDT"]["rate_pct"] == pytest.approx(0.36)          # del WebSocket (más reciente)
+    assert rows["BUSDT"]["rate_pct"] == pytest.approx(-0.4) and rows["BUSDT"]["next_ts"] == 3600.0
+    assert bot._funding_src["only_rest"] == 1
+
+    async def ws_caido(*a, **k):
+        raise RuntimeError("sin WebSocket")
+    bot._funding_ws_snapshot = ws_caido
+    assert len(asyncio.run(bot._funding_full_snapshot())) == 2           # con una sola fuente basta
