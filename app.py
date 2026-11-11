@@ -243,6 +243,7 @@ API_WS_TIMEOUT_S = float(os.getenv("API_WS_TIMEOUT_S", "20"))
 # con las de menor latencia) FUNDING_CLOCK_SYNC_BEFORE_S segundos antes de cada cobro, en un hilo aparte.
 FUNDING_CLOCK_SYNC_BEFORE_S = float(os.getenv("FUNDING_CLOCK_SYNC_BEFORE_S", "120"))   # sincronización completa: 2 min antes
 FUNDING_MIN_LEAD_S = float(os.getenv("FUNDING_MIN_LEAD_S", "0.4"))       # si al abrir faltan menos s, NO se entra (no alcanzaría el cobro)
+FUNDING_OPEN_MIN_S = round(max(0.2, FUNDING_MIN_LEAD_S + 0.1), 2)      # mínimo de "abrir N s antes del cobro"
 FUNDING_CLOCK_VERIFY_BEFORE_S = float(os.getenv("FUNDING_CLOCK_VERIFY_BEFORE_S", "8"))  # re-medición rápida (solo Binance)
 # Proveedores externos de hora (referencia para comparar con Binance). NTP por UDP/123 y, si el hosting
 # bloquea UDP, el /cdn-cgi/trace de Cloudflare (trae `ts=` con milisegundos) por HTTPS.
@@ -1092,7 +1093,11 @@ class _WsRpc:
             import aiohttp                                  # type: ignore
             self._lib = "a"
             self._session = aiohttp.ClientSession()
-            self._ws = await self._session.ws_connect(self.url, heartbeat=20, max_msg_size=0)
+            try:
+                self._ws = await self._session.ws_connect(self.url, heartbeat=20, max_msg_size=0)
+            except BaseException:
+                await self._session.close()             # sin __aexit__ si la conexión falla: no dejar la sesión abierta
+                raise
         return self
 
     async def __aexit__(self, *exc) -> None:
@@ -1152,7 +1157,10 @@ class KlineBot:
 
         self._pos_syms: frozenset = frozenset()     # copia para el hilo del WS (sin lock)
         self._book_ws_ok = ""                       # última URL que dio el libro por WebSocket
-        self._price_hold: set = set()               # símbolos con precio pedido antes de una entrada
+        # Símbolos con precio pedido antes de una entrada → cuántos lo piden (ratio, funding, exploración
+        # horaria). Con un contador, soltar el de uno no da de baja el precio que otro sigue esperando.
+        self._price_hold: Dict[str, int] = {}
+        self._bg_tasks: set = set()                 # tareas lanzadas en segundo plano (referencia fuerte)
         self._pending: set = set()                  # símbolos con tick de precio pendiente
         self._pending_lock = threading.Lock()
         self._wake_scheduled = False
@@ -1365,12 +1373,36 @@ class KlineBot:
             syms = frozenset(p.symbol for e in self.engines.values() for p in e.positions.values())
             changed = syms != self._pos_syms
             self._pos_syms = syms
-            wanted = syms | self._price_hold
+            wanted = syms | self._price_hold.keys()
         pc = self.price_cache
         if (changed or force) and pc is not None:
             pc.update_symbols(sorted(wanted))
         if changed or force:
             self._sync_indicators()
+
+    def _hold_price(self, syms) -> None:
+        """Pide el precio en vivo de `syms` (se suma a las demás peticiones del mismo par)."""
+        with self.lock:
+            for s in syms:
+                self._price_hold[s] = self._price_hold.get(s, 0) + 1
+
+    def _release_price(self, syms) -> None:
+        """Suelta UNA petición de precio de cada par de `syms`; se da de baja cuando nadie más lo pide."""
+        with self.lock:
+            for s in syms:
+                n = self._price_hold.get(s, 0) - 1
+                if n > 0:
+                    self._price_hold[s] = n
+                else:
+                    self._price_hold.pop(s, None)
+
+    def _spawn(self, coro):
+        """Lanza una tarea en el loop guardando la referencia: asyncio solo guarda una referencia débil
+        y una tarea sin referencia puede desaparecer a mitad (p. ej. la apertura de un funding)."""
+        task = asyncio.ensure_future(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
 
     def _find(self, trade_id: int) -> Tuple[Optional[Engine], Optional[Position]]:
         with self.lock:
@@ -3104,8 +3136,7 @@ class KlineBot:
             hold = self._entry_candidate(sym, pts)
             try:
                 if hold:
-                    with self.lock:
-                        self._price_hold.add(sym)
+                    self._hold_price((sym,))
                     # Precio en vivo y libro a la vez: los 3 bots abren con el mismo libro, sin esperar REST.
                     await asyncio.gather(self._prefetch_price(sym), self._prefetch_book(sym))
                 fresh[sym] = self._on_ratio_points(sym, pts)
@@ -3113,8 +3144,7 @@ class KlineBot:
                 self.ratio_last_error = f"{sym}: {exc!r}"
             finally:
                 if hold:
-                    with self.lock:
-                        self._price_hold.discard(sym)
+                    self._release_price((sym,))
 
         await asyncio.gather(*(one(s) for s in symbols))
         self._refresh_pos_syms(force=True)                  # da de baja los precios pedidos sin entrada
@@ -3300,7 +3330,8 @@ class KlineBot:
 
         def go() -> None:
             if sym in self._ind_buf:
-                loop.create_task(self._ind_seed(sym))
+                self._bg_tasks.add(t := loop.create_task(self._ind_seed(sym)))
+                t.add_done_callback(self._bg_tasks.discard)
             else:
                 self._ind_seeding.discard(sym)
 
@@ -3746,7 +3777,10 @@ class KlineBot:
     # FUNDING_OPEN_BEFORE_S antes del cobro (al executor YA, con el precio en vivo; la entrada en
     # papel se corrige después con el libro) y se cierran FUNDING_CLOSE_AFTER_S después.
 
-    _FUNDING_LIMITS = {"min_pct": (0.01, 10.0), "notional": (5.0, 100000.0), "open_before_s": (0.2, 60.0),
+    # Abrir con menos antelación que FUNDING_MIN_LEAD_S no entra nunca (_funding_open la descarta por tardía):
+    # el mínimo de open_before_s queda por encima para que la web no acepte un valor que apaga el bot en silencio.
+    _FUNDING_LIMITS = {"min_pct": (0.01, 10.0), "notional": (5.0, 100000.0),
+                       "open_before_s": (FUNDING_OPEN_MIN_S, 60.0),
                        "close_after_s": (0.0, 60.0), "scan_before_s": (FUNDING_SCAN_MIN_S, 900.0)}
 
     @classmethod
@@ -3827,26 +3861,10 @@ class KlineBot:
                     await asyncio.wait_for(agen.aclose(), 2.0)
                 except Exception:
                     pass
-            try:
-                data = json.loads(raw)
-                data = data.get("data", data) if isinstance(data, dict) else data
-            except ValueError as exc:
-                last_exc = exc
-                continue
-            if not isinstance(data, list):
+            rows = self._parse_mark_rows(raw)
+            if rows is None:
                 last_exc = RuntimeError("markPrice: respuesta inesperada")
                 continue
-            rows = []
-            for d in data:
-                try:
-                    sym = str(d["s"])
-                    if not sym.endswith(QUOTE_ASSET):
-                        continue
-                    rows.append({"symbol": sym, "rate_pct": float(d.get("r") or 0) * 100.0,
-                                 "next_ts": int(d.get("T") or 0) / 1000.0,
-                                 "mark": float(d.get("p") or 0)})
-                except (KeyError, TypeError, ValueError):
-                    continue
             if not rows:
                 last_exc = RuntimeError("markPrice: sin pares")
                 continue
@@ -4027,7 +4045,7 @@ class KlineBot:
         # La tabla va PRIMERO y en paralelo a la sync del reloj (que puede tardar ~10 s): exploración completa
         # (hasta 30 s, la misma del botón). Si falla o no trae pares, se reintenta cada 30 s (ver más abajo).
         self._rows_retry_at = time.time() + 30.0
-        asyncio.ensure_future(self._funding_hourly_scan(
+        self._spawn(self._funding_hourly_scan(
             next_funding_ts(self._srv_now(), self.funding_cfg["open_before_s"] + 0.3), warm=False))
         await self._funding_clock_sync()                     # reloj de Binance desde el arranque
         while self.running:
@@ -4037,7 +4055,7 @@ class KlineBot:
             ts = next_funding_ts(now, c["open_before_s"] + 0.3)
             if not self._funding_rows and not self._scan_busy and time.time() >= self._rows_retry_at:
                 self._rows_retry_at = time.time() + 30.0     # sin datos para la web: no esperar a la exploración horaria
-                asyncio.ensure_future(self._funding_hourly_scan(ts, warm=False))
+                self._spawn(self._funding_hourly_scan(ts, warm=False))
             self._funding_target_ts = ts
             left = ts - now
             if self._funding_done_ts == ts:              # ya programado: espera a que pase este cobro
@@ -4098,12 +4116,13 @@ class KlineBot:
                 continue
         return rows
 
-    def _release_watch(self, keep=frozenset()) -> None:
-        """Suelta los precios en vivo calentados por la exploración horaria (menos los de `keep`)."""
+    def _release_watch(self) -> None:
+        """Suelta los precios en vivo calentados por la exploración horaria. Los pares que van a entrar ya
+        tienen su propia petición (la toma _funding_cycle antes de llamar aquí), así que no se dan de baja
+        ni se quedan suscritos para siempre si al final no se entra (bot pausado)."""
         with self.lock:
-            drop = self._watch_hold - set(keep)
-            self._watch_hold = set()
-            self._price_hold -= drop
+            drop, self._watch_hold = self._watch_hold, set()
+            self._release_price(drop)
         if drop:
             self._refresh_pos_syms(force=True)
 
@@ -4197,7 +4216,7 @@ class KlineBot:
             self._funding_over = sum(1 for r in rows if abs(r["rate_pct"]) >= thr)
             self.funding_last_scan_ts = time.time()
             self._watch_hold = set(hot)
-            self._price_hold |= set(hot)
+            self._hold_price(hot)
             self._funding_watch = {
                 "ts": ts, "when": time.time(), "scanned": len(seen), "capped": len(seen) >= cap,
                 "elapsed_s": round(elapsed, 1), "n": len(cands),
@@ -4216,7 +4235,10 @@ class KlineBot:
         rows = await self._funding_scan()
         thr = self.funding_cfg["min_pct"]
         cands = [r for r in rows if abs(r["next_ts"] - ts) <= 1.5 and abs(r["rate_pct"]) >= thr]
-        self._release_watch(keep={r["symbol"] for r in cands})
+        trades = [(r, side) for r in cands if (side := funding_side(r["rate_pct"])) is not None]
+        if not eng.paused:
+            self._hold_price(r["symbol"] for r, _side in trades)   # antes de soltar los calentados: sin cortes
+        self._release_watch()
         if not cands:
             if rows:
                 top = rows[0]
@@ -4225,19 +4247,18 @@ class KlineBot:
             return
         self.log(f"[funding] cobro {_utc(ts, '%H:%M')} UTC: {len(cands)} con funding ≥ ±{thr:g}%: "
                  + ", ".join(f"{r['symbol']} {r['rate_pct']:+.3f}%" for r in cands[:10]))
-        for r in cands:
-            side = funding_side(r["rate_pct"])
-            if side is None:
-                continue
+        for r, side in trades:
             if eng.paused:
                 self._funding_signal(r["symbol"], side, r["rate_pct"], ts, r["mark"], "pausado")
                 continue
-            asyncio.ensure_future(self._funding_trade(r["symbol"], side, r["rate_pct"], ts, r["mark"]))
+            self._spawn(self._funding_trade(r["symbol"], side, r["rate_pct"], ts, r["mark"], held=True))
 
-    async def _funding_trade(self, sym: str, side: str, rate: float, ts: float, mark: float) -> None:
-        """Precio en vivo del par desde ya (aggTrade) y, al llegar el momento, abre sin esperar nada."""
-        with self.lock:
-            self._price_hold.add(sym)
+    async def _funding_trade(self, sym: str, side: str, rate: float, ts: float, mark: float,
+                             held: bool = False) -> None:
+        """Precio en vivo del par desde ya (aggTrade) y, al llegar el momento, abre sin esperar nada.
+        held=True: la petición de precio ya la tomó quien la lanzó; aquí solo se suelta al terminar."""
+        if not held:
+            self._hold_price((sym,))
         try:
             self._refresh_pos_syms(force=True)
             try:
@@ -4251,8 +4272,7 @@ class KlineBot:
                 await asyncio.sleep(min(wait, 0.5))
             self._funding_open(sym, side, rate, ts, mark)
         finally:
-            with self.lock:
-                self._price_hold.discard(sym)
+            self._release_price((sym,))
             self._refresh_pos_syms(force=True)
 
     def _funding_open(self, sym: str, side: str, rate: float, ts: float, mark: float) -> Optional[Position]:
@@ -5604,7 +5624,7 @@ HTML = r"""<!doctype html>
               <label class="f">Notional por entrada, USDT <span id="fdCurNot"></span>
                 <input id="fdNot" type="number" step="1" min="5" max="100000" placeholder="ej. 20"></label>
               <label class="f">Abrir, segundos antes del cobro <span id="fdCurOpen"></span>
-                <input id="fdOpen" type="number" step="0.1" min="0.2" max="60" placeholder="ej. 2"></label>
+                <input id="fdOpen" type="number" step="0.1" min="__FD_OPEN_MIN__" max="60" placeholder="ej. 2"></label>
               <label class="f">Cerrar, segundos después del cobro <span id="fdCurClose"></span>
                 <input id="fdClose" type="number" step="0.1" min="0" max="60" placeholder="ej. 1"></label>
               <label class="f">Consultar el funding, segundos antes del cobro <span id="fdCurScan"></span>
@@ -6424,7 +6444,8 @@ showView(location.hash.slice(1) || store.get('botkline_view', 'resumen'));
 </body>
 </html>"""
 
-PAGE = HTML.replace("__POLL_MS__", str(STATUS_POLL_MS)).encode("utf-8")
+PAGE = (HTML.replace("__POLL_MS__", str(STATUS_POLL_MS))
+        .replace("__FD_OPEN_MIN__", f"{FUNDING_OPEN_MIN_S:g}")).encode("utf-8")
 PAGE_ETAG = hashlib.sha1(PAGE).hexdigest()[:16]
 
 
