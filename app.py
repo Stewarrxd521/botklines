@@ -219,7 +219,10 @@ FUNDING_MIN_PCT       = abs(float(os.getenv("FUNDING_MIN_PCT", "0.3")))    # |fu
 FUNDING_NOTIONAL      = float(os.getenv("FUNDING_NOTIONAL", "20"))         # USDT por entrada
 FUNDING_OPEN_BEFORE_S = float(os.getenv("FUNDING_OPEN_BEFORE_S", "2"))     # abre N s antes del cobro
 FUNDING_CLOSE_AFTER_S = float(os.getenv("FUNDING_CLOSE_AFTER_S", "1"))     # cierra N s después del cobro
-FUNDING_SCAN_BEFORE_S = float(os.getenv("FUNDING_SCAN_BEFORE_S", "30"))    # consulta del funding antes del cobro
+# Consulta final del funding: SIEMPRE con anticipación (mínimo FUNDING_SCAN_MIN_S, 2 min), para tener los pares, el
+# precio en vivo y el reloj listos mucho antes de abrir. Un valor guardado por debajo del mínimo se ignora.
+FUNDING_SCAN_MIN_S = float(os.getenv("FUNDING_SCAN_MIN_S", "120"))
+FUNDING_SCAN_BEFORE_S = max(float(os.getenv("FUNDING_SCAN_BEFORE_S", "120")), FUNDING_SCAN_MIN_S)
 FUNDING_PERIOD_S      = 3600            # Binance cobra en horas en punto (cada 1, 4 u 8 h según el par)
 # El funding se lee por WebSocket (!markPrice@arr: tasa "r", próximo cobro "T", mark "p" y hora "E" de
 # TODOS los pares en un solo mensaje). Se abre unos segundos antes del cobro, se toma el primer mensaje
@@ -1226,6 +1229,9 @@ class KlineBot:
         self.funding_clock_info: dict = {}            # última comparación Binance vs proveedores externos
         self._clock_verified_for = 0                  # cobro para el que ya se hizo la verificación rápida
         self._funding_hourly_for = 0                  # cobro para el que ya se hizo la exploración horaria
+        self._scan_busy = False                       # hay una exploración completa en curso (horaria o manual)
+        self._rows_retry_at = 0.0                     # próximo reintento si la tabla sigue vacía
+        self._rescan_last = 0.0                       # última exploración pedida a mano (anti-spam)
         self._funding_watch: dict = {}                # resultado de la última exploración horaria
         self._watch_hold: set = set()                 # símbolos con precio calentado por esa exploración
         self.funding_clock_ts = 0.0                   # cuándo se midió por última vez (0 = nunca)
@@ -3741,7 +3747,7 @@ class KlineBot:
     # papel se corrige después con el libro) y se cierran FUNDING_CLOSE_AFTER_S después.
 
     _FUNDING_LIMITS = {"min_pct": (0.01, 10.0), "notional": (5.0, 100000.0), "open_before_s": (0.2, 60.0),
-                       "close_after_s": (0.0, 60.0), "scan_before_s": (5.0, 900.0)}
+                       "close_after_s": (0.0, 60.0), "scan_before_s": (FUNDING_SCAN_MIN_S, 900.0)}
 
     @classmethod
     def _load_funding_cfg(cls, raw) -> dict:
@@ -3991,12 +3997,21 @@ class KlineBot:
         thr = self.funding_cfg["min_pct"]
         rows.sort(key=lambda r: abs(r["rate_pct"]), reverse=True)
         with self.lock:
-            self._funding_rows = rows[:25]
+            self._funding_rows = self._funding_table_rows(rows, thr)
             self._funding_over = sum(1 for r in rows if abs(r["rate_pct"]) >= thr)
             self.funding_scans += 1
             self.funding_last_scan_ts = time.time()
             self.funding_last_error = ""
         return rows
+
+    @staticmethod
+    def _funding_table_rows(rows: List[dict], thr: float) -> List[dict]:
+        """Filas para la web: TODOS los pares que superan el umbral (hasta 150) y, si sobra sitio, los siguientes
+        de mayor |funding| hasta completar 25. Antes se cortaba en 20 y un par que cumplía podía quedar fuera."""
+        ordered = sorted(rows, key=lambda r: abs(r["rate_pct"]), reverse=True)
+        over = [r for r in ordered if abs(r["rate_pct"]) >= thr][:150]
+        rest = [r for r in ordered if abs(r["rate_pct"]) < thr][:max(25 - len(over), 0)]
+        return over + rest
 
     def _funding_signal(self, sym: str, side: str, rate: float, ts: float, mark: float, action: str) -> None:
         eng = self.engines[ENGINE_FUNDING]
@@ -4009,14 +4024,20 @@ class KlineBot:
             })
 
     async def _funding_loop(self) -> None:
+        # La tabla va PRIMERO y en paralelo a la sync del reloj (que puede tardar ~10 s): exploración completa
+        # (hasta 30 s, la misma del botón). Si falla o no trae pares, se reintenta cada 30 s (ver más abajo).
+        self._rows_retry_at = time.time() + 30.0
+        asyncio.ensure_future(self._funding_hourly_scan(
+            next_funding_ts(self._srv_now(), self.funding_cfg["open_before_s"] + 0.3), warm=False))
         await self._funding_clock_sync()                     # reloj de Binance desde el arranque
-        if not self._funding_rows:
-            await self._funding_scan()                       # para la web
         while self.running:
             self._funding_overdue()
             c = self.funding_cfg
             now = self._srv_now()
             ts = next_funding_ts(now, c["open_before_s"] + 0.3)
+            if not self._funding_rows and not self._scan_busy and time.time() >= self._rows_retry_at:
+                self._rows_retry_at = time.time() + 30.0     # sin datos para la web: no esperar a la exploración horaria
+                asyncio.ensure_future(self._funding_hourly_scan(ts, warm=False))
             self._funding_target_ts = ts
             left = ts - now
             if self._funding_done_ts == ts:              # ya programado: espera a que pase este cobro
@@ -4031,7 +4052,7 @@ class KlineBot:
                     continue
                 await asyncio.sleep(min(max(left, 0.2), 5.0))
                 continue
-            sync_lead = max(FUNDING_CLOCK_SYNC_BEFORE_S, c["scan_before_s"] + 15.0)
+            sync_lead = max(FUNDING_CLOCK_SYNC_BEFORE_S, c["scan_before_s"] + 20.0)   # el reloj se sincroniza antes de consultar
             hourly_lead = max(FUNDING_HOURLY_BEFORE_S, sync_lead + 40.0)
             if FUNDING_HOURLY_SCAN and self._funding_hourly_for != ts and left <= hourly_lead:
                 self._funding_hourly_for = ts
@@ -4086,7 +4107,36 @@ class KlineBot:
         if drop:
             self._refresh_pos_syms(force=True)
 
-    async def _funding_hourly_scan(self, ts: float) -> None:
+    async def _funding_hourly_scan(self, ts: float, manual: bool = False, warm: bool = True) -> None:
+        if self._scan_busy:                                  # ya hay una exploración completa en curso
+            return
+        self._scan_busy = True
+        try:
+            await self._funding_hourly_scan_run(ts, manual, warm)
+        finally:
+            self._scan_busy = False
+
+    def request_funding_rescan(self) -> dict:
+        """Botón de la web: explora YA todos los pares (≤ FUNDING_HOURLY_MAX_SYMBOLS y ≤ FUNDING_HOURLY_MAX_S s).
+        Se niega si ya hay una en curso, si hace menos de 5 s de la última o si la consulta final del cobro es inminente."""
+        loop = self.loop
+        if loop is None or not loop.is_running():
+            return {"ok": False, "error": "El bot aún no arrancó"}
+        if self._scan_busy:
+            return {"ok": False, "error": "Ya hay una exploración en curso"}
+        now = time.time()
+        if now - self._rescan_last < 5.0:
+            return {"ok": False, "error": "Espera unos segundos entre exploraciones"}
+        c = self.funding_cfg
+        ts = self._funding_target_ts or next_funding_ts(self._srv_now(), c["open_before_s"])
+        left = ts - self._srv_now()
+        if 0 < left <= c["scan_before_s"] + 5.0:
+            return {"ok": False, "error": f"Faltan {left:.0f} s para el cobro: la consulta final ya está por correr"}
+        self._rescan_last = now
+        asyncio.run_coroutine_threadsafe(self._funding_hourly_scan(ts, manual=True), loop)
+        return {"ok": True, "max_symbols": FUNDING_HOURLY_MAX_SYMBOLS, "max_s": FUNDING_HOURLY_MAX_S}
+
+    async def _funding_hourly_scan_run(self, ts: float, manual: bool = False, warm: bool = True) -> None:
         """Exploración horaria PROPIA del bot de funding (no comparte nada con la de los demás bots): lee todos los
         pares por WebSocket, como máximo FUNDING_HOURLY_MAX_SYMBOLS pares y FUNDING_HOURLY_MAX_S segundos, y guarda
         cuáles cumplen el umbral para el cobro `ts`. A los de mayor |funding| les calienta el precio en vivo."""
@@ -4135,15 +4185,17 @@ class KlineBot:
         if not seen:
             self.funding_errors += 1
             self.funding_last_error = f"exploración horaria sin datos: {last_exc!r}"
-            self.log(f"[funding] ✗ exploración horaria sin datos tras {elapsed:.1f} s: {last_exc!r}")
+            self.log(f"[funding] ✗ exploración {'manual' if manual else 'horaria' if warm else 'inicial'} sin datos tras {elapsed:.1f} s: {last_exc!r}")
             return
         thr = self.funding_cfg["min_pct"]
         rows = sorted(seen.values(), key=lambda r: abs(r["rate_pct"]), reverse=True)
         cands = [r for r in rows if abs(r["rate_pct"]) >= thr and abs(r["next_ts"] - ts) <= 1.5]
-        hot = [r["symbol"] for r in cands if r["symbol"] in self.filters][:max(FUNDING_WATCH_PRICE_MAX, 0)]
+        hot = ([r["symbol"] for r in cands if r["symbol"] in self.filters][:max(FUNDING_WATCH_PRICE_MAX, 0)]
+               if warm else [])                              # la de arranque/reintento solo llena la tabla
         with self.lock:
-            self._funding_rows = rows[:25]
+            self._funding_rows = self._funding_table_rows(rows, thr)
             self._funding_over = sum(1 for r in rows if abs(r["rate_pct"]) >= thr)
+            self.funding_last_scan_ts = time.time()
             self._watch_hold = set(hot)
             self._price_hold |= set(hot)
             self._funding_watch = {
@@ -4153,7 +4205,7 @@ class KlineBot:
             }
         if hot:
             self._refresh_pos_syms(force=True)
-        self.log(f"[funding] exploración horaria: {len(seen)} pares en {elapsed:.1f} s"
+        self.log(f"[funding] exploración {'MANUAL' if manual else 'horaria' if warm else 'inicial'}: {len(seen)} pares en {elapsed:.1f} s"
                  f"{' (tope ' + str(cap) + ')' if len(seen) >= cap else ''} · cobro {_utc(ts, '%H:%M')} UTC: "
                  + (f"{len(cands)} ≥ ±{thr:g}%: " + ", ".join(f"{r['symbol']} {r['rate_pct']:+.3f}%" for r in cands[:10])
                     if cands else f"ninguno ≥ ±{thr:g}%"))
@@ -4298,7 +4350,7 @@ class KlineBot:
     def funding_snapshot(self, rows: bool = True) -> dict:
         c = dict(self.funding_cfg)
         with self.lock:
-            top = [dict(r) for r in self._funding_rows[:20]] if rows else []
+            top = [dict(r) for r in self._funding_rows[:150]] if rows else []
         now = self._srv_now()
         ts = self._funding_target_ts or next_funding_ts(now, c["open_before_s"])
         for r in top:
@@ -4314,7 +4366,7 @@ class KlineBot:
                 "clock_diff_ms": self.funding_clock_info.get("diff_ms"),
                 "clock_agree": self.funding_clock_info.get("agree"),
                 "clock_providers": self.funding_clock_info.get("providers", {}),
-                "watch": dict(self._funding_watch),
+                "watch": dict(self._funding_watch), "scan_busy": self._scan_busy,
                 "clock_rtt_ms": round(self.funding_clock_rtt_ms),
                 "clock_age_s": round(time.time() - self.funding_clock_ts) if self.funding_clock_ts else None,
                 "loop_lag_ms": round(self.loop_lag_ms),
@@ -4907,7 +4959,7 @@ def api_funding_get():
 @app.post("/api/funding")
 def api_funding_set():
     """Bot de funding alto, en caliente. Body JSON (todo opcional): {"min_pct": 0.3, "notional": 20,
-    "open_before_s": 2, "close_after_s": 1, "scan_before_s": 30}. Pausar con /api/pause y bloquear
+    "open_before_s": 2, "close_after_s": 1, "scan_before_s": 120}. Pausar con /api/pause y bloquear
     LONG/SHORT con /api/block ({"engine": "funding", ...})."""
     busy = _guard()
     if busy:
@@ -4928,6 +4980,16 @@ def api_funding_set():
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     return jsonify({"ok": True, **cfg})
+
+
+@app.post("/api/funding/rescan")
+def api_funding_rescan():
+    """Explora ahora todos los pares del funding (botón de la web). No cambia ajustes ni abre operaciones."""
+    busy = _guard()
+    if busy:
+        return busy
+    res = bot.request_funding_rescan()
+    return jsonify(res), (200 if res.get("ok") else 409)
 
 
 @app.post("/api/session/reset")
@@ -5546,7 +5608,7 @@ HTML = r"""<!doctype html>
               <label class="f">Cerrar, segundos después del cobro <span id="fdCurClose"></span>
                 <input id="fdClose" type="number" step="0.1" min="0" max="60" placeholder="ej. 1"></label>
               <label class="f">Consultar el funding, segundos antes del cobro <span id="fdCurScan"></span>
-                <input id="fdScan" type="number" step="1" min="5" max="900" placeholder="ej. 30"></label>
+                <input id="fdScan" type="number" step="1" min="120" max="900" placeholder="ej. 120 (mínimo 120)"></label>
               <button type="submit">Guardar</button>
             </form>
             <h4 style="margin-top:16px">Direcciones y estado</h4><div class="row c" id="rb_funding"></div>
@@ -5554,6 +5616,8 @@ HTML = r"""<!doctype html>
           <div class="box">
             <h4>Cómo funciona</h4>
             <div class="note" style="margin-top:0" id="fdNote"></div>
+            <div style="margin-top:10px"><button type="button" id="fdRescan">Reescanear todos los símbolos ahora</button>
+              <span class="muted" id="fdRescanMsg" style="margin-left:8px"></span></div>
             <div class="scroll" style="margin-top:10px"><table><thead><tr><th>Par</th><th>Funding</th><th>Cobro (UTC)</th><th>Cobra en</th><th>Mark</th><th>Elegido</th></tr></thead><tbody id="fdTbl"></tbody></table></div>
           </div>
         </div>
@@ -6309,6 +6373,16 @@ q('rvExitForm').addEventListener('submit', async ev => {
 for (const [id, key] of [['revMult', 'rev_mult'], ['revRecover', 'rev_recover_pct'], ['revSl', 'rev_sl_pct']]) {
   q(id).addEventListener('change', ev => { if (ev.target.value) revPost({[key]: ev.target.value}, revMsg).then(() => ev.target.blur()); });
 }
+q('fdRescan').addEventListener('click', async () => {
+  const btn = q('fdRescan'), msg = q('fdRescanMsg');
+  btn.disabled = true; msg.textContent = 'Explorando todos los pares…';
+  try {
+    const r = await post('/api/funding/rescan', {});
+    msg.innerHTML = r.ok ? `<span class="pos">Explorando</span> (hasta ${r.max_symbols} pares y ${r.max_s} s)` : `<span class="neg">${esc(r.error)}</span>`;
+    if (r.ok) { setTimeout(refresh, 2500); setTimeout(refresh, 6000); setTimeout(() => { msg.textContent = ''; }, 12000); }
+  } catch (e) { msg.innerHTML = `<span class="neg">${esc(e)}</span>`; }
+  finally { setTimeout(() => { btn.disabled = false; }, 3000); }
+});
 q('fdForm').addEventListener('submit', async ev => {
   ev.preventDefault();
   const ids = {min_pct: 'fdMin', notional: 'fdNot', open_before_s: 'fdOpen', close_after_s: 'fdClose', scan_before_s: 'fdScan'};
@@ -6356,4 +6430,3 @@ PAGE_ETAG = hashlib.sha1(PAGE).hexdigest()[:16]
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")), threaded=True)
-
