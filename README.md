@@ -61,7 +61,7 @@ curl -X POST https://<bot>/api/indicators -H 'Content-Type: application/json' -d
 
 - **REST a Binance y bloqueos (418/429)**: el único REST a Binance es el del **ratio** (más `exchangeInfo` al arrancar). Va por la IP directa; si recibe un 418/429, esa ruta queda vetada lo que diga Binance y las peticiones pasan a las **proxies** (`REST_PROXY_URLS`, por defecto las 5 de Fixie), **rotando una distinta en cada petición** y saltando las vetadas, hasta que la IP directa se desbloquee. Con todas vetadas no sale nada (insistir alarga el veto). Además se lee el peso usado que Binance devuelve en `X-MBX-USED-WEIGHT-1M`: si una ruta pasa de `REST_WEIGHT_BUDGET` (80 % de 2400) descansa hasta el minuto siguiente, **antes** de que llegue el 429. Las proxies no se usan para nada más.
 - **Demora mínima**: ninguna posición se cierra por TP/SL, ratio o RSI/VWAP antes de **2 s** desde que abrió (`MIN_HOLD_S`, editable en *Sistema → Ajustes generales*). Si la señal llega antes, se vuelve a mirar al cumplirse la demora. Los cierres manuales, «Cerrar todas» y el objetivo global no esperan.
-- **Precios como el executor**: la entrada y la salida en papel se valoran con el **libro de 20 niveles**, tomado del **WebSocket** `<par>@depth20@100ms` (se conecta, toma una foto y se cierra; sin REST): una compra recorre los asks desde el mejor y una venta los bids, y se toma el precio medio ponderado de la cantidad; lo que pase de 20 niveles va al peor precio visto. Sin libro, el precio en vivo o el de la señal. El TP/SL se calcula desde esa entrada. Los cierres mandan la orden al executor al instante y el libro se toma en paralelo, sin bloquear al bot. **Excepción, el TP por precio**: en un mechazo el último precio puede tocar el TP sin que haya bids/asks a ese nivel, así que antes de enviar el cierre se valora la salida con el libro; si no llega al TP (igual o mejor) el cierre se **rechaza** y la posición sigue abierta hasta que el TP se cumpla de verdad (se registra en el log y en `tp_rejects`). El SL y los cierres por señal (ratio, RSI/VWAP, objetivo, manual) no se frenan. Se apaga con `TP_BOOK_CHECK=false`. Los tres bots de ratio comparten un mismo libro y la venganza reutiliza el del cierre que la dispara. Se apaga con `BOOK_FILL=false`.
+- **Precios como el executor**: la entrada y la salida en papel se valoran con el **libro de 20 niveles**, tomado del **WebSocket** `<par>@depth20@100ms` (se conecta, toma una foto y se cierra; sin REST): una compra recorre los asks desde el mejor y una venta los bids, y se toma el precio medio ponderado de la cantidad; lo que pase de 20 niveles va al peor precio visto. Las órdenes al executor (aperturas, cierres y venganzas) **no esperan el libro**: salen al instante con el libro si hay una foto reciente, o si no con el precio en vivo (o el de la señal), y el TP/SL se calcula desde ese precio. El libro se pide en paralelo y, cuando llega, se corrige en la página el precio de entrada (o de salida) en papel; el TP/SL ya puesto no cambia. La venganza sale en el mismo instante que el cierre que la dispara, con la pérdida estimada a ese precio. **Excepción, el TP por precio**: en un mechazo el último precio puede tocar el TP sin que haya bids/asks a ese nivel, así que antes de enviar el cierre se valora la salida con el libro; si no llega al TP (igual o mejor) el cierre se **rechaza** y la posición sigue abierta hasta que el TP se cumpla de verdad (se registra en el log y en `tp_rejects`). El SL y los cierres por señal (ratio, RSI/VWAP, objetivo, manual) no se frenan. Se apaga con `TP_BOOK_CHECK=false`. Los tres bots de ratio comparten un mismo libro. Se apaga con `BOOK_FILL=false`.
 
 ### Trade de venganza (bot `ratio_rev`)
 
@@ -80,6 +80,24 @@ curl -X POST https://<bot>/api/ratio -H 'Content-Type: application/json' \
      -d '{"engine": "ratio_rev", "tp_pct": 10, "sl_pct": -5, "ratio_exit": true,
           "revenge": true, "rev_mult": 10, "rev_recover_pct": 65, "rev_sl_pct": 100, "rev_dir": "opposite"}'
 ```
+
+## Bot de funding alto (`funding`)
+
+Gana el funding de los pares con tasas extremas abriendo justo antes del cobro y cerrando justo después:
+
+1. **Consulta**: `FUNDING_SCAN_BEFORE_S` (30 s) antes de cada hora en punto UTC (Binance cobra en horas en punto, cada 1, 4 u 8 h según el par) se pide **una vez** `GET /fapi/v1/premiumIndex` de todos los pares (peso 10, gzip; ~24 peticiones al día). La misma respuesta trae la hora de Binance, con la que se corrige el reloj local para programar la entrada.
+2. **Entrada**: los pares con `|funding| ≥ 0,3 %` (`min_pct`) que cobran en esa hora abren en el lado que **cobra**: funding positivo → **SHORT** (los LONG pagan), negativo → **LONG**. Se abre **2 s antes** del cobro (`open_before_s`) con un notional de **20 USDT** (`notional`). Desde la consulta se suscribe el precio en vivo del par (aggTrade), así que al llegar el momento la orden sale **al executor al instante con el precio en vivo**, sin esperar al libro ni a nada más. La entrada en papel se corrige después con el libro de 20 niveles cuando llega.
+3. **Salida**: **1 s después** del cobro (`close_after_s`), motivo `FUNDING`. Si el bot se reinicia con una abierta cuyo cobro ya pasó, la cierra al volver. No lleva TP ni SL.
+4. **PnL**: el neto suma el funding cobrado (notional × tasa vista al entrar; solo si estaba abierta en el momento del cobro). El historial lo guarda en `funding_usd`.
+
+Todo se cambia en caliente en *Bots → Bot funding alto* (también pausar y bloquear SHORT/LONG), o con:
+
+```bash
+curl -X POST https://<bot>/api/funding -H 'Content-Type: application/json' \
+     -d '{"min_pct": 0.3, "notional": 20, "open_before_s": 2, "close_after_s": 1, "scan_before_s": 30}'
+```
+
+Respeta el límite de abiertas, la pausa de envíos al executor y el objetivo global como el resto de bots.
 
 ## Ancho de banda
 
@@ -207,13 +225,13 @@ Cada apertura y cierre se manda con `POST <EXECUTOR_URL>/signal` y la cabecera `
  "reason": "TP", "close_price": 1.0609, "pnl": 0.1045, "strategy": "live"}
 ```
 
-`direction` puede ser `LONG` o `SHORT`, `level` lleva el % del cuerpo de la vela (o del cambio del ratio) que disparó la señal y `strategy` dice qué bot la mandó (`ratio`, `ratio_tp`, `ratio_rev`, `close` o `live`). Los `trade_id` son únicos entre todos los bots.
+`direction` puede ser `LONG` o `SHORT`, `level` lleva el % del cuerpo de la vela (o del cambio del ratio) que disparó la señal y `strategy` dice qué bot la mandó (`ratio`, `ratio_tp`, `ratio_rev`, `funding`, `close` o `live`; en `funding`, `level` es la tasa de funding en %). Los `trade_id` son únicos entre todos los bots.
 
 El executor suma en **una** posición de Binance las de todos los bots en el mismo par y dirección (los tres bots de ratio abren con la misma señal). Por eso, mientras otro bot siga con ese par y dirección abierto, el `close` lleva `"quantity"` con la cantidad de esa operación y el executor cierra solo esa parte; el último en cerrar manda el cierre sin `quantity` y cierra todo lo que quede. La venganza en dirección contraria y los bots con posiciones opuestas en el mismo par necesitan la cuenta en **modo cobertura (Hedge Mode)**: en modo unidireccional Binance las netea.
 
 ### TP en Binance
 
-Cada apertura con TP por precio lleva `"tp"` con el take profit de esa posición. El executor lo pone en Binance con **la cantidad de esa posición** y lo identifica por su `trade_id`, así que hay un TP por posición aunque varios bots compartan par y dirección (los tres de ratio abren juntos), y el TP salta aunque el bot o la red fallen. El bot *solo TP ratio* no lleva TP por precio. Si el TP cambia en caliente, se manda `open_tp` del `trade_id` con el nuevo nivel (o `close_tp` si se apagó). Se apaga con `SEND_TP=false`.
+Cada apertura con TP por precio lleva `"tp"` con el take profit de esa posición. El executor lo pone en Binance con **la cantidad de esa posición** y lo identifica por su `trade_id`, así que hay un TP por posición aunque varios bots compartan par y dirección (los tres de ratio abren juntos), y el TP salta aunque el bot o la red fallen. El bot *solo TP ratio* no lleva TP por precio. Si el TP cambia en caliente, se manda `open_tp` del `trade_id` con el nuevo nivel (o `close_tp` si se apagó). Se enciende y apaga en caliente desde la web (*Ahorro de datos* → «TP al executor», para todos los bots): al apagarlo se quita el TP en Binance de las abiertas y las aperturas nuevas van sin TP; al encenderlo se les pone. `SEND_TP` solo fija el valor inicial.
 
 ### Latencia
 
@@ -264,6 +282,9 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 | `REVENGE_RECOVER_PCT` | `64` | Venganza: % de la pérdida que busca recuperar (TP en USD). |
 | `REVENGE_SL_PCT` | `150` | Venganza: SL en % de (pérdida × multiplicador). |
 | `REVENGE_DIR` | `opposite` | Venganza: `opposite` (contraria) o `same`. |
+| `FUNDING_ENABLED` | `true` | Bot de funding en marcha al arrancar por primera vez (luego manda el botón Pausar). |
+| `FUNDING_MIN_PCT` / `FUNDING_NOTIONAL` | `0.3` / `20` | Valores iniciales del funding mínimo (± %) y del notional en USDT (luego se editan en la web). |
+| `FUNDING_OPEN_BEFORE_S` / `FUNDING_CLOSE_AFTER_S` / `FUNDING_SCAN_BEFORE_S` | `2` / `1` / `30` | Segundos antes del cobro para abrir, después para cerrar y antes para consultar el funding. |
 | `KLINE_BOTS_ENABLED` | `false` | Activa los dos bots de velas 1m (abre el stream de velas). |
 | `TICKER_MODE` | `scan` | 24 h por WebSocket: exploración cada 5 min (`scan`) o abierto siempre (`ws`). |
 | `TICKER_SCAN_S` | `30` | Segundos máximos de cada exploración del mercado (la diaria los usa enteros). |
@@ -297,6 +318,7 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 | `GET /api/trades.csv?engine=` | Historial con MFE/MAE en CSV. |
 | `POST /api/block` | Bloquear o permitir LONG o SHORT en un bot. |
 | `GET/POST /api/ratio` | Ver o cambiar los bots de ratio: vigilancia y rango (comunes), `tp_pct`, `sl_pct`, `ratio_exit`; con `"engine": "ratio_rev"`, la salida y la venganza de ese bot. |
+| `GET/POST /api/funding` | Bot de funding: `min_pct`, `notional`, `open_before_s`, `close_after_s`, `scan_before_s`; estado de la última consulta. |
 | `GET/POST /api/global` | Modo invertido, objetivo en USD, fee y demora mínima `min_hold_s` (comunes). |
 | `GET/POST /api/indicators` | TP por RSI + VWAP: `{"engine": "ratio", "enabled": true}` por bot; `rsi_period`, `rsi_level`, `vwap_k`, `use_rsi`, `use_vwap` comunes. |
 | `POST /api/realized/reset` | Poner a cero el PnL realizado de un bot (`{"engine": "ratio"}`); el historial se conserva. |

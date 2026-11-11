@@ -51,6 +51,16 @@ services:
       - key: RATIO_EXIT_BY_RATIO
         value: "true"         # además, TP cuando el ratio recupera el % que cayó
 
+      # ── Bot de funding alto (editable en caliente desde la web) ─────────────
+      - key: FUNDING_MIN_PCT
+        value: "0.3"          # entra si |funding| ≥ 0,3 % (SHORT si es positivo, LONG si es negativo)
+      - key: FUNDING_NOTIONAL
+        value: "20"           # USDT por entrada
+      - key: FUNDING_OPEN_BEFORE_S
+        value: "2"            # abre 2 s antes del cobro
+      - key: FUNDING_CLOSE_AFTER_S
+        value: "1"            # cierra 1 s después del cobro
+
       # ── Ancho de banda ──────────────────────────────────────────────────────
       - key: TICKER_MODE
         value: "scan"         # 24 h por WebSocket: exploración de TICKER_SCAN_S cada 5 min (ws = abierto siempre)
