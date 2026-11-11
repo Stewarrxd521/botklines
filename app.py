@@ -80,6 +80,10 @@ import json
 import http.client
 import os
 import queue
+import socket
+import ssl
+import statistics
+import struct
 import sys
 import tempfile
 import threading
@@ -110,7 +114,7 @@ from state_store import StateStore, make_owner_id                    # noqa: E40
 
 BASE_URL    = os.getenv("BASE_URL", "https://fapi.binance.com")
 QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDT")
-# Proxy HTTP opcional SOLO para la única consulta REST del arranque (exchangeInfo).
+# Proxy HTTP opcional para el REST de Binance (hoy solo el ratio; exchangeInfo va por WebSocket).
 REST_PROXY_URL = os.getenv("REST_PROXY_URL", "").strip()   # http://usuario:clave@host:puerto (variable de entorno)
 # Proxies SOLO para el REST de Binance (ratio de top traders): se usan, rotando, mientras la IP
 # directa esté vetada (418/429). REST_PROXY_URLS (separadas por comas) reemplaza esta lista.
@@ -210,6 +214,45 @@ FUNDING_OPEN_BEFORE_S = float(os.getenv("FUNDING_OPEN_BEFORE_S", "2"))     # abr
 FUNDING_CLOSE_AFTER_S = float(os.getenv("FUNDING_CLOSE_AFTER_S", "1"))     # cierra N s después del cobro
 FUNDING_SCAN_BEFORE_S = float(os.getenv("FUNDING_SCAN_BEFORE_S", "30"))    # consulta del funding antes del cobro
 FUNDING_PERIOD_S      = 3600            # Binance cobra en horas en punto (cada 1, 4 u 8 h según el par)
+# El funding se lee por WebSocket (!markPrice@arr: tasa "r", próximo cobro "T", mark "p" y hora "E" de
+# TODOS los pares en un solo mensaje). Se abre unos segundos antes del cobro, se toma el primer mensaje
+# y se cierra: nada de REST. Se prueban en orden; la que funcione se recuerda.
+FUNDING_WS_URLS = [u.strip() for u in os.getenv(
+    "FUNDING_WS_URLS", "wss://fstream.binance.com/market/ws/!markPrice@arr@1s,"
+                       "wss://fstream.binance.com/market/ws/!markPrice@arr,"
+                       "wss://fstream.binance.com/ws/!markPrice@arr@1s").split(",") if u.strip()]
+FUNDING_WS_TIMEOUT_S = float(os.getenv("FUNDING_WS_TIMEOUT_S", "5"))   # espera al primer mensaje por URL
+# exchangeInfo (filtros de cantidad) por la API WebSocket de futuros (método "exchangeInfo"), sin REST.
+API_WS_URLS = [u.strip() for u in os.getenv(
+    "API_WS_URLS", "wss://ws-fapi.binance.com/ws-fapi/v1,wss://ws-fapi.binance.com/ws-fapi/v1?returnRateLimits=false"
+).split(",") if u.strip()]
+API_WS_TIMEOUT_S = float(os.getenv("API_WS_TIMEOUT_S", "20"))
+# Respaldo: si el WebSocket no da exchangeInfo se usa este archivo del repositorio (JSON tal cual lo
+# devuelve Binance, con o sin el envoltorio {"result": ...}). Se puede refrescar a mano cuando quieras.
+# Reloj de Binance: se mide con el método "time" de la API WebSocket (ida y vuelta, varias muestras, se queda
+# con las de menor latencia) FUNDING_CLOCK_SYNC_BEFORE_S segundos antes de cada cobro, en un hilo aparte.
+FUNDING_CLOCK_SYNC_BEFORE_S = float(os.getenv("FUNDING_CLOCK_SYNC_BEFORE_S", "120"))   # sincronización completa: 2 min antes
+FUNDING_MIN_LEAD_S = float(os.getenv("FUNDING_MIN_LEAD_S", "0.4"))       # si al abrir faltan menos s, NO se entra (no alcanzaría el cobro)
+FUNDING_CLOCK_VERIFY_BEFORE_S = float(os.getenv("FUNDING_CLOCK_VERIFY_BEFORE_S", "8"))  # re-medición rápida (solo Binance)
+# Proveedores externos de hora (referencia para comparar con Binance). NTP por UDP/123 y, si el hosting
+# bloquea UDP, el /cdn-cgi/trace de Cloudflare (trae `ts=` con milisegundos) por HTTPS.
+FUNDING_NTP_HOSTS = [h.strip() for h in os.getenv(
+    "FUNDING_NTP_HOSTS", "time.cloudflare.com,time.google.com,pool.ntp.org").split(",") if h.strip()]
+FUNDING_HTTP_TIME_URLS = [u.strip() for u in os.getenv(
+    "FUNDING_HTTP_TIME_URLS", "https://www.cloudflare.com/cdn-cgi/trace").split(",") if u.strip()]
+FUNDING_CLOCK_PROVIDER_SAMPLES = int(os.getenv("FUNDING_CLOCK_PROVIDER_SAMPLES", "5"))
+FUNDING_CLOCK_TOLERANCE_S = float(os.getenv("FUNDING_CLOCK_TOLERANCE_S", "0.15"))     # Binance vs proveedores: aviso si difieren más
+# Exploración horaria propia del bot de funding (independiente de la de los demás bots): lee TODOS los
+# pares por WebSocket, como máximo FUNDING_HOURLY_MAX_SYMBOLS pares y FUNDING_HOURLY_MAX_S segundos, y deja
+# la lista de los que ya cumplen el umbral (se les calienta el precio en vivo antes de la consulta final).
+FUNDING_HOURLY_SCAN = os.getenv("FUNDING_HOURLY_SCAN", "true").lower() in ("1", "true", "yes")
+FUNDING_HOURLY_BEFORE_S = float(os.getenv("FUNDING_HOURLY_BEFORE_S", "300"))      # cuánto antes de cada hora en punto
+FUNDING_HOURLY_MAX_SYMBOLS = int(os.getenv("FUNDING_HOURLY_MAX_SYMBOLS", "700"))
+FUNDING_HOURLY_MAX_S = float(os.getenv("FUNDING_HOURLY_MAX_S", "30"))
+FUNDING_WATCH_PRICE_MAX = int(os.getenv("FUNDING_WATCH_PRICE_MAX", "10"))         # precios en vivo que se calientan
+FUNDING_CLOCK_SAMPLES = int(os.getenv("FUNDING_CLOCK_SAMPLES", "12"))
+FUNDING_CLOCK_MAX_RTT_S = float(os.getenv("FUNDING_CLOCK_MAX_RTT_S", "0.4"))   # muestras más lentas se descartan
+EXCHANGE_INFO_FILE = os.getenv("EXCHANGE_INFO_FILE", os.path.join(_HERE, "exchangeInfo.txt"))
 # Fuente del 24 h, siempre por WebSocket: "scan" = exploración de TICKER_SCAN_S por ciclo de
 # 5 min (~10 % del tiempo conectado); "ws" = !miniTicker@arr abierto siempre (~80 KB/s).
 TICKER_MODE         = os.getenv("TICKER_MODE", "scan").strip().lower()
@@ -903,6 +946,160 @@ class Engine:
 # BOT
 # ─────────────────────────────────────────────────────────────────────────────
 
+def exchange_filters(data: dict) -> Dict[str, Dict[str, float]]:
+    """Filtros de cantidad (stepSize, minQty, minNotional) de los perpetuos USDT en TRADING."""
+    data = data.get("result", data) if isinstance(data, dict) else {}
+    out: Dict[str, Dict[str, float]] = {}
+    for s in data.get("symbols", []):
+        if (s.get("quoteAsset") != QUOTE_ASSET or s.get("contractType") != "PERPETUAL"
+                or s.get("status") != "TRADING"):
+            continue
+        row = {"stepSize": 0.001, "minQty": 0.0, "minNotional": 5.0}
+        for f in s.get("filters", []):
+            if f.get("filterType") == "LOT_SIZE":
+                row["stepSize"] = float(f.get("stepSize", row["stepSize"]))
+                row["minQty"] = float(f.get("minQty", row["minQty"]))
+            elif f.get("filterType") == "MIN_NOTIONAL":
+                row["minNotional"] = float(f.get("notional", row["minNotional"]))
+        out[s["symbol"]] = row
+    return out
+
+
+def pick_clock_offset(samples: List[Tuple[float, float]], max_rtt: float = 0.4,
+                      max_spread: float = 0.25) -> Optional[Tuple[float, float, float]]:
+    """samples = [(rtt_s, offset_s)]. Devuelve (offset, rtt_mínimo, dispersión) o None si no es fiable.
+    Una muestra lenta (red o event loop saturado) trae un error de hasta rtt/2: solo valen las rápidas."""
+    good = sorted(x for x in samples if 0 < x[0] <= max_rtt)
+    if len(good) < 3:
+        return None
+    best = good[0][0]
+    keep = [o for r, o in good if r <= best * 1.5 + 0.02][:5]
+    if len(keep) < 2:
+        return None
+    spread = max(keep) - min(keep)
+    if spread > max_spread:
+        return None
+    return statistics.median(keep), best, spread
+
+
+_NTP_EPOCH = 2208988800
+
+
+def ntp_samples(host: str, n: int = 5, timeout: float = 1.0) -> List[Tuple[float, float]]:
+    """Consulta NTP (UDP/123, sin dependencias). Devuelve [(rtt_s, hora_servidor − perf_counter)].
+    rtt = tiempo de ida y vuelta menos el que el servidor tardó en responder (fórmula estándar de NTP)."""
+    out: List[Tuple[float, float]] = []
+    addr = socket.getaddrinfo(host, 123, socket.AF_INET, socket.SOCK_DGRAM)[0][4]
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(timeout)
+        for _ in range(n):
+            pkt = b"\x1b" + 47 * b"\0"                       # LI=0, VN=3, modo cliente
+            p0 = time.perf_counter()
+            try:
+                sock.sendto(pkt, addr)
+                data, _a = sock.recvfrom(512)
+            except OSError:
+                continue
+            p3 = time.perf_counter()
+            if len(data) < 48 or data[1] == 0 or (data[0] & 7) != 4:   # sin stratum / no es respuesta de servidor
+                continue
+            w = struct.unpack("!12I", data[:48])
+            t2 = w[8] + w[9] / 2 ** 32 - _NTP_EPOCH                  # recibió
+            t3 = w[10] + w[11] / 2 ** 32 - _NTP_EPOCH                # respondió
+            rtt = (p3 - p0) - (t3 - t2)
+            if rtt <= 0:
+                continue
+            out.append((rtt, (t2 + t3) / 2.0 - (p0 + p3) / 2.0))
+            time.sleep(0.05)
+    return out
+
+
+def http_time_samples(url: str, n: int = 6, timeout: float = 2.0) -> List[Tuple[float, float]]:
+    """Hora con milisegundos por HTTPS (campo `ts=` de Cloudflare /cdn-cgi/trace), sobre UNA conexión
+    reutilizada (la primera petición, con TLS, se descarta). [(rtt_s, hora_servidor − perf_counter)]."""
+    u = urlsplit(url)
+    conn = http.client.HTTPSConnection(u.hostname, u.port or 443, timeout=timeout,
+                                       context=ssl.create_default_context())
+    out: List[Tuple[float, float]] = []
+    try:
+        for i in range(n + 1):
+            p0 = time.perf_counter()
+            conn.request("GET", (u.path or "/") + (f"?{u.query}" if u.query else ""),
+                         headers={"Connection": "keep-alive", "Cache-Control": "no-cache"})
+            resp = conn.getresponse()
+            body = resp.read().decode("utf-8", "replace")
+            p1 = time.perf_counter()
+            if i == 0:
+                continue
+            srv = None
+            for line in body.splitlines():
+                if line.startswith("ts="):
+                    srv = float(line[3:])
+            if srv is not None and resp.status == 200:
+                out.append((p1 - p0, srv - (p0 + p1) / 2.0))
+            time.sleep(0.05)
+    finally:
+        conn.close()
+    return out
+
+
+def clock_compare(binance: Optional[Tuple[float, float, float]],
+                  providers: Dict[str, Tuple[float, float, float]],
+                  tolerance_s: float = 0.15) -> Tuple[Optional[float], str, dict]:
+    """Elige el desfase (hora de Binance − perf_counter) con el que se opera y compara con los proveedores.
+    binance / providers[nombre] = (desfase, rtt_min, dispersión) o None. Se opera con Binance, que es quien
+    fija el instante del cobro; si Binance no midió bien, con la mediana de los proveedores (nunca con un
+    valor viejo). Devuelve (desfase|None, fuente, info)."""
+    ref = statistics.median([v[0] for v in providers.values()]) if providers else None
+    info = {"providers": {k: {"off_ms": round(v[0] * 1000), "rtt_ms": round(v[1] * 1000)}
+                          for k, v in providers.items()}}
+    if binance is not None and ref is not None:
+        diff = binance[0] - ref
+        info["diff_ms"] = round(diff * 1000)
+        info["agree"] = abs(diff) <= max(tolerance_s, binance[1] / 2 + 0.02)
+    if binance is not None:
+        return binance[0], "binance", info
+    if ref is not None and len(providers) >= 2:
+        return ref, "proveedores", info
+    return None, "", info
+
+
+class _WsRpc:
+    """Conexión WebSocket mínima de petición/respuesta (websockets o, si no está, aiohttp)."""
+
+    def __init__(self, url: str) -> None:
+        self.url, self._ws, self._session, self._lib = url, None, None, ""
+
+    async def __aenter__(self) -> "_WsRpc":
+        try:
+            import websockets                               # type: ignore
+        except ImportError:
+            websockets = None
+        if websockets is not None:
+            self._lib = "w"
+            self._ws = await websockets.connect(self.url, ping_interval=20, ping_timeout=30, max_size=None)
+        else:
+            import aiohttp                                  # type: ignore
+            self._lib = "a"
+            self._session = aiohttp.ClientSession()
+            self._ws = await self._session.ws_connect(self.url, heartbeat=20, max_msg_size=0)
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        try:
+            await self._ws.close()
+        finally:
+            if self._session is not None:
+                await self._session.close()
+
+    async def call(self, payload: str, timeout: float):
+        if self._lib == "w":
+            await self._ws.send(payload)
+            return await asyncio.wait_for(self._ws.recv(), timeout)
+        await self._ws.send_str(payload)
+        return await asyncio.wait_for(self._ws.receive_str(), timeout)
+
+
 async def _ws_messages(url: str):
     """Mensajes de un WebSocket (generador asíncrono). Usa `websockets`; si no
     está instalado, `aiohttp`. Termina cuando el servidor cierra la conexión."""
@@ -1017,8 +1214,21 @@ class KlineBot:
         self._funding_over = 0                        # cuántos pasaban el umbral en esa consulta
         self._funding_done_ts = 0                     # último cobro ya consultado y programado
         self._funding_target_ts = 0                   # cobro al que apunta ahora el bot
-        self.funding_clock_off = 0.0                  # hora de Binance − hora local (s)
+        self.funding_clock_off = 0.0                  # hora de Binance − hora local (s), solo informativo/respaldo
+        self._perf_to_srv: Optional[float] = None     # hora de Binance − perf_counter(): ancla MONOTÓNICA (inmune a saltos del reloj del sistema)
+        self.funding_clock_info: dict = {}            # última comparación Binance vs proveedores externos
+        self._clock_verified_for = 0                  # cobro para el que ya se hizo la verificación rápida
+        self._funding_hourly_for = 0                  # cobro para el que ya se hizo la exploración horaria
+        self._funding_watch: dict = {}                # resultado de la última exploración horaria
+        self._watch_hold: set = set()                 # símbolos con precio calentado por esa exploración
+        self.funding_clock_ts = 0.0                   # cuándo se midió por última vez (0 = nunca)
+        self.funding_clock_rtt_ms = 0.0               # latencia mínima de esa medición
+        self._clock_synced_for = 0                    # cobro para el que ya se sincronizó el reloj
+        self._clock_next_try = 0.0
+        self.loop_lag_ms = 0.0                        # mayor retraso reciente del event loop
         self.funding_scans = 0
+        self._funding_ws_ok = ""                      # última URL del stream de funding que respondió
+        self._filters_from_file = False               # los filtros vienen del archivo de respaldo, no de Binance
         self.funding_errors = 0
         self.funding_last_error = ""
         self.funding_last_scan_ts = 0.0
@@ -1510,6 +1720,7 @@ class KlineBot:
             *([self._supervised(self._ticker_loop, "ticker")] if TICKER_MODE == "ws" else []),
             self._supervised(self._ratio_loop, "ratio"),
             self._supervised(self._funding_loop, "funding"),
+            self._supervised(self._loop_lag_monitor, "lag del loop"),
             self._supervised(self._ind_alt_loop, "velas de otros exchanges"),
             self._supervised(self._symbols_retry_loop, "symbols"),
         )
@@ -1538,31 +1749,68 @@ class KlineBot:
 
     # ── Símbolos y filtros (UNA petición REST como mucho) ─────────────────────
 
-    def _fetch_exchange_info(self) -> Dict[str, Dict[str, float]]:
-        before = self.rx_rest_bytes
+    async def _ws_exchange_info(self) -> dict:
+        """exchangeInfo por la API WebSocket de futuros: se conecta, pide el método y se cierra."""
         try:
-            data = self._rest_get("/fapi/v1/exchangeInfo", None, 20.0)   # respeta los bloqueos 418/429
+            import websockets                               # type: ignore
+        except ImportError:
+            websockets = None
+        req = json.dumps({"id": f"xi-{int(time.time() * 1000)}", "method": "exchangeInfo", "params": {}})
+        last_exc: Optional[Exception] = None
+        for url in API_WS_URLS:
+            try:
+                if websockets is not None:
+                    async with websockets.connect(url, ping_interval=20, ping_timeout=30, max_size=None) as ws:
+                        await ws.send(req)
+                        raw = await asyncio.wait_for(ws.recv(), API_WS_TIMEOUT_S)
+                else:
+                    import aiohttp                          # type: ignore
+                    async with aiohttp.ClientSession() as session:
+                        async with session.ws_connect(url, heartbeat=20, max_msg_size=0) as ws:
+                            await ws.send_str(req)
+                            raw = await asyncio.wait_for(ws.receive_str(), API_WS_TIMEOUT_S)
+                msg = json.loads(raw)
+                if not isinstance(msg, dict) or msg.get("status") != 200:
+                    err = msg.get("error") if isinstance(msg, dict) else msg
+                    raise RuntimeError(f"respuesta {msg.get('status') if isinstance(msg, dict) else '?'}: {err}")
+                result = msg.get("result")
+                if not isinstance(result, dict) or not result.get("symbols"):
+                    raise RuntimeError("exchangeInfo sin símbolos")
+                self.log(f"WS exchangeInfo ({len(raw) / 1024:.0f} KB) por {url.split('?')[0]}")
+                return result
+            except Exception as exc:
+                last_exc = exc
+        raise RuntimeError(f"exchangeInfo por WebSocket falló: {last_exc!r}")
+
+    def _exchange_info_from_file(self, why: Exception) -> Dict[str, Dict[str, float]]:
+        """Respaldo: exchangeInfo guardado en el repositorio (EXCHANGE_INFO_FILE)."""
+        try:
+            with open(EXCHANGE_INFO_FILE, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+            out = exchange_filters(raw)
         except Exception as exc:
-            raise RuntimeError(f"exchangeInfo falló: {exc}")
-        self.log(f"REST exchangeInfo ({(self.rx_rest_bytes - before) / 1024:.0f} KB comprimido)")
-        out: Dict[str, Dict[str, float]] = {}
-        for s in data.get("symbols", []):
-            if (s.get("quoteAsset") != QUOTE_ASSET or s.get("contractType") != "PERPETUAL"
-                    or s.get("status") != "TRADING"):
-                continue
-            row = {"stepSize": 0.001, "minQty": 0.0, "minNotional": 5.0}
-            for f in s.get("filters", []):
-                if f.get("filterType") == "LOT_SIZE":
-                    row["stepSize"] = float(f.get("stepSize", row["stepSize"]))
-                    row["minQty"] = float(f.get("minQty", row["minQty"]))
-                elif f.get("filterType") == "MIN_NOTIONAL":
-                    row["minNotional"] = float(f.get("notional", row["minNotional"]))
-            out[s["symbol"]] = row
+            raise RuntimeError(f"exchangeInfo: WebSocket falló ({why}) y el archivo "
+                               f"{os.path.basename(EXCHANGE_INFO_FILE)} no sirve ({exc!r})")
+        if not out:
+            raise RuntimeError(f"exchangeInfo: WebSocket falló ({why}) y el archivo no trae perpetuos {QUOTE_ASSET}")
+        data = raw.get("result", raw)
+        when = _utc(float(data.get("serverTime") or 0) / 1000.0, "%Y-%m-%d") if data.get("serverTime") else "?"
+        self.log(f"[símbolos] exchangeInfo por WebSocket falló ({why}); uso el archivo "
+                 f"{os.path.basename(EXCHANGE_INFO_FILE)} (del {when}): {len(out)} perpetuos")
         return out
+
+    async def _fetch_exchange_info(self) -> Dict[str, Dict[str, float]]:
+        self._filters_from_file = False
+        try:
+            return exchange_filters(await self._ws_exchange_info())
+        except Exception as exc:
+            out = self._exchange_info_from_file(exc)
+            self._filters_from_file = True
+            return out
 
     async def _init_symbols(self) -> None:
         """Filtros de cantidad (stepSize, mínimos) de exchangeInfo, cacheados en disco
-        SYMBOL_REFRESH_HOURS (10 días). Es la única petición REST aparte de la del ratio."""
+        SYMBOL_REFRESH_HOURS (10 días). Por WebSocket (API de futuros): el único REST es el del ratio."""
         cached = None
         try:
             with open(SYMBOLS_CACHE_FILE, "r", encoding="utf-8") as fh:
@@ -1576,13 +1824,17 @@ class KlineBot:
             self.log(f"Filtros de cantidad desde caché en disco: {len(self.filters)} (hace {age_h / 24:.1f} días)")
         else:
             try:
-                self.filters = await asyncio.to_thread(self._fetch_exchange_info)
-                self._filters_ts = time.time()
-                tmp = f"{SYMBOLS_CACHE_FILE}.tmp"
-                with open(tmp, "w", encoding="utf-8") as fh:
-                    json.dump({"symbols": sorted(self.filters), "filters": self.filters,
-                               "saved_at": time.time()}, fh)
-                os.replace(tmp, SYMBOLS_CACHE_FILE)
+                self.filters = await self._fetch_exchange_info()
+                if self._filters_from_file:
+                    # Del archivo: no se guarda como caché fresca y el WebSocket se reintenta en 1 h (no cada minuto).
+                    self._filters_ts = time.time() - max(SYMBOL_REFRESH_HOURS - 1, 0) * 3600
+                else:
+                    self._filters_ts = time.time()
+                    tmp = f"{SYMBOLS_CACHE_FILE}.tmp"
+                    with open(tmp, "w", encoding="utf-8") as fh:
+                        json.dump({"symbols": sorted(self.filters), "filters": self.filters,
+                                   "saved_at": time.time()}, fh)
+                    os.replace(tmp, SYMBOLS_CACHE_FILE)
             except Exception as exc:
                 self.last_error = str(exc)
                 if cached and cached.get("filters"):
@@ -2519,7 +2771,7 @@ class KlineBot:
         while self.running:
             await asyncio.sleep(60.0)
             if not self.filters:
-                self.log("[REST] reintentando exchangeInfo…")
+                self.log("[WS] reintentando exchangeInfo…")
                 await self._init_symbols()
             elif time.time() - self._filters_ts >= SYMBOL_REFRESH_HOURS * 3600:
                 await self._init_symbols()
@@ -3409,7 +3661,7 @@ class KlineBot:
                 self._restore_from_store(late=True)
 
     # ── Bot de funding alto ───────────────────────────────────────────────────
-    # Una consulta REST de premiumIndex (todos los pares, gzip) unos segundos antes de cada hora en
+    # Una foto por WebSocket (!markPrice@arr, todos los pares) unos segundos antes de cada hora en
     # punto. Los pares con |funding| ≥ umbral y cobro en esa hora se abren en el lado que cobra
     # FUNDING_OPEN_BEFORE_S antes del cobro (al executor YA, con el precio en vivo; la entrada en
     # papel se corrige después con el libro) y se cierran FUNDING_CLOSE_AFTER_S después.
@@ -3458,47 +3710,205 @@ class KlineBot:
         return dict(new)
 
     def _srv_now(self) -> float:
-        """Hora de Binance (la local corregida con la que devuelve premiumIndex)."""
+        """Hora de Binance (la local corregida con la última medición de _funding_clock_sync)."""
+        off = self._perf_to_srv
+        if off is not None:                 # ancla monotónica: no la mueven saltos ni correcciones del reloj del sistema
+            return time.perf_counter() + off
         return time.time() + self.funding_clock_off
+
+    def _clock_off(self) -> float:
+        """Hora de Binance − hora local ahora mismo (s)."""
+        return self._srv_now() - time.time()
 
     def _funding_paid(self, p: Position, now: Optional[float] = None) -> float:
         """Funding cobrado por la posición: solo si estaba abierta en el momento del cobro."""
         if not p.funding_ts:
             return 0.0
-        srv = (now if now is not None else time.time()) + self.funding_clock_off
-        if srv < p.funding_ts or p.opened_ts + self.funding_clock_off >= p.funding_ts:
+        srv = (now if now is not None else time.time()) + self._clock_off()
+        if srv < p.funding_ts or p.opened_ts + self._clock_off() >= p.funding_ts:
             return 0.0
         return funding_income_usd(p.notional, p.funding_rate, p.direction)
 
-    def _fetch_funding(self) -> List[dict]:
-        """premiumIndex de todos los perpetuos (una petición, peso 10, gzip). Ajusta el reloj con Binance."""
-        t0 = time.time()
-        data = self._rest_get("/fapi/v1/premiumIndex")
-        t1 = time.time()
-        if not isinstance(data, list):
-            raise RuntimeError("premiumIndex: respuesta inesperada")
-        rows, srv_ms = [], 0
-        for d in data:
+    async def _funding_ws_snapshot(self) -> List[dict]:
+        """Funding de todos los perpetuos por WebSocket (!markPrice@arr): se conecta, toma el primer
+        mensaje (trae todos los pares) y se cierra. Sin REST. NO toca el reloj (ver _funding_clock_sync)."""
+        last_exc: Optional[Exception] = None
+        for url in sorted(FUNDING_WS_URLS, key=lambda u: u != self._funding_ws_ok):
+            t0 = time.time()
+            agen = _ws_messages(url)
             try:
-                sym = str(d["symbol"])
-                if not sym.endswith(QUOTE_ASSET):
-                    continue
-                rows.append({"symbol": sym, "rate_pct": float(d.get("lastFundingRate") or 0) * 100.0,
-                             "next_ts": int(d.get("nextFundingTime") or 0) / 1000.0,
-                             "mark": float(d.get("markPrice") or 0)})
-                srv_ms = max(srv_ms, int(d.get("time") or 0))
-            except (KeyError, TypeError, ValueError):
+                raw = await asyncio.wait_for(agen.__anext__(), FUNDING_WS_TIMEOUT_S)
+                t1 = time.time()                     # al RECIBIR: el cierre del socket ya no infla la medida
+            except Exception as exc:
+                last_exc = exc
                 continue
-        if srv_ms:
-            off = srv_ms / 1000.0 - (t0 + t1) / 2
-            if abs(off) < 300:
-                self.funding_clock_off = off
-        self.funding_last_scan_ms = (t1 - t0) * 1000
-        return rows
+            finally:
+                try:
+                    await asyncio.wait_for(agen.aclose(), 2.0)
+                except Exception:
+                    pass
+            try:
+                data = json.loads(raw)
+                data = data.get("data", data) if isinstance(data, dict) else data
+            except ValueError as exc:
+                last_exc = exc
+                continue
+            if not isinstance(data, list):
+                last_exc = RuntimeError("markPrice: respuesta inesperada")
+                continue
+            rows = []
+            for d in data:
+                try:
+                    sym = str(d["s"])
+                    if not sym.endswith(QUOTE_ASSET):
+                        continue
+                    rows.append({"symbol": sym, "rate_pct": float(d.get("r") or 0) * 100.0,
+                                 "next_ts": int(d.get("T") or 0) / 1000.0,
+                                 "mark": float(d.get("p") or 0)})
+                except (KeyError, TypeError, ValueError):
+                    continue
+            if not rows:
+                last_exc = RuntimeError("markPrice: sin pares")
+                continue
+            self.funding_last_scan_ms = (t1 - t0) * 1000
+            self._funding_ws_ok = url
+            return rows
+        raise RuntimeError(f"sin funding por WebSocket: {last_exc!r}")
+
+    def _clock_sync_thread(self, full: bool = True) -> dict:
+        """Corre en un hilo con su propio event loop (el retraso del loop principal no entra en la medición).
+        Todo se mide contra perf_counter (monotónico): [(rtt, hora_fuente − perf_counter)].
+        full=True: Binance + proveedores externos (NTP / Cloudflare) en paralelo; False: solo Binance, rápido."""
+        res: dict = {"binance": [], "providers": {}, "errors": []}
+        n = max(FUNDING_CLOCK_SAMPLES, 4) if full else 6
+
+        async def binance() -> List[Tuple[float, float]]:
+            last_exc: Optional[Exception] = None
+            for url in API_WS_URLS:
+                samples: List[Tuple[float, float]] = []
+                try:
+                    async with _WsRpc(url) as ws:
+                        for i in range(n):
+                            rid = f"t{i}"
+                            p0 = time.perf_counter()
+                            raw = await ws.call(json.dumps({"id": rid, "method": "time"}), 3.0)
+                            p1 = time.perf_counter()
+                            msg = json.loads(raw)
+                            if msg.get("id") != rid or msg.get("status") != 200:
+                                continue
+                            srv = float(msg["result"]["serverTime"]) / 1000.0
+                            samples.append((p1 - p0, srv - (p0 + p1) / 2.0))     # latencia, Binance − perf
+                            await asyncio.sleep(0.05)
+                    if samples:
+                        return samples
+                except Exception as exc:
+                    last_exc = exc
+            raise RuntimeError(f"time por WebSocket falló: {last_exc!r}")
+
+        try:
+            res["binance"] = asyncio.run(binance())
+        except Exception as exc:
+            res["errors"].append(f"Binance: {exc}")
+        if full and (FUNDING_NTP_HOSTS or FUNDING_HTTP_TIME_URLS):
+            k = FUNDING_CLOCK_PROVIDER_SAMPLES
+            jobs: Dict[concurrent.futures.Future, str] = {}
+            ex = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="clock")
+            try:
+                for h in FUNDING_NTP_HOSTS:
+                    jobs[ex.submit(ntp_samples, h, k)] = f"ntp:{h}"
+                for u in FUNDING_HTTP_TIME_URLS:
+                    jobs[ex.submit(http_time_samples, u, k)] = f"http:{urlsplit(u).hostname}"
+                done, _pending = concurrent.futures.wait(list(jobs), timeout=8.0)
+                for fut, name in jobs.items():
+                    if fut not in done:
+                        res["errors"].append(f"{name}: sin respuesta a tiempo")
+                        continue
+                    try:
+                        smp = fut.result()
+                    except Exception as exc:
+                        res["errors"].append(f"{name}: {exc!r}")
+                        continue
+                    if smp:
+                        res["providers"][name] = smp
+                    else:
+                        res["errors"].append(f"{name}: sin muestras (¿UDP/HTTPS bloqueado?)")
+            finally:
+                ex.shutdown(wait=False)
+        return res
+
+    async def _funding_clock_sync(self, full: bool = True) -> bool:
+        """Mide la hora de Binance (y, en la completa, la de proveedores externos), las compara y fija el ancla
+        monotónica con la que opera el bot. Si no hay medición fiable conserva la anterior y avisa."""
+        try:
+            raw = await asyncio.to_thread(self._clock_sync_thread, full)
+        except Exception as exc:
+            self.log(f"[reloj] ✗ no pude sincronizar: {exc}")
+            return False
+        bres = pick_clock_offset(raw["binance"], FUNDING_CLOCK_MAX_RTT_S)
+        provs: Dict[str, Tuple[float, float, float]] = {}
+        for name, smp in raw["providers"].items():
+            r = pick_clock_offset(smp, FUNDING_CLOCK_MAX_RTT_S)
+            if r is not None:
+                provs[name] = r
+        off, src, info = clock_compare(bres, provs, FUNDING_CLOCK_TOLERANCE_S)
+        if off is None:
+            fastest = min((r for r, _ in raw["binance"]), default=0.0) * 1000
+            self.log(f"[reloj] ✗ medición descartada (Binance: latencia mínima {fastest:.0f} ms, "
+                     f"{len(raw['binance'])} muestras; proveedores válidos: {len(provs)}"
+                     f"{'; ' + ' | '.join(raw['errors']) if raw['errors'] else ''}) · "
+                     f"conservo {self._clock_off() * 1000:+.0f} ms")
+            return False
+        old = self._perf_to_srv
+        self._perf_to_srv = off
+        wall = self._clock_off()                              # Binance − reloj local, ahora
+        self.funding_clock_off = wall
+        self.funding_clock_ts = time.time()
+        rtt, spread = (bres[1], bres[2]) if bres else (0.0, 0.0)
+        self.funding_clock_rtt_ms = rtt * 1000
+        shift = off - (old if old is not None else off)
+        adj = time.perf_counter() - time.time()               # perf → reloj local, para mostrar
+        provtxt = ", ".join(f"{k} {(v[0] + adj) * 1000:+.0f} ms (lat {v[1] * 1000:.0f})" for k, v in provs.items())
+        info.update({"source": src, "full": full, "errors": raw["errors"], "ts": time.time(),
+                     "n_providers": len(provs)})
+        if full:
+            self.funding_clock_info = info
+        else:                                                # la verificación rápida conserva la comparación completa
+            self.funding_clock_info = {**self.funding_clock_info, "source": src, "ts": info["ts"]}
+        self.log(f"[reloj] {'sync completa' if full else 'verificación'}: Binance {wall * 1000:+.0f} ms respecto a este "
+                 f"servidor ({'lat mín ' + format(rtt * 1000, '.0f') + ' ms, disp ' + format(spread * 1000, '.0f') + ' ms, ' if bres else 'SIN medición propia, '}"
+                 f"{len(raw['binance'])} muestras) · se opera con {src}"
+                 + (f" · proveedores: {provtxt}" if provtxt else (" · proveedores: ninguno disponible" if full else ""))
+                 + (f" · Binance − proveedores {info['diff_ms']:+d} ms {'✓' if info.get('agree') else '⚠ difieren'}"
+                    if "diff_ms" in info else "")
+                 + (f" · ajuste vs. medición anterior {shift * 1000:+.0f} ms" if old is not None else ""))
+        if raw["errors"] and full:
+            self.log(f"[reloj] avisos: {' | '.join(raw['errors'])}")
+        if abs(wall) > 1.0:
+            self.log(f"[reloj] ⚠ el reloj de este servidor está desfasado {wall:+.2f} s de Binance (sin NTP en el host); "
+                     f"el bot usa un reloj monotónico anclado a Binance y lo compensa")
+        if old is not None and abs(shift) > 0.1:
+            self.log(f"[reloj] ⚠ el desfase cambió {shift * 1000:+.0f} ms desde la medición anterior")
+        if "diff_ms" in info and not info.get("agree"):
+            self.log(f"[reloj] ⚠ Binance y los proveedores externos difieren {info['diff_ms']:+d} ms: "
+                     f"la ruta a Binance puede ser asimétrica (la medición lleva ±{rtt * 500:.0f} ms de incertidumbre)")
+        return True
+
+    async def _loop_lag_monitor(self) -> None:
+        """Mide cuánto se retrasa el event loop (si pasa de ~1 s las entradas llegan tarde aunque el reloj esté bien)."""
+        worst, window_start = 0.0, time.time()
+        while self.running:
+            t = time.perf_counter()
+            await asyncio.sleep(0.25)
+            lag = (time.perf_counter() - t - 0.25) * 1000
+            worst = max(worst, lag)
+            if lag > 1000:
+                self.log(f"[loop] ⚠ el event loop se retrasó {lag:.0f} ms (CPU saturada o código bloqueante)")
+            if time.time() - window_start >= 60:
+                self.loop_lag_ms, worst, window_start = worst, 0.0, time.time()
 
     async def _funding_scan(self) -> List[dict]:
         try:
-            rows = await asyncio.to_thread(self._fetch_funding)
+            rows = await self._funding_ws_snapshot()
         except Exception as exc:
             self.funding_errors += 1
             self.funding_last_error = str(exc)
@@ -3525,23 +3935,154 @@ class KlineBot:
             })
 
     async def _funding_loop(self) -> None:
+        await self._funding_clock_sync()                     # reloj de Binance desde el arranque
         if not self._funding_rows:
-            await self._funding_scan()                       # para la web (y el reloj de Binance)
+            await self._funding_scan()                       # para la web
         while self.running:
             self._funding_overdue()
             c = self.funding_cfg
             now = self._srv_now()
             ts = next_funding_ts(now, c["open_before_s"] + 0.3)
             self._funding_target_ts = ts
+            left = ts - now
             if self._funding_done_ts == ts:              # ya programado: espera a que pase este cobro
-                await asyncio.sleep(min(max(ts - now, 0.2), 5.0))
+                vlead = FUNDING_CLOCK_VERIFY_BEFORE_S
+                if vlead > 0 and self._clock_verified_for != ts:
+                    if left > vlead:
+                        await asyncio.sleep(min(max(left - vlead, 0.05), 5.0))
+                        continue
+                    self._clock_verified_for = ts
+                    if left > c["open_before_s"] + 2.5:      # verificación rápida (Binance) justo antes de abrir
+                        await self._funding_clock_sync(full=False)
+                    continue
+                await asyncio.sleep(min(max(left, 0.2), 5.0))
+                continue
+            sync_lead = max(FUNDING_CLOCK_SYNC_BEFORE_S, c["scan_before_s"] + 15.0)
+            hourly_lead = max(FUNDING_HOURLY_BEFORE_S, sync_lead + 40.0)
+            if FUNDING_HOURLY_SCAN and self._funding_hourly_for != ts and left <= hourly_lead:
+                self._funding_hourly_for = ts
+                if left > sync_lead + 5.0:                   # si el bot arrancó tarde, se omite (no choca con la sync)
+                    await self._funding_hourly_scan(ts)
+                continue
+            if self._clock_synced_for != ts and left <= sync_lead and time.time() >= self._clock_next_try:
+                if await self._funding_clock_sync():
+                    self._clock_synced_for = ts
+                else:
+                    self._clock_next_try = time.time() + 4.0       # reintenta en unos segundos, no en bucle
                 continue
             wait = ts - c["scan_before_s"] - now
             if wait > 0:
-                await asyncio.sleep(min(wait, 5.0))
+                nxt = [wait, 5.0]
+                if FUNDING_HOURLY_SCAN and self._funding_hourly_for != ts:
+                    nxt.append(max(left - hourly_lead, 0.05))
+                if self._clock_synced_for != ts and left > sync_lead:
+                    nxt.append(left - sync_lead)
+                await asyncio.sleep(max(min(nxt), 0.05))
                 continue
             self._funding_done_ts = ts
             await self._funding_cycle(ts)
+
+    @staticmethod
+    def _parse_mark_rows(raw) -> Optional[List[dict]]:
+        try:
+            data = json.loads(raw)
+            data = data.get("data", data) if isinstance(data, dict) else data
+        except ValueError:
+            return None
+        if not isinstance(data, list):
+            return None
+        rows = []
+        for d in data:
+            try:
+                sym = str(d["s"])
+                if not sym.endswith(QUOTE_ASSET):
+                    continue
+                rows.append({"symbol": sym, "rate_pct": float(d.get("r") or 0) * 100.0,
+                             "next_ts": int(d.get("T") or 0) / 1000.0, "mark": float(d.get("p") or 0)})
+            except (KeyError, TypeError, ValueError):
+                continue
+        return rows
+
+    def _release_watch(self, keep=frozenset()) -> None:
+        """Suelta los precios en vivo calentados por la exploración horaria (menos los de `keep`)."""
+        with self.lock:
+            drop = self._watch_hold - set(keep)
+            self._watch_hold = set()
+            self._price_hold -= drop
+        if drop:
+            self._refresh_pos_syms(force=True)
+
+    async def _funding_hourly_scan(self, ts: float) -> None:
+        """Exploración horaria PROPIA del bot de funding (no comparte nada con la de los demás bots): lee todos los
+        pares por WebSocket, como máximo FUNDING_HOURLY_MAX_SYMBOLS pares y FUNDING_HOURLY_MAX_S segundos, y guarda
+        cuáles cumplen el umbral para el cobro `ts`. A los de mayor |funding| les calienta el precio en vivo."""
+        self._release_watch()
+        t0 = time.monotonic()
+        deadline = t0 + FUNDING_HOURLY_MAX_S
+        cap = max(FUNDING_HOURLY_MAX_SYMBOLS, 1)
+        seen: Dict[str, dict] = {}
+        last_exc: Optional[Exception] = None
+        for url in sorted(FUNDING_WS_URLS, key=lambda u: u != self._funding_ws_ok):
+            if deadline - time.monotonic() <= 1.0:
+                break
+            agen = _ws_messages(url)
+            first = True
+            try:
+                while len(seen) < cap:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    try:
+                        raw = await asyncio.wait_for(agen.__anext__(), min(left, FUNDING_WS_TIMEOUT_S) if first else left)
+                    except (asyncio.TimeoutError, StopAsyncIteration):
+                        break
+                    first = False
+                    rows = self._parse_mark_rows(raw)
+                    if rows is None:
+                        last_exc = RuntimeError("markPrice: respuesta inesperada")
+                        break
+                    before = len(seen)
+                    for r in rows:
+                        if r["symbol"] in seen or len(seen) < cap:
+                            seen[r["symbol"]] = r                   # el último mensaje gana
+                    if len(seen) == before:                           # un mensaje sin pares nuevos: ya se vio todo
+                        break
+            except Exception as exc:
+                last_exc = exc
+            finally:
+                try:
+                    await asyncio.wait_for(agen.aclose(), 2.0)
+                except Exception:
+                    pass
+            if seen:
+                self._funding_ws_ok = url
+                break
+        elapsed = time.monotonic() - t0
+        if not seen:
+            self.funding_errors += 1
+            self.funding_last_error = f"exploración horaria sin datos: {last_exc!r}"
+            self.log(f"[funding] ✗ exploración horaria sin datos tras {elapsed:.1f} s: {last_exc!r}")
+            return
+        thr = self.funding_cfg["min_pct"]
+        rows = sorted(seen.values(), key=lambda r: abs(r["rate_pct"]), reverse=True)
+        cands = [r for r in rows if abs(r["rate_pct"]) >= thr and abs(r["next_ts"] - ts) <= 1.5]
+        hot = [r["symbol"] for r in cands if r["symbol"] in self.filters][:max(FUNDING_WATCH_PRICE_MAX, 0)]
+        with self.lock:
+            self._funding_rows = rows[:25]
+            self._funding_over = sum(1 for r in rows if abs(r["rate_pct"]) >= thr)
+            self._watch_hold = set(hot)
+            self._price_hold |= set(hot)
+            self._funding_watch = {
+                "ts": ts, "when": time.time(), "scanned": len(seen), "capped": len(seen) >= cap,
+                "elapsed_s": round(elapsed, 1), "n": len(cands),
+                "cands": [{"symbol": r["symbol"], "rate_pct": round(r["rate_pct"], 4)} for r in cands[:20]],
+            }
+        if hot:
+            self._refresh_pos_syms(force=True)
+        self.log(f"[funding] exploración horaria: {len(seen)} pares en {elapsed:.1f} s"
+                 f"{' (tope ' + str(cap) + ')' if len(seen) >= cap else ''} · cobro {_utc(ts, '%H:%M')} UTC: "
+                 + (f"{len(cands)} ≥ ±{thr:g}%: " + ", ".join(f"{r['symbol']} {r['rate_pct']:+.3f}%" for r in cands[:10])
+                    if cands else f"ninguno ≥ ±{thr:g}%"))
 
     async def _funding_cycle(self, ts: float) -> None:
         """Consulta el funding antes del cobro `ts` y programa las entradas de los que lo superan."""
@@ -3549,6 +4090,7 @@ class KlineBot:
         rows = await self._funding_scan()
         thr = self.funding_cfg["min_pct"]
         cands = [r for r in rows if abs(r["next_ts"] - ts) <= 1.5 and abs(r["rate_pct"]) >= thr]
+        self._release_watch(keep={r["symbol"] for r in cands})
         if not cands:
             if rows:
                 top = rows[0]
@@ -3576,9 +4118,11 @@ class KlineBot:
                 await self._prefetch_price(sym)
             except Exception:
                 pass
-            wait = ts - self.funding_cfg["open_before_s"] - self._srv_now()
-            if wait > 0:
-                await asyncio.sleep(wait)
+            while True:                                 # se reevalúa el reloj: una re-sincronización se aplica sobre la marcha
+                wait = ts - self.funding_cfg["open_before_s"] - self._srv_now()
+                if wait <= 0:
+                    break
+                await asyncio.sleep(min(wait, 0.5))
             self._funding_open(sym, side, rate, ts, mark)
         finally:
             with self.lock:
@@ -3594,8 +4138,8 @@ class KlineBot:
             self._funding_signal(sym, side, rate, ts, mark, action)
 
         left = ts - self._srv_now()
-        if left <= 0.05:
-            return skip(f"ignorada: llegó tarde al cobro ({-left:.2f} s)")
+        if left <= max(FUNDING_MIN_LEAD_S, 0.05):
+            return skip(f"ignorada: llegó tarde al cobro (faltaban {left:.2f} s, mínimo {FUNDING_MIN_LEAD_S:g} s)")
         if eng.paused:
             return skip("pausado")
         if eng.blocked.get(side):
@@ -3690,7 +4234,15 @@ class KlineBot:
         return {"cfg": c, "rows": top, "over": self._funding_over, "scans": self.funding_scans,
                 "errors": self.funding_errors, "last_error": self.funding_last_error,
                 "last_scan": _utc(self.funding_last_scan_ts, "%H:%M:%S") if self.funding_last_scan_ts else "",
-                "scan_ms": round(self.funding_last_scan_ms), "clock_off_ms": round(self.funding_clock_off * 1000),
+                "scan_ms": round(self.funding_last_scan_ms), "clock_off_ms": round(self._clock_off() * 1000),
+                "clock_src": self.funding_clock_info.get("source", ""),
+                "clock_diff_ms": self.funding_clock_info.get("diff_ms"),
+                "clock_agree": self.funding_clock_info.get("agree"),
+                "clock_providers": self.funding_clock_info.get("providers", {}),
+                "watch": dict(self._funding_watch),
+                "clock_rtt_ms": round(self.funding_clock_rtt_ms),
+                "clock_age_s": round(time.time() - self.funding_clock_ts) if self.funding_clock_ts else None,
+                "loop_lag_ms": round(self.loop_lag_ms),
                 "next": _utc(ts, "%H:%M"), "next_in_s": round(ts - now),
                 "scan_in_s": round(ts - c["scan_before_s"] - now)}
 
@@ -5311,11 +5863,11 @@ function render(d) {
   q('fdCurMin').textContent = `(ahora ±${fdc.min_pct}%)`; q('fdCurNot').textContent = `(ahora ${fdc.notional})`;
   q('fdCurOpen').textContent = `(ahora ${fdc.open_before_s} s)`; q('fdCurClose').textContent = `(ahora ${fdc.close_after_s} s)`;
   q('fdCurScan').textContent = `(ahora ${fdc.scan_before_s} s)`;
-  q('fdNote').innerHTML = `Antes de cada cobro (horas en punto UTC) consulta el funding de todos los pares <b>una vez</b> (${fdc.scan_before_s} s antes, una petición REST con gzip). `
+  q('fdNote').innerHTML = `Antes de cada cobro (horas en punto UTC) consulta el funding de todos los pares <b>una vez</b> (${fdc.scan_before_s} s antes, un mensaje por WebSocket, sin REST). `
     + `Si un par tiene funding ≥ +${fdc.min_pct}% abre <b>SHORT</b> (los LONG le pagan); si es ≤ −${fdc.min_pct}%, <b>LONG</b>. Entra ${fdc.open_before_s} s antes del cobro, `
     + `manda la orden al executor al instante con el precio en vivo (la entrada en papel se corrige después con el libro) y cierra ${fdc.close_after_s} s después. El PnL suma el funding cobrado. `
     + `Próximo cobro ${esc(fd.next || '—')} UTC (en ${dur(fd.next_in_s || 0)}) · última consulta ${esc(fd.last_scan || '—')}${fd.scan_ms ? ' (' + fd.scan_ms + ' ms)' : ''} · `
-    + `${fd.over || 0} par(es) ≥ umbral · reloj Binance ${fd.clock_off_ms >= 0 ? '+' : ''}${fd.clock_off_ms || 0} ms${fd.last_error ? ` · <span class="neg">${esc(fd.last_error)}</span>` : ''}`;
+    + `${fd.over || 0} par(es) ≥ umbral · reloj Binance ${fd.clock_off_ms >= 0 ? '+' : ''}${fd.clock_off_ms || 0} ms${fd.clock_age_s == null ? ' <span class="neg">(sin sincronizar)</span>' : ' (medido hace ' + dur(fd.clock_age_s) + ', latencia ' + (fd.clock_rtt_ms || 0) + ' ms)'}${fd.clock_diff_ms != null ? ' · vs proveedores ' + (fd.clock_diff_ms >= 0 ? '+' : '') + fd.clock_diff_ms + ' ms ' + (fd.clock_agree ? '✓' : '<span class=\"neg\">⚠ difieren</span>') : (fd.clock_age_s != null ? ' · sin proveedores externos' : '')}${fd.watch && fd.watch.ts ? ' · exploración horaria: ' + fd.watch.scanned + ' pares en ' + fd.watch.elapsed_s + ' s, ' + fd.watch.n + ' ≥ umbral' : ''}${fd.loop_lag_ms > 500 ? ` · <span class="neg">loop con retraso ${fd.loop_lag_ms} ms</span>` : ''}${fd.last_error ? ` · <span class="neg">${esc(fd.last_error)}</span>` : ''}`;
   if (view === 'bots') q('fdTbl').innerHTML = (fd.rows || []).map(z => `<tr><td><b>${esc(z.symbol)}</b></td><td class="${z.over ? (z.rate_pct > 0 ? 'neg' : 'pos') : 'muted'}">${z.rate_pct > 0 ? '+' : ''}${(+z.rate_pct).toFixed(4)}%</td>
       <td>${esc(z.next)}${z.in_s != null && z.in_s >= 0 ? ` <span class="muted">(${dur(z.in_s)})</span>` : ''}</td><td>${num(z.mark, 8)}</td><td>${z.over ? tag(z.rate_pct > 0 ? 'SHORT' : 'LONG') : ''}</td></tr>`).join('')
     || '<tr><td colspan="5" class="muted">Aún no hay consulta del funding</td></tr>';
@@ -5485,7 +6037,7 @@ function render(d) {
       ['Entrada total', bytes(nt.rx_total)], ['Entrada por hora', bytes(nt.rx_per_hour)],
       [`Precios en vivo (${esc(nt.price_stream || '—')}, ${nt.price_symbols} pares)`, bytes(nt.rx.prices)],
       [`24 h por WebSocket (${nt.ticker_mode === 'ws' ? 'continuo' : 'exploración'})`, bytes(nt.rx.ticker)],
-      ['REST (ratio y exchangeInfo)', bytes(nt.rx.rest)],
+      ['REST (ratio)', bytes(nt.rx.rest)],
       ['Web enviada', bytes(nt.web_tx)], ['Web por hora', bytes(nt.web_per_hour)],
     ].map(([a, b]) => `<div>${a}<b>${b}</b></div>`).join('');
   }
