@@ -856,3 +856,44 @@ def test_tp_por_precio_se_confirma_con_el_libro_antes_de_cerrar(tmp_path, monkey
     assert 61 not in eng.positions and enviados[-1]["action"] == "close"
     assert enviados[-1]["close_price"] == pytest.approx(0.9949)
     assert eng.closed_trades[0]["close_price"] == pytest.approx(0.9949) and eng.closed_trades[0]["reason"] == "TP"
+
+
+def test_la_venganza_sale_sin_esperar_el_libro(tmp_path, monkeypatch):
+    # En el loop del bot y sin libro reciente: el cierre por SL y la venganza no esperan la foto
+    # del libro (que abre un WebSocket y tarda segundos); salen en el mismo instante.
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    bot.executor_paused = False
+    bot.rev_cfg.update(revenge=True, rev_mult=10, rev_recover_pct=65, rev_sl_pct=100, rev_dir="opposite")
+    enviados = []
+    bot.executor.send = lambda payload, *a, **k: enviados.append(payload)
+    bot._on_loop = lambda: True
+    pedidos = []
+    bot._with_fill = lambda *a, **k: pedidos.append(a)   # si se usara, la venganza quedaría esperando
+    eng = bot.engines[st.ENGINE_RATIO_REV]
+    eng.positions[1] = st.Position(trade_id=1, symbol="AUSDT", direction=st.SHORT, entry_price=1.0, qty=5,
+                                   notional=5.0, tp_price=0.9, sl_price=1.05, signal_pct=-27, candle_open=1.18,
+                                   candle_close=0.86, candle_time=0, last_price=1.0, strategy=st.ENGINE_RATIO_REV)
+    bot._price = lambda sym: 1.06
+    bot._close(1, 1.05, "SL")
+    assert not pedidos
+    assert [p["action"] for p in enviados] == ["close", "open"]
+    v = [p for p in eng.positions.values() if p.revenge]
+    assert len(v) == 1 and v[0].entry_src == "precio en vivo"
+
+
+def test_el_libro_prueba_primero_la_url_que_funciono(tmp_path, monkeypatch):
+    import asyncio, json
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    monkeypatch.setattr(st, "BOOK_WS_URLS", ["wss://a/ws", "wss://b/ws"])
+    intentos = []
+
+    async def falso_ws(url):
+        intentos.append(url.split("/")[2])
+        if url.startswith("wss://a"):
+            raise RuntimeError("sin libro aquí")
+        yield json.dumps({"b": [["1", "5"]], "a": [["1.01", "5"]]})
+
+    monkeypatch.setattr(st, "_ws_messages", falso_ws)
+    asyncio.run(st.KlineBot._ws_depth(bot, "AUSDT"))
+    asyncio.run(st.KlineBot._ws_depth(bot, "AUSDT"))
+    assert intentos == ["a", "b", "b"]          # la segunda vez va directa a la que funcionó

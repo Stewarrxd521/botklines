@@ -908,6 +908,7 @@ class KlineBot:
         self.started_at = time.time()
 
         self._pos_syms: frozenset = frozenset()     # copia para el hilo del WS (sin lock)
+        self._book_ws_ok = ""                       # última URL que dio el libro por WebSocket
         self._price_hold: set = set()               # símbolos con precio pedido antes de una entrada
         self._pending: set = set()                  # símbolos con tick de precio pendiente
         self._pending_lock = threading.Lock()
@@ -1865,9 +1866,19 @@ class KlineBot:
                 self._closing.discard(trade_id)
             raise
         # Cerrar un LONG es vender (bids); cerrar un SHORT, comprar (asks).
-        self._with_fill(symbol, pos.direction == SHORT, pos.qty, price,
-                        lambda px, src: self._finish_close(eng, pos, px, src, price, reason, on_done))
+        finish = lambda px, src: self._finish_close(eng, pos, px, src, price, reason, on_done)
+        if self._may_revenge(eng, pos, reason):
+            # Puede disparar una venganza: no se espera la foto del libro (abrir un WebSocket nuevo
+            # tarda segundos). Se valora ya con el libro reciente, el precio en vivo o el disparo.
+            finish(*self._fill_from_book(symbol, pos.direction == SHORT, pos.qty, price))
+        else:
+            self._with_fill(symbol, pos.direction == SHORT, pos.qty, price, finish)
         return True
+
+    def _may_revenge(self, eng: Engine, pos: Position, reason: str) -> bool:
+        """Este cierre puede abrir una venganza (si termina en pérdida)."""
+        return (eng.name == ENGINE_RATIO_REV and not pos.revenge and bool(self.rev_cfg.get("revenge"))
+                and reason not in REVENGE_SKIP_REASONS)
 
     def _finish_close(self, eng: Engine, pos: Position, price: float, src: str,
                       trigger: float, reason: str, on_done=None) -> None:
@@ -1934,7 +1945,9 @@ class KlineBot:
         primer mensaje y se cierra). No usa REST ni consume peso de la IP en Binance."""
         stream = f"{sym.lower()}@depth20@100ms"
         last_exc: Optional[Exception] = None
-        for base in BOOK_WS_URLS:
+        # Primero la URL que funcionó la última vez: las que no dan libro cuestan BOOK_TIMEOUT_S cada una.
+        urls = sorted(BOOK_WS_URLS, key=lambda u: u != self._book_ws_ok)
+        for base in urls:
             try:
                 agen = _ws_messages(f"{base}/{stream}")
                 try:
@@ -1945,6 +1958,7 @@ class KlineBot:
                 d = d.get("data", d) if isinstance(d, dict) else {}
                 bids, asks = d.get("b") or d.get("bids") or [], d.get("a") or d.get("asks") or []
                 if bids or asks:
+                    self._book_ws_ok = base
                     return bids, asks
             except Exception as exc:
                 last_exc = exc
@@ -2214,10 +2228,10 @@ class KlineBot:
             f.get("minNotional", 5.0), MAX_NOTIONAL_OVER)
         if qty <= 0:
             return note(f"venganza saltada: {why}")
-        # Entrada al precio del libro (el del cierre que la dispara sigue fresco: sin otro REST).
-        self._with_fill(sym, side == LONG, qty, ref,
-                        lambda px, src: self._open_revenge_at(eng, lost, side, qty, ref, px, src,
-                                                              price, loss, reason, note))
+        # Sale YA al executor: sin esperar una foto nueva del libro. En papel entra con el libro
+        # si está reciente; si no, con el precio en vivo (aggTrade del par abierto).
+        px, src = self._fill_from_book(sym, side == LONG, qty, ref)
+        self._open_revenge_at(eng, lost, side, qty, ref, px, src, price, loss, reason, note)
 
     def _open_revenge_at(self, eng: Engine, lost: Position, side: str, qty: float, ref: float, px: float,
                          src: str, price: float, loss: float, reason: str, note) -> None:
