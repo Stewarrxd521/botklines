@@ -341,6 +341,10 @@ EXECUTOR_FILL_EVERY_S = max(0.5, float(os.getenv("EXECUTOR_FILL_EVERY_S", "1.5")
 EXECUTOR_FILL_WAIT_S  = max(5.0, float(os.getenv("EXECUTOR_FILL_WAIT_S", "45")))   # entrada: espera máxima
 # Cierre: el cierre en papel espera como mucho esto al precio del executor antes de usar el del libro.
 EXECUTOR_CLOSE_WAIT_S = max(0.0, float(os.getenv("EXECUTOR_CLOSE_WAIT_S", "15")))
+# Tras un reinicio, las abiertas que el bot perdió (sin estado guardado) se recuperan del executor:
+# cada lote abierto con un trade_id del bot que el bot no tiene vuelve como posición.
+EXECUTOR_RECOVER = os.getenv("EXECUTOR_RECOVER", "true").lower() in ("1", "true", "yes")
+EXECUTOR_RECOVER_TRIES = max(1, int(os.getenv("EXECUTOR_RECOVER_TRIES", "6")))   # Render puede estar dormido
 # Un cierre del executor sin ese trade_id (cierre parcial, o lo cerró Binance) se empareja por par,
 # dirección y SEGUNDO de cierre: el del bot y el del executor no difieren en más que esto.
 EXECUTOR_CLOSE_MATCH_S = max(0.5, float(os.getenv("EXECUTOR_CLOSE_MATCH_S", "2")))
@@ -1010,6 +1014,35 @@ def match_executor_close(tid: int, symbol: str, direction: str, since: float,
             if best is None or abs(ts - since) < abs(best[1] - since):
                 best = (px, ts)
     return best
+
+
+def executor_open_lots(state: dict) -> List[dict]:
+    """Lotes abiertos del bot en el executor: uno por tranche con trade_id de una posición abierta
+    (las "adoptadas" sin tranche no son del bot). qty = la del bot (bot_qty) si la hay."""
+    out: List[dict] = []
+    for t in state.get("open_trades") or []:
+        if not isinstance(t, dict) or str(t.get("status") or "OPEN").upper() != "OPEN":
+            continue
+        sym = str(t.get("symbol") or "").upper()
+        side = str(t.get("direction") or "").upper()
+        if not sym or side not in (LONG, SHORT):
+            continue
+        lots = t.get("lots") if isinstance(t.get("lots"), dict) else {}
+        for tr in t.get("tranches") or []:
+            if not isinstance(tr, dict):
+                continue
+            tid = int(_num(tr.get("trade_id")))
+            if tid <= 0 or (lots and str(tid) not in lots):
+                continue                                # ese lote ya se cerró (parcial)
+            px = _num(tr.get("fill_price")) or _num(t.get("entry_price"))
+            qty = _num(tr.get("bot_qty")) or _num(tr.get("qty")) or _num(lots.get(str(tid)))
+            if px <= 0 or qty <= 0:
+                continue
+            out.append({"trade_id": tid, "symbol": sym, "direction": side, "price": px, "qty": qty,
+                        "signal_price": _num(tr.get("signal_price")) or px, "level": _num(tr.get("level")),
+                        "ts": _num(tr.get("ts")) or _num(tr.get("fill_ms")) / 1000.0 or _num(t.get("opened_ts")),
+                        "strategy": str(tr.get("strategy") or t.get("strategy") or t.get("bot") or "")})
+    return out
 
 
 class ExecutorFills:
@@ -5291,6 +5324,83 @@ class KlineBot:
                            for p in all_pos) or "ninguna"
         self.log(f"[estado] Recuperado desde {source}: abiertas: {detail} | "
                  f"historial: {len(rows)} cierres | executor → {self.executor.target.url or '(vacío)'}")
+        if EXECUTOR_RECOVER and self.executor.target.url and self._on_loop():
+            self._spawn(self._recover_from_executor())
+
+    # ── Abiertas recuperadas del executor (reinicio sin estado guardado) ──────
+
+    async def _recover_from_executor(self) -> int:
+        """Pide al executor sus abiertas y recupera los lotes del bot que el bot no tiene. Solo lee."""
+        doc = None
+        for i in range(EXECUTOR_RECOVER_TRIES):
+            try:
+                doc, _ = await asyncio.to_thread(self.executor.fetch_state, {})
+                break
+            except Exception as exc:
+                self.log(f"[estado] executor sin responder para recuperar abiertas ({i + 1}/"
+                         f"{EXECUTOR_RECOVER_TRIES}): {exc}")
+                await asyncio.sleep(min(5.0 * (i + 1), 20.0))
+        if doc is None:
+            return 0
+        return self._adopt_executor_lots(executor_open_lots(doc))
+
+    def _recover_engine(self, lot: dict) -> str:
+        """Bot dueño de un lote recuperado. Si el executor lo guarda ("strategy"), ese; si no, se deduce:
+        "level" es el % de cambio del ratio en los bots de ratio (≥ el mínimo configurado), el
+        cuerpo de la vela en los de velas. Cada bot de ratio tiene como mucho una por par y dirección."""
+        name = lot.get("strategy") or ""
+        if name in self.engines:
+            return name
+        if abs(lot["level"]) >= self.ratio_cfg["drop_min_pct"]:
+            for n in RATIO_ENGINES:
+                if not any(p.symbol == lot["symbol"] and p.direction == lot["direction"] and not p.revenge
+                           for p in self.engines[n].positions.values()):
+                    return n
+        return ENGINE_CLOSE
+
+    def _adopt_executor_lots(self, lots: List[dict]) -> int:
+        with self.lock:
+            known = {tid for e in self.engines.values() for tid in e.positions}
+            known |= {int(_num(t.get("trade_id"))) for e in self.engines.values() for t in e.closed_trades}
+            known |= set(self._closing)
+        added: List[Position] = []
+        for lot in lots:
+            if lot["trade_id"] in known:
+                continue
+            name = self._recover_engine(lot)
+            eng = self.engines[name]
+            px, side = lot["price"], lot["direction"]
+            tp, sl = 0.0, 0.0
+            if name in RATIO_ENGINES:
+                tp, sl = self._ratio_exit_prices(px, side, name)
+            elif name in KLINE_ENGINES:
+                tp = exit_price(px, side, eng.tp_pct)
+            pos = Position(
+                trade_id=lot["trade_id"], symbol=lot["symbol"], direction=side, entry_price=px,
+                qty=lot["qty"], notional=lot["qty"] * px, tp_price=tp, sl_price=sl,
+                signal_pct=lot["level"], candle_open=0.0, candle_close=0.0, candle_time=0,
+                opened_ts=lot["ts"] or time.time(), last_price=px, strategy=name, sent=True,
+                signal_price=lot["signal_price"], entry_src="executor",
+                ratio_change_pct=lot["level"] if name in RATIO_ENGINES else 0.0,
+            )
+            with self.lock:
+                eng.positions[pos.trade_id] = pos
+                self.trade_id_seq = max(self.trade_id_seq, pos.trade_id)
+            known.add(pos.trade_id)
+            added.append(pos)
+        if not added:
+            return 0
+        self._refresh_pos_syms()
+        if self.price_cache is not None:
+            self.price_cache.ensure_symbols(sorted({p.symbol for p in added}))
+        self.store.mark_dirty(True)
+        for p in added:
+            self._sync_executor_tp(p)                   # su TP en Binance, con la config vigente
+            self._on_price_event(p.symbol, "recuperada")
+        self.log("[estado] Recuperadas del executor: " + ", ".join(
+            f"{ENGINE_LABELS[p.strategy]}: {p.direction} {p.symbol} #{p.trade_id} @ {p.entry_price:g} qty {p.qty:g}"
+            for p in added))
+        return len(added)
 
     def _on_fenced(self) -> None:
         self.last_error = "Otra instancia tomó el control del estado: esta queda en standby"
