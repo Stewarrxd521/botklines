@@ -309,3 +309,46 @@ def test_un_par_que_un_escaneo_no_trajo_no_desaparece(tmp_path, monkeypatch):
     assert {r["symbol"] for r in bot._funding_remember([b])} == {"AUSDT", "BUSDT"}
     monkeypatch.setattr(st, "FUNDING_CACHE_TTL_S", -1)                    # caducado: ya no cuenta
     assert bot._funding_remember([]) == []
+
+
+def test_solo_opera_contratos_en_trading(tmp_path, monkeypatch):
+    """!markPrice@arr trae también contratos en liquidación/deslistado: esos se ignoran y queda en el log."""
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    for s in ("AUSDT", "BUSDT"):
+        bot.filters[s] = {"stepSize": 1, "minQty": 0, "minNotional": 5}
+    bot._price = lambda sym: 1.0
+    bot._refine_entry = lambda *a, **k: None
+    bot.funding_cfg.update(open_before_s=0.6, close_after_s=0.1)
+    monkeypatch.setattr(st, "FUNDING_TRACK", False)
+    bot._filters_ok_ts = time.time()                     # exchangeInfo recién pedido: lo que falta no es operable
+    bot._apply_contract_info({"e": "contractInfo", "s": "BUSDT", "ct": "PERPETUAL", "cs": "SETTLING"})
+    assert bot._funding_operable("BUSDT") is False and bot._funding_operable("CUSDT") is False
+    assert bot._funding_operable("AUSDT") is True
+    eng = bot.engines[st.ENGINE_FUNDING]
+
+    async def run():
+        bot.loop = asyncio.get_running_loop()
+        ts = time.time() + 0.9
+
+        async def snap(*a, **k):
+            return [{"symbol": s, "rate_pct": 0.5, "next_ts": ts, "mark": 1.0} for s in ("AUSDT", "BUSDT", "CUSDT")]
+        bot._funding_ws_snapshot = snap
+        await bot._funding_cycle(ts)
+        await asyncio.sleep(0.6)
+        return {p.symbol for p in eng.positions.values()}
+
+    assert asyncio.run(run()) == {"AUSDT"}
+    assert any("NO operables" in e and "BUSDT" in e and "CUSDT" in e for e in bot.events)
+    bot._apply_contract_info({"e": "contractInfo", "s": "BUSDT", "ct": "PERPETUAL", "cs": "TRADING"})
+    assert bot._funding_operable("BUSDT") is True
+
+
+def test_si_no_abre_queda_en_el_log_el_motivo(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    bot.max_open = 1
+    bot._price = lambda sym: 1.0
+    eng = bot.engines[st.ENGINE_FUNDING]
+    ts = bot._srv_now() + 5
+    assert bot._funding_open("AUSDT", st.SHORT, 0.5, ts, 1.0) is not None
+    assert bot._funding_open("ZUSDT", st.SHORT, 0.6, ts, 1.0) is None
+    assert any("ZUSDT" in e and "NO se abre" in e and "límite" in e for e in bot.events)

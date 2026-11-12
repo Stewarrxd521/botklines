@@ -251,6 +251,14 @@ FUNDING_TRACK_WS_BASES = [u.strip() for u in os.getenv(
 # Pares nuevos con funding alto sin filtros de cantidad (la caché de exchangeInfo dura días): se pide
 # exchangeInfo otra vez, como mucho una vez cada FUNDING_FILTERS_RETRY_S.
 FUNDING_FILTERS_RETRY_S = float(os.getenv("FUNDING_FILTERS_RETRY_S", "1800"))
+# Solo se opera lo que es OPERABLE en futuros: perpetuo USDT en estado TRADING según exchangeInfo (pedido por la API
+# WebSocket de futuros). El stream !markPrice@arr trae también contratos en liquidación o deslistándose, que suelen
+# tener funding extremo y no se pueden abrir. Los cambios de estado llegan en vivo por !contractInfo (como en el
+# executor): conexión siempre abierta, casi sin tráfico (solo hay mensajes cuando un contrato cambia de estado).
+CONTRACT_INFO_WS = os.getenv("CONTRACT_INFO_WS", "true").lower() in ("1", "true", "yes")
+CONTRACT_INFO_WS_URLS = [u.strip() for u in os.getenv(
+    "CONTRACT_INFO_WS_URLS", "wss://fstream.binance.com/market/ws/!contractInfo,"
+                             "wss://fstream.binance.com/ws/!contractInfo").split(",") if u.strip()]
 FUNDING_PERIOD_S      = 3600            # Binance cobra en horas en punto (cada 1, 4 u 8 h según el par)
 # El funding se lee por WebSocket (!markPrice@arr: tasa "r", próximo cobro "T", mark "p" y hora "E" de
 # todos los pares). Se abre antes del cobro, se juntan mensajes hasta tener todos los pares y se cierra:
@@ -1287,6 +1295,8 @@ class KlineBot:
         self._funding_launched: set = set()           # pares ya programados para el cobro en curso
         self._filters_retry_ts = 0.0                  # último reintento de exchangeInfo por un par sin filtros
         self._filters_busy = False
+        self._filters_ok_ts = 0.0                     # último exchangeInfo REAL pedido ahora (no caché ni archivo)
+        self._not_trading: Dict[str, str] = {}        # símbolo → estado (SETTLING, CLOSE, PENDING_TRADING…)
         self._filters_from_file = False               # los filtros vienen del archivo de respaldo, no de Binance
         self.funding_errors = 0
         self.funding_last_error = ""
@@ -1805,6 +1815,7 @@ class KlineBot:
             *([self._supervised(self._ticker_loop, "ticker")] if TICKER_MODE == "ws" else []),
             self._supervised(self._ratio_loop, "ratio"),
             self._supervised(self._funding_loop, "funding"),
+            *([self._supervised(self._contract_info_loop, "contractInfo")] if CONTRACT_INFO_WS else []),
             self._supervised(self._loop_lag_monitor, "lag del loop"),
             self._supervised(self._ind_alt_loop, "velas de otros exchanges"),
             self._supervised(self._symbols_retry_loop, "symbols"),
@@ -1979,7 +1990,7 @@ class KlineBot:
                     # Del archivo: no se guarda como caché fresca y el WebSocket se reintenta en 1 h (no cada minuto).
                     self._filters_ts = time.time() - max(SYMBOL_REFRESH_HOURS - 1, 0) * 3600
                 else:
-                    self._filters_ts = time.time()
+                    self._filters_ts = self._filters_ok_ts = time.time()
                     tmp = f"{SYMBOLS_CACHE_FILE}.tmp"
                     with open(tmp, "w", encoding="utf-8") as fh:
                         json.dump({"symbols": sorted(self.filters), "filters": self.filters,
@@ -4301,7 +4312,8 @@ class KlineBot:
             return
         thr = self.funding_cfg["min_pct"]
         rows = sorted(self._funding_remember(list(seen.values())), key=lambda r: abs(r["rate_pct"]), reverse=True)
-        cands = [r for r in rows if abs(r["rate_pct"]) >= thr and abs(r["next_ts"] - ts) <= 1.5]
+        cands = [r for r in rows if abs(r["rate_pct"]) >= thr and abs(r["next_ts"] - ts) <= 1.5
+                 and self._funding_operable(r["symbol"]) is not False]
         hot = ([r["symbol"] for r in cands if r["symbol"] in self.filters][:max(FUNDING_WATCH_PRICE_MAX, 0)]
                if warm else [])                              # la de arranque/reintento solo llena la tabla
         with self.lock:
@@ -4324,12 +4336,72 @@ class KlineBot:
                  + (f"{len(cands)} ≥ ±{thr:g}%: " + ", ".join(f"{r['symbol']} {r['rate_pct']:+.3f}%" for r in cands[:10])
                     if cands else f"ninguno ≥ ±{thr:g}%"))
 
-    def _funding_ensure_filters(self, syms) -> None:
-        """Pares con funding alto sin filtros de cantidad (p. ej. listados después de la última caché de exchangeInfo):
-        pide exchangeInfo otra vez en segundo plano (como mucho una vez cada FUNDING_FILTERS_RETRY_S)."""
-        missing = sorted(s for s in syms if s not in self.filters)
-        if not missing or self._filters_busy or time.time() - self._filters_retry_ts < FUNDING_FILTERS_RETRY_S:
+    def _apply_contract_info(self, d: dict) -> None:
+        """Evento de !contractInfo: un contrato cambió de estado (listado nuevo, liquidación, deslistado…)."""
+        sym = str(d.get("s") or d.get("ps") or "").upper()
+        cs = str(d.get("cs") or "")
+        if not sym.endswith(QUOTE_ASSET) or not cs:
             return
+        if d.get("ct") and d.get("ct") != "PERPETUAL":
+            return
+        if cs == "TRADING":
+            was = self._not_trading.pop(sym, None)
+            if sym not in self.filters:
+                self.log(f"[contratos] {sym} pasa a TRADING{f' (antes {was})' if was else ''}: pido sus filtros")
+                self._funding_ensure_filters([sym], force=True)
+            elif was:
+                self.log(f"[contratos] {sym} vuelve a TRADING (antes {was})")
+        elif self._not_trading.get(sym) != cs:
+            self._not_trading[sym] = cs
+            self.log(f"[contratos] {sym} → {cs}: deja de ser operable")
+
+    async def _contract_info_loop(self) -> None:
+        """!contractInfo siempre conectado (como el executor): casi no hay tráfico, solo cambios de estado."""
+        idx, backoff = 0, 2.0
+        while self.running:
+            url = CONTRACT_INFO_WS_URLS[idx % len(CONTRACT_INFO_WS_URLS)]
+            t0 = time.time()
+            try:
+                async for raw in _ws_messages(url):
+                    backoff = 2.0
+                    try:
+                        d = json.loads(raw)
+                    except ValueError:
+                        continue
+                    d = d.get("data", d) if isinstance(d, dict) else None
+                    if isinstance(d, dict) and d.get("e") == "contractInfo":
+                        self._apply_contract_info(d)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if time.time() - t0 < 5:
+                    idx += 1                                 # no conectó: probar la siguiente URL
+                    self.log(f"[contratos] {url}: {exc!r}")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 300.0)
+
+    def _funding_operable(self, sym: str) -> Optional[bool]:
+        """True: perpetuo USDT en TRADING (tiene filtros y !contractInfo no dijo lo contrario). False: seguro que no se
+        puede operar. None: aún no se sabe (no está en un exchangeInfo viejo; se está pidiendo otro)."""
+        if sym in self._not_trading:
+            return False
+        if sym in self.filters:
+            return True
+        if self._filters_ok_ts and time.time() - self._filters_ok_ts < 2 * 3600 and not self._filters_busy:
+            return False                                    # exchangeInfo reciente y no está: no es operable
+        return None
+
+    def _funding_ensure_filters(self, syms, force: bool = False) -> None:
+        """Pares con funding alto sin filtros de cantidad (p. ej. listados después de la última caché de exchangeInfo):
+        pide exchangeInfo otra vez en segundo plano, primero por la API WebSocket de futuros (sin REST), como mucho
+        una vez cada FUNDING_FILTERS_RETRY_S (force: un listado nuevo avisado por !contractInfo)."""
+        missing = sorted(s for s in syms if s not in self.filters and s not in self._not_trading)
+        if not missing or self._filters_busy:
+            return
+        if not force and time.time() - self._filters_retry_ts < FUNDING_FILTERS_RETRY_S:
+            return
+        if not force and self._filters_ok_ts and time.time() - self._filters_ok_ts < 2 * 3600:
+            return                                          # exchangeInfo reciente: los que faltan no son operables
         if not self._on_loop():
             return
         self._filters_retry_ts = time.time()
@@ -4337,8 +4409,19 @@ class KlineBot:
 
         async def run() -> None:
             try:
-                self.log(f"[funding] sin filtros de cantidad para {', '.join(missing[:10])}: pido exchangeInfo de nuevo")
-                got = await self._fetch_exchange_info()
+                self.log(f"[funding] sin filtros de cantidad para {', '.join(missing[:10])}: pido exchangeInfo de nuevo "
+                         f"(API WebSocket de futuros)")
+                try:
+                    got = self._exchange_filters_checked(await self._ws_exchange_info())
+                    self._filters_from_file = False
+                except Exception as exc:
+                    self.log(f"[funding] exchangeInfo por WebSocket falló ({exc}); pruebo la ruta normal")
+                    got = await self._fetch_exchange_info()
+                if not self._filters_from_file:
+                    self._filters_ok_ts = time.time()
+                    with self.lock:
+                        for sym in got:
+                            self._not_trading.pop(sym, None)
                 if self._filters_from_file:
                     self.log("[funding] exchangeInfo no respondió (solo el archivo de respaldo): sigo sin esos filtros")
                     got = {k: v for k, v in got.items() if k not in self.filters}   # el archivo solo suma, no pisa
@@ -4348,6 +4431,9 @@ class KlineBot:
                     self.symbols = sorted(self.filters)
                 if added:
                     self.log(f"[funding] filtros nuevos: {', '.join(added[:15])}")
+                still = [s for s in missing if s not in self.filters]
+                if still and not self._filters_from_file:
+                    self.log(f"[funding] no son operables en futuros (no están en TRADING en exchangeInfo): {', '.join(still[:10])}")
             except Exception as exc:
                 self.log(f"[funding] ✗ exchangeInfo: {exc}")
             finally:
@@ -4375,7 +4461,9 @@ class KlineBot:
         umbral y deja el seguimiento en vivo de los que están cerca (el funding cambia hasta el cobro)."""
         rows = await self._funding_scan()
         thr = self.funding_cfg["min_pct"]
-        due = [r for r in rows if abs(r["next_ts"] - ts) <= 1.5]
+        due_all = [r for r in rows if abs(r["next_ts"] - ts) <= 1.5]
+        nope = [r for r in due_all if abs(r["rate_pct"]) >= thr and self._funding_operable(r["symbol"]) is False]
+        due = [r for r in due_all if self._funding_operable(r["symbol"]) is not False]   # solo operables en futuros
         cands = [r for r in due if abs(r["rate_pct"]) >= thr]
         later = [r for r in rows if abs(r["rate_pct"]) >= thr and abs(r["next_ts"] - ts) > 1.5]
         with self.lock:
@@ -4389,6 +4477,11 @@ class KlineBot:
         self._funding_ensure_filters([r["symbol"] for r in cands])
         extra = (f" · {len(later)} con funding alto cobran más tarde (intervalo 4/8 h): "
                  + ", ".join(f"{r['symbol']} {_utc(r['next_ts'], '%H:%M')}" for r in later[:5])) if later else ""
+        if nope:
+            extra += (f" · {len(nope)} con funding alto NO operables en futuros (se ignoran): "
+                      + ", ".join(f"{r['symbol']} {r['rate_pct']:+.3f}%"
+                                  + (f" [{self._not_trading[r['symbol']]}]" if r['symbol'] in self._not_trading else "")
+                                  for r in nope[:5]))
         if rows:
             src = self._funding_src
             info = (f"{len(rows)} pares leídos (WebSocket {src.get('ws', 0)} en {self._funding_snap_msgs} mensajes"
@@ -4526,6 +4619,8 @@ class KlineBot:
 
         def skip(action: str) -> None:
             self._funding_signal(sym, side, rate, ts, mark, action)
+            if action != "pausado":                     # que quede en el log por qué NO salió la señal
+                self.log(f"[{eng.label}] {side} {sym} (funding {rate:+.4f}%) NO se abre: {action}")
 
         left = ts - self._srv_now()
         if left <= max(FUNDING_MIN_LEAD_S, 0.05):
@@ -4542,8 +4637,10 @@ class KlineBot:
             dup = any(p.symbol == sym and p.funding_ts == ts for p in eng.positions.values())
         if dup:
             return skip("ya hay una abierta para este cobro")
+        if sym in self._not_trading:
+            return skip(f"no operable en futuros (estado {self._not_trading[sym]})")
         if sym not in self.filters:
-            return skip("saltada: sin filtros del símbolo (exchangeInfo no cargó)")
+            return skip("no operable en futuros o sin filtros (no está en TRADING en exchangeInfo)")
         price = self._live_price(sym)
         src = "precio en vivo"
         if not price:
@@ -4554,7 +4651,6 @@ class KlineBot:
         qty, eff, why = size_order(self.funding_cfg["notional"], price, f.get("stepSize", 0.001),
                                    f.get("minQty", 0.0), f.get("minNotional", 5.0), MAX_NOTIONAL_OVER)
         if qty <= 0:
-            self.log(f"[{eng.label}] {side} {sym} saltada: {why}")
             return skip(f"saltada: {why}")
         pos = Position(
             trade_id=self._next_trade_id(), symbol=sym, direction=side, entry_price=price, qty=qty,
@@ -4621,6 +4717,8 @@ class KlineBot:
             r["next"] = _utc(r["next_ts"], "%H:%M") if r["next_ts"] else ""
             r["in_s"] = round(r["next_ts"] - now) if r["next_ts"] else None
             r["over"] = abs(r["rate_pct"]) >= c["min_pct"]
+            r["operable"] = self._funding_operable(r["symbol"]) is not False
+            r["status"] = self._not_trading.get(r["symbol"], "")
             r["due"] = bool(r["next_ts"]) and abs(r["next_ts"] - ts) <= 1.5   # cobra en el cobro que apunta el bot
         return {"cfg": c, "rows": top, "over": self._funding_over, "scans": self.funding_scans,
                 "errors": self.funding_errors, "last_error": self.funding_last_error,
@@ -6293,10 +6391,10 @@ function render(d) {
     + `${fd.over || 0} par(es) ≥ umbral · reloj Binance ${fd.clock_off_ms >= 0 ? '+' : ''}${fd.clock_off_ms || 0} ms${fd.clock_age_s == null ? ' <span class="neg">(sin sincronizar)</span>' : ' (medido hace ' + dur(fd.clock_age_s) + ', latencia ' + (fd.clock_rtt_ms || 0) + ' ms)'}${fd.clock_diff_ms != null ? ' · vs proveedores ' + (fd.clock_diff_ms >= 0 ? '+' : '') + fd.clock_diff_ms + ' ms ' + (fd.clock_agree ? '✓' : '<span class=\"neg\">⚠ difieren</span>') : (fd.clock_age_s != null ? ' · sin proveedores externos' : '')}${fd.watch && fd.watch.ts ? ' · exploración horaria: ' + fd.watch.scanned + ' pares en ' + fd.watch.elapsed_s + ' s, ' + fd.watch.n + ' ≥ umbral' : ''}${fd.loop_lag_ms > 500 ? ` · <span class="neg">loop con retraso ${fd.loop_lag_ms} ms</span>` : ''}${fd.last_error ? ` · <span class="neg">${esc(fd.last_error)}</span>` : ''}`;
   if (view === 'bots') q('fdTbl').innerHTML = (fd.rows || []).map(z => {
       const cobro = z.next_ts ? `<b data-cd="${z.next_ts}" data-off="0" data-done="cobrado">${cdFmt(z.in_s || 0)}</b>` : '—';
-      const pick = z.over && z.due;
+      const pick = z.over && z.due && z.operable !== false;
       const abre = pick ? ` <span class="muted">abre en <span data-cd="${z.next_ts}" data-off="${fdc.open_before_s || 0}" data-done="abriendo">${cdFmt((z.in_s || 0) - (fdc.open_before_s || 0))}</span></span>` : '';
       return `<tr><td><b>${esc(z.symbol)}</b></td><td class="${z.over ? (z.rate_pct > 0 ? 'neg' : 'pos') : 'muted'}">${z.rate_pct > 0 ? '+' : ''}${(+z.rate_pct).toFixed(4)}%</td>
-      <td>${esc(z.next)}</td><td>${cobro}</td><td>${num(z.mark, 8)}</td><td>${pick ? tag(z.rate_pct > 0 ? 'SHORT' : 'LONG') + abre : z.over ? '<span class="muted">funding alto, pero cobra más tarde</span>' : '<span class="muted">no cumple</span>'}</td></tr>`;
+      <td>${esc(z.next)}</td><td>${cobro}</td><td>${num(z.mark, 8)}</td><td>${pick ? tag(z.rate_pct > 0 ? 'SHORT' : 'LONG') + abre : z.operable === false ? `<span class="muted">no operable en futuros${z.status ? ' (' + esc(z.status) + ')' : ''}</span>` : z.over ? '<span class="muted">funding alto, pero cobra más tarde</span>' : '<span class="muted">no cumple</span>'}</td></tr>`;
     }).join('')
     || '<tr><td colspan="6" class="muted">Aún no hay consulta del funding</td></tr>';
   tickCountdowns();
