@@ -336,11 +336,14 @@ EXECUTOR_WARM_S  = float(os.getenv("EXECUTOR_WARM_S", "20"))            # HEAD p
 # quien ejecuta en Binance. Solo se consulta mientras haya aperturas o cierres esperando su precio:
 # una consulta sirve para todos los pendientes. Si el executor no lo da a tiempo, queda el del libro.
 EXECUTOR_FILLS = os.getenv("EXECUTOR_FILLS", "true").lower() in ("1", "true", "yes")
-EXECUTOR_FILL_FIRST_S = max(0.5, float(os.getenv("EXECUTOR_FILL_FIRST_S", "2")))   # 1.ª consulta tras la señal
-EXECUTOR_FILL_EVERY_S = max(1.0, float(os.getenv("EXECUTOR_FILL_EVERY_S", "3")))   # reintentos
+EXECUTOR_FILL_FIRST_S = max(0.3, float(os.getenv("EXECUTOR_FILL_FIRST_S", "1")))   # 1.ª consulta tras la señal
+EXECUTOR_FILL_EVERY_S = max(0.5, float(os.getenv("EXECUTOR_FILL_EVERY_S", "1.5")))   # reintentos
 EXECUTOR_FILL_WAIT_S  = max(5.0, float(os.getenv("EXECUTOR_FILL_WAIT_S", "45")))   # entrada: espera máxima
 # Cierre: el cierre en papel espera como mucho esto al precio del executor antes de usar el del libro.
 EXECUTOR_CLOSE_WAIT_S = max(0.0, float(os.getenv("EXECUTOR_CLOSE_WAIT_S", "15")))
+# Un cierre del executor sin ese trade_id (cierre parcial, o lo cerró Binance) se empareja por par,
+# dirección y SEGUNDO de cierre: el del bot y el del executor no difieren en más que esto.
+EXECUTOR_CLOSE_MATCH_S = max(0.5, float(os.getenv("EXECUTOR_CLOSE_MATCH_S", "2")))
 
 # ── Persistencia ──────────────────────────────────────────────────────────────
 SETTINGS_FILE     = os.getenv("SETTINGS_FILE", os.path.join(_HERE, "bot_settings.json"))
@@ -949,14 +952,17 @@ def _num(v) -> float:
         return 0.0
 
 
-def parse_executor_fills(state: dict) -> Tuple[Dict[int, float], Dict[int, Tuple[float, float]]]:
+def parse_executor_fills(state: dict) -> Tuple[Dict[int, float], Dict[int, Tuple[float, float]],
+                                                List[Tuple[str, str, float, float]]]:
     """Del /api/state del executor saca, por trade_id del bot:
       entradas: precio medio real de la orden de apertura (tranches[].fill_price);
       cierres:  (close_price, closed_ts) de la posición del executor que contenía ese trade_id.
     El executor agrupa en una posición los lotes de todos los bots en el mismo par y dirección:
-    la entrada es por lote, el cierre solo existe cuando la posición entera se cierra."""
+    la entrada es por lote, el cierre solo existe cuando la posición entera se cierra.
+    Además, la lista de cierres (par, dirección, precio, segundo) para emparejar por hora."""
     entries: Dict[int, float] = {}
     closes: Dict[int, Tuple[float, float]] = {}
+    closed: List[Tuple[str, str, float, float]] = []
     for key in ("open_trades", "closed_trades"):
         for t in state.get(key) or []:
             if not isinstance(t, dict):
@@ -982,10 +988,28 @@ def parse_executor_fills(state: dict) -> Tuple[Dict[int, float], Dict[int, Tuple
             if cpx <= 0:
                 continue
             cts = _num(t.get("closed_ts"))
+            if cts > 0:
+                closed.append((str(t.get("symbol") or "").upper(), str(t.get("direction") or "").upper(), cpx, cts))
             for tid in ids:
                 if tid not in closes or cts >= closes[tid][1]:
                     closes[tid] = (cpx, cts)
-    return entries, closes
+    return entries, closes, closed
+
+
+def match_executor_close(tid: int, symbol: str, direction: str, since: float,
+                         closes: Dict[int, Tuple[float, float]],
+                         closed: List[Tuple[str, str, float, float]]) -> Optional[Tuple[float, float]]:
+    """(precio, segundo) del cierre real de `tid`: por trade_id, o si no está, el cierre del mismo par
+    y dirección más cercano al segundo en que el bot lo mandó (como mucho EXECUTOR_CLOSE_MATCH_S)."""
+    c = closes.get(tid)
+    if c and (not c[1] or c[1] >= since - EXECUTOR_CLOSE_MATCH_S - 3):
+        return c
+    best = None
+    for sym, d, px, ts in closed:
+        if sym == symbol and d == direction and abs(ts - since) <= EXECUTOR_CLOSE_MATCH_S:
+            if best is None or abs(ts - since) < abs(best[1] - since):
+                best = (px, ts)
+    return best
 
 
 class ExecutorFills:
@@ -1008,12 +1032,15 @@ class ExecutorFills:
         self.last_error = ""
         self.last_fetch_ts = 0.0
 
-    def watch(self, kind: str, trade_id: int, cb, wait_s: float, since: float = 0.0) -> None:
-        """kind: "entry" | "close". since: s Unix desde los que vale un cierre (evita uno viejo)."""
+    def watch(self, kind: str, trade_id: int, cb, wait_s: float, since: float = 0.0,
+              symbol: str = "", direction: str = "") -> None:
+        """kind: "entry" | "close". since: segundo (s Unix) en que el bot mandó el cierre.
+        cb(precio, segundo): segundo = hora real del cierre en el executor (0 si no la hay)."""
         now = time.time()
         with self._cv:
             self._pending[(kind, int(trade_id))] = {
-                "cb": cb, "due": now + EXECUTOR_FILL_FIRST_S, "deadline": now + wait_s, "since": since}
+                "cb": cb, "due": now + EXECUTOR_FILL_FIRST_S, "deadline": now + wait_s, "since": since,
+                "symbol": symbol.upper(), "direction": direction.upper()}
             if self._thread is None:
                 self._thread = threading.Thread(target=self._run, daemon=True, name="executor-fills")
                 self._thread.start()
@@ -1048,6 +1075,7 @@ class ExecutorFills:
         now = time.time()
         entries: Dict[int, float] = {}
         closes: Dict[int, Tuple[float, float]] = {}
+        closed: List[Tuple[str, str, float, float]] = []
         with self._cv:
             asking = any(i["due"] <= now for i in self._pending.values())
         if asking and self.bridge.target.url:
@@ -1056,30 +1084,30 @@ class ExecutorFills:
                 self.fetches += 1
                 self.bytes_in += wire
                 self.last_fetch_ts = time.time()
-                entries, closes = parse_executor_fills(doc)
+                entries, closes, closed = parse_executor_fills(doc)
             except Exception as exc:
                 self.fetch_errors += 1
                 self.last_error = str(exc)
                 for c in conns.values():
                     c.close()
                 conns.clear()
-        done: List[Tuple[str, int, dict, float]] = []
+        done: List[Tuple[str, int, dict, float, float]] = []
         now = time.time()
         with self._cv:
             for (kind, tid), item in list(self._pending.items()):
-                px = 0.0
+                px, ts = 0.0, 0.0
                 if kind == "entry":
                     px = entries.get(tid, 0.0)
                 else:
-                    c = closes.get(tid)
-                    if c and (not c[1] or c[1] >= item["since"] - 5):
-                        px = c[0]
+                    c = match_executor_close(tid, item["symbol"], item["direction"], item["since"], closes, closed)
+                    if c:
+                        px, ts = c
                 if px > 0 or now >= item["deadline"]:
-                    done.append((kind, tid, item, px))
+                    done.append((kind, tid, item, px, ts))
                     del self._pending[(kind, tid)]
                 elif item["due"] <= now:
                     item["due"] = now + EXECUTOR_FILL_EVERY_S
-        for kind, tid, item, px in done:
+        for kind, tid, item, px, ts in done:
             if px > 0:
                 if kind == "entry":
                     self.entries_fixed += 1
@@ -1088,7 +1116,7 @@ class ExecutorFills:
             else:
                 self.timeouts += 1
             try:
-                item["cb"](px)
+                item["cb"](px, ts)
             except Exception as exc:
                 self._log(f"[executor] error aplicando el precio de {kind} #{tid}: {exc!r}")
 
@@ -2571,6 +2599,7 @@ class KlineBot:
             # dirección: si queda otra enviada, se cierra solo la cantidad de esta.
             shared = pos.sent and any(p.sent and p.symbol == symbol and p.direction == pos.direction
                                       for e in self.engines.values() for p in e.positions.values())
+        sent_at = time.time()                   # el segundo del cierre: el de la orden, no el del registro
         try:
             self._refresh_pos_syms()
             if pos.sent:                        # simulada: el executor nunca la abrió
@@ -2602,7 +2631,6 @@ class KlineBot:
             if est_pnl < 0:
                 revenged = True
                 self._open_revenge(eng, pos, est, -est_pnl, reason)
-        sent_at = time.time()
         self._with_fill(symbol, pos.direction == SHORT, pos.qty, price,
                         lambda px, src: self._close_with_executor(eng, pos, px, src, price, reason, on_done,
                                                                   revenged, sent_at))
@@ -2621,17 +2649,19 @@ class KlineBot:
         """El cierre se contabiliza con el precio REAL que dio el executor; si no lo da en
         EXECUTOR_CLOSE_WAIT_S (p. ej. cierre parcial de un par compartido), con el del libro."""
         if not (EXECUTOR_FILLS and pos.sent and EXECUTOR_CLOSE_WAIT_S > 0 and self.executor.target.url):
-            return self._finish_close(eng, pos, book_px, book_src, trigger, reason, on_done, revenged)
+            return self._finish_close(eng, pos, book_px, book_src, trigger, reason, on_done, revenged, sent_at)
 
-        def got(px: float) -> None:
+        def got(px: float, ts: float) -> None:
             if px > 0:
-                self._on_bot_loop(self._finish_close, eng, pos, px, "executor", trigger, reason, on_done, revenged)
+                self._on_bot_loop(self._finish_close, eng, pos, px, "executor", trigger, reason, on_done,
+                                  revenged, ts or sent_at)
             else:
                 self._on_bot_loop(self._finish_close, eng, pos, book_px,
                                   f"{book_src or 'disparo'} (executor sin precio)", trigger, reason,
-                                  on_done, revenged)
+                                  on_done, revenged, sent_at)
 
-        self.fills.watch("close", pos.trade_id, got, EXECUTOR_CLOSE_WAIT_S, since=sent_at)
+        self.fills.watch("close", pos.trade_id, got, EXECUTOR_CLOSE_WAIT_S, since=sent_at,
+                         symbol=pos.symbol, direction=pos.direction)
 
     def _may_revenge(self, eng: Engine, pos: Position, reason: str) -> bool:
         """Este cierre puede abrir una venganza (si termina en pérdida)."""
@@ -2639,7 +2669,8 @@ class KlineBot:
                 and reason not in REVENGE_SKIP_REASONS)
 
     def _finish_close(self, eng: Engine, pos: Position, price: float, src: str,
-                      trigger: float, reason: str, on_done=None, revenged: bool = False) -> None:
+                      trigger: float, reason: str, on_done=None, revenged: bool = False,
+                      closed_at: float = 0.0) -> None:
         """Contabiliza el cierre en papel al precio del libro y, si toca (y no salió ya al
         cerrar), abre la venganza."""
         try:
@@ -2649,7 +2680,9 @@ class KlineBot:
                 fees = fees_usd(pos.entry_price, price, pos.qty, self.fee_pct)
                 funding = self._funding_paid(pos)
                 pnl = gross - fees + funding                # neto: fees de entrada y salida (+ funding cobrado)
-                now = time.time()
+                # Hora del cierre: la del executor o la de la orden, no la de este registro (el libro o
+                # la respuesta del executor pueden tardar unos segundos en llegar).
+                now = closed_at or time.time()
                 rec = {
                     **asdict(pos),
                     "close_price": price,
@@ -2805,7 +2838,7 @@ class KlineBot:
         if not (EXECUTOR_FILLS and pos.sent and pos.entry_src != "executor" and self.executor.target.url):
             return
 
-        def got(px: float) -> None:
+        def got(px: float, _ts: float) -> None:
             if px > 0:
                 self._on_bot_loop(self._apply_executor_entry, eng, pos, px)
 

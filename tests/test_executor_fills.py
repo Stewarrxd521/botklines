@@ -27,13 +27,14 @@ ESTADO = {
 
 
 def test_se_leen_entradas_por_lote_y_cierres_por_posicion():
-    entradas, cierres = st.parse_executor_fills(ESTADO)
+    entradas, cierres, lista = st.parse_executor_fills(ESTADO)
     assert entradas == {101: 0.97, 102: 0.975, 7: 0.96}
-    assert cierres == {7: (0.88, 0.0)}                 # la abierta y la EXTERNAL no dan cierre
+    assert cierres == {7: (0.88, 0.0)}                 # la abierta y la EXTERNAL no dan cierre por id
+    assert lista == []                                 # sin closed_ts no se empareja por hora
 
 
 def test_precio_no_real_no_se_usa():
-    e, _ = st.parse_executor_fills({"open_trades": [{"tranches": [{"trade_id": 1, "fill_price": 2.0,
+    e, _, _ = st.parse_executor_fills({"open_trades": [{"tranches": [{"trade_id": 1, "fill_price": 2.0,
                                                                    "price_real": False}]}]})
     assert e == {}
 
@@ -159,3 +160,44 @@ def test_fetch_state_pide_y_descomprime_gzip():
         assert vistos == {"enc": "gzip", "secret": "s3"}
     finally:
         srv.shutdown()
+
+
+def test_cierre_sin_trade_id_se_empareja_por_par_direccion_y_segundo():
+    t0 = 1_800_000_000.0
+    estado = {"closed_trades": [
+        {"symbol": "BUSDT", "direction": "SHORT", "close_price": 0.80, "closed_ts": t0 - 30, "tranches": []},
+        {"symbol": "BUSDT", "direction": "SHORT", "close_price": 0.88, "closed_ts": t0 + 0.4, "tranches": []},
+        {"symbol": "BUSDT", "direction": "LONG", "close_price": 0.70, "closed_ts": t0, "tranches": []},
+    ]}
+    _, cierres, lista = st.parse_executor_fills(estado)
+    assert st.match_executor_close(9, "BUSDT", "SHORT", t0, cierres, lista) == (0.88, t0 + 0.4)
+    assert st.match_executor_close(9, "BUSDT", "SHORT", t0 + 60, cierres, lista) is None
+
+
+def test_la_hora_del_cierre_es_la_real_y_no_la_del_registro(tmp_path, monkeypatch):
+    t_real = time.time() + 0.3
+    estado = {"open_trades": [], "closed_trades": [
+        {"symbol": "BUSDT", "direction": "SHORT", "close_price": 0.88, "closed_ts": t_real,
+         "paper_ids": [7], "tranches": [{"trade_id": 7, "fill_price": 1.0}]}]}
+    bot, _, _ = _bot(tmp_path, monkeypatch, estado)
+    eng = bot.engines[st.ENGINE_RATIO]
+    eng.positions[7] = _pos(7)
+    bot._books["BUSDT"] = (time.time(), [["0.89", "10"]], [["0.90", "10"]], "libro")
+    bot._close(7, 0.9, "TP")
+    assert _espera(lambda: eng.closed_trades)
+    assert eng.closed_trades[0]["closed_at_ts"] == t_real
+
+
+def test_sin_executor_la_hora_es_la_de_la_orden_aunque_el_libro_tarde(tmp_path, monkeypatch):
+    bot, _, _ = _bot(tmp_path, monkeypatch, ESTADO)
+    monkeypatch.setattr(st, "EXECUTOR_FILLS", False)
+    eng = bot.engines[st.ENGINE_RATIO]
+    eng.positions[7] = _pos(7)
+
+    def libro_lento(sym):
+        time.sleep(0.5)                                 # p. ej. el WebSocket del libro tarda
+        bot._books[sym] = (time.time(), [["0.89", "10"]], [["0.90", "10"]], "libro")
+    bot._fetch_book = libro_lento
+    t0 = time.time()
+    bot._close(7, 0.9, "TP")
+    assert eng.closed_trades[0]["closed_at_ts"] - t0 < 0.1
