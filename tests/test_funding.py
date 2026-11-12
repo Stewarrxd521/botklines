@@ -375,3 +375,19 @@ def test_si_no_abre_queda_en_el_log_el_motivo(tmp_path, monkeypatch):
     assert bot._funding_open("AUSDT", st.SHORT, 0.5, ts, 1.0) is not None
     assert bot._funding_open("ZUSDT", st.SHORT, 0.6, ts, 1.0) is None
     assert any("ZUSDT" in e and "NO se abre" in e and "límite" in e for e in bot.events)
+
+
+def test_los_perpetuos_tradfi_son_operables(tmp_path, monkeypatch):
+    """Acciones y materias primas (TSLAUSDT, XAUUSDT) son TRADIFI_PERPETUAL y se abren en futuros."""
+    data = {"symbols": [
+        {"symbol": "TSLAUSDT", "quoteAsset": "USDT", "contractType": "TRADIFI_PERPETUAL", "status": "TRADING",
+         "filters": [{"filterType": "LOT_SIZE", "stepSize": "0.01", "minQty": "0.01"}]},
+        {"symbol": "AUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING", "filters": []},
+        {"symbol": "VIEJOUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "SETTLING", "filters": []},
+        {"symbol": "AUSDT_260327", "quoteAsset": "USDT", "contractType": "CURRENT_QUARTER", "status": "TRADING",
+         "filters": []}]}
+    assert set(st.exchange_filters(data)) == {"TSLAUSDT", "AUSDT"}
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    bot._funding_ensure_filters = lambda *a, **k: None
+    bot._apply_contract_info({"e": "contractInfo", "s": "XAUUSDT", "ct": "TRADIFI_PERPETUAL", "cs": "SETTLING"})
+    assert bot._not_trading.get("XAUUSDT") == "SETTLING"           # los TradFi también se siguen por contractInfo
