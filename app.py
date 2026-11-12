@@ -80,6 +80,7 @@ import json
 import http.client
 import os
 import queue
+import re
 import socket
 import ssl
 import statistics
@@ -280,7 +281,13 @@ API_WS_TIMEOUT_S = float(os.getenv("API_WS_TIMEOUT_S", "20"))
 # devuelve Binance, con o sin el envoltorio {"result": ...}). Se puede refrescar a mano cuando quieras.
 # Reloj de Binance: se mide con el método "time" de la API WebSocket (ida y vuelta, varias muestras, se queda
 # con las de menor latencia) FUNDING_CLOCK_SYNC_BEFORE_S segundos antes de cada cobro, en un hilo aparte.
-FUNDING_CLOCK_SYNC_BEFORE_S = float(os.getenv("FUNDING_CLOCK_SYNC_BEFORE_S", "120"))   # sincronización completa: 2 min antes
+FUNDING_CLOCK_SYNC_BEFORE_S = float(os.getenv("FUNDING_CLOCK_SYNC_BEFORE_S", "300"))   # sincronización completa: 5 min antes
+# Además, el reloj se re-mide solo (rápido, solo Binance, ~1 KB) cada FUNDING_CLOCK_RESYNC_S aunque no haya
+# cobro cerca, para que el ancla nunca envejezca (el reloj del servidor deriva unos ms por hora). 0 = apagado.
+FUNDING_CLOCK_RESYNC_S = float(os.getenv("FUNDING_CLOCK_RESYNC_S", "600"))
+# Segunda sincronización completa, 2 min antes del cobro, por si algo cambió desde la de 5 min. 0 = apagada.
+FUNDING_CLOCK_RECHECK_BEFORE_S = float(os.getenv("FUNDING_CLOCK_RECHECK_BEFORE_S", "120"))
+FUNDING_CLOCK_QUIET_S = 20.0       # la re-medición periódica no se hace tan cerca de la apertura
 FUNDING_MIN_LEAD_S = float(os.getenv("FUNDING_MIN_LEAD_S", "0.4"))       # si al abrir faltan menos s, NO se entra (no alcanzaría el cobro)
 FUNDING_OPEN_MIN_S = round(max(0.2, FUNDING_MIN_LEAD_S + 0.1), 2)      # mínimo de "abrir N s antes del cobro"
 FUNDING_CLOCK_VERIFY_BEFORE_S = float(os.getenv("FUNDING_CLOCK_VERIFY_BEFORE_S", "8"))  # re-medición rápida (solo Binance)
@@ -382,6 +389,13 @@ BINANCE_KLINES_CHUNK = max(1, min(499, int(os.getenv("BINANCE_KLINES_CHUNK", "49
 # Peso usado por minuto que Binance devuelve en X-MBX-USED-WEIGHT-1M: al pasar este tope la ruta
 # descansa hasta el minuto siguiente, antes de que llegue el 429 (y luego el 418 por insistir).
 REST_WEIGHT_BUDGET = int(os.getenv("REST_WEIGHT_BUDGET", str(int(2400 * 0.8))))
+# Veto de una ruta tras un 418/429: Binance manda en Retry-After el tiempo del baneo, que puede ser de horas o
+# días. No se espera tanto: la ruta descansa REST_BAN_RETRY_CYCLES ciclos del ratio (5 min c/u) y luego se
+# vuelve a probar con UNA sola petición. Si responde, se sigue por ella (la IP pública manda); si vuelve el
+# 418, otro descanso igual. Mientras tanto el ratio sale por los proxies.
+REST_BAN_RETRY_CYCLES = max(float(os.getenv("REST_BAN_RETRY_CYCLES", "2")), 0.2)
+REST_BAN_MIN_S = float(os.getenv("REST_BAN_MIN_S", "30"))
+REST_PROBE_HOLD_S = 20.0           # mientras la petición de prueba está en vuelo nadie más usa esa ruta
 
 
 def price_stream_for(klines_on: bool, fast: bool = True) -> str:
@@ -405,6 +419,39 @@ def http_get_json(url: str, proxy: str = "", timeout: float = 15.0,
         else:
             body = raw
     return json.loads(body), len(raw)
+
+
+def route_ban_s(retry_after, cap_s: float, min_s: float = 30.0) -> float:
+    """Cuánto descansa una ruta tras un 418/429: lo que pide Binance (Retry-After, s), pero nunca más de cap_s
+    (1-2 ciclos) ni menos de min_s. Retry-After ausente o raro → cap_s."""
+    try:
+        wait = float(retry_after)
+    except (TypeError, ValueError):
+        wait = cap_s
+    if wait != wait or wait <= 0:          # NaN o ≤ 0
+        wait = cap_s
+    return max(min(wait, cap_s), min(min_s, cap_s))
+
+
+def _fmt_wait(sec: float) -> str:
+    """Duración legible: 45 s, 10 min, 3 h 20 min, 2 d 4 h."""
+    sec = max(0.0, float(sec))
+    if sec < 90:
+        return f"{sec:.0f} s"
+    m = int(round(sec / 60))
+    if m < 60:
+        return f"{m} min"
+    h, m = divmod(m, 60)
+    if h < 48:
+        return f"{h} h {m} min" if m else f"{h} h"
+    d, h = divmod(h, 24)
+    return f"{d} d {h} h" if h else f"{d} d"
+
+
+def ban_until_from_body(body: str) -> Optional[float]:
+    """Binance explica el 418 en el cuerpo: "...IP banned until 1731370000000..." (ms). Devuelve s o None."""
+    m = re.search(r"banned until (\d{12,14})", body or "")
+    return int(m.group(1)) / 1000.0 if m else None
 
 
 def _utc(ts: float, pattern: str = "%Y-%m-%d %H:%M:%S") -> str:
@@ -1285,6 +1332,8 @@ class KlineBot:
         self.funding_clock_rtt_ms = 0.0               # latencia mínima de esa medición
         self._clock_synced_for = 0                    # cobro para el que ya se sincronizó el reloj
         self._clock_next_try = 0.0
+        self._clock_busy = False                      # hay una medición del reloj en curso
+        self._clock_rechecked_for = 0                 # cobro para el que ya se hizo la sync de 2 min antes
         self.loop_lag_ms = 0.0                        # mayor retraso reciente del event loop
         self.funding_scans = 0
         self._funding_ws_ok = ""                      # última URL del stream de funding que respondió
@@ -1326,6 +1375,10 @@ class KlineBot:
         self._route_errors: Dict[str, int] = {}
         self._route_weight: Dict[str, int] = {}    # último X-MBX-USED-WEIGHT-1M visto por ruta
         self._proxy_rr = 0
+        self._route_lock = threading.Lock()
+        self._route_probe: set = set()                 # rutas con el veto vencido que esperan su petición de prueba
+        self._route_bans: Dict[str, int] = {}          # 418/429 recibidos por ruta desde el arranque
+        self._route_ban_until: Dict[str, float] = {}   # hasta cuándo dice Binance que dura el baneo (informativo)
         self._rest_last_route: Optional[str] = None
         self._rest_times: Deque[float] = deque()      # peticiones de los últimos 5 min
         self._scan_seen: Optional[set] = None         # símbolos vistos en la exploración en curso
@@ -1820,6 +1873,7 @@ class KlineBot:
             self._supervised(self._ratio_loop, "ratio"),
             self._supervised(self._funding_loop, "funding"),
             *([self._supervised(self._contract_info_loop, "contractInfo")] if CONTRACT_INFO_WS else []),
+            self._supervised(self._clock_keeper_loop, "reloj"),
             self._supervised(self._loop_lag_monitor, "lag del loop"),
             self._supervised(self._ind_alt_loop, "velas de otros exchanges"),
             self._supervised(self._symbols_retry_loop, "symbols"),
@@ -1917,23 +1971,20 @@ class KlineBot:
                 data, nbytes = http_get_json(url, route, 25.0, headers_out=hdrs)
             except urllib.error.HTTPError as exc:
                 if exc.code in (418, 429):
-                    try:
-                        wait = float(exc.headers.get("Retry-After") or 60)
-                    except (TypeError, ValueError):
-                        wait = 60.0
-                    self._route_block[route] = time.time() + max(wait, 30.0)
+                    self._ban_route(route, exc, "/fapi/v1/exchangeInfo")
+                else:
+                    self._route_fail_soft(route)
                 last_exc = RuntimeError(f"HTTP {exc.code} por {proxy_label(route)}")
-                self._route_errors[route] = self._route_errors.get(route, 0) + 1
                 continue
             except Exception as exc:
                 last_exc = RuntimeError(f"{proxy_label(route)}: {exc}")
-                self._route_errors[route] = self._route_errors.get(route, 0) + 1
+                self._route_fail_soft(route)
                 continue
             if not isinstance(data, dict) or not data.get("symbols"):
                 last_exc = RuntimeError(f"{proxy_label(route)}: respuesta sin símbolos")
                 continue
             self.rx_rest_bytes += nbytes
-            self._route_ok[route] = self._route_ok.get(route, 0) + 1
+            self._route_ok_hit(route)
             self._note_weight(route, hdrs.get("x-mbx-used-weight-1m"))
             self.log(f"exchangeInfo por {proxy_label(route)} ({nbytes / 1024:.0f} KB)")
             return data
@@ -3022,21 +3073,84 @@ class KlineBot:
 
     def _rest_routes(self) -> List[str]:
         """Orden de rutas para el REST de Binance: la IP directa mientras no esté vetada; si lo
-        está, las proxies rotando (una distinta en cada petición) y saltando las vetadas."""
-        now = time.time()
-        free = [r for r in [""] + REST_PROXIES if self._route_block.get(r, 0.0) <= now]
-        if "" in free:
-            return [""] + [r for r in free if r]
-        if not free:
-            return []
-        k = self._proxy_rr % len(free)
-        self._proxy_rr += 1
-        return free[k:] + free[:k]
+        está, las proxies rotando (una distinta en cada petición) y saltando las vetadas.
+        Una ruta cuyo veto acaba de vencer va "a prueba": la reserva UNA sola petición (las demás,
+        concurrentes, no la ven) hasta saber si Binance ya la deja pasar."""
+        with self._route_lock:
+            now = time.time()
+            free = [r for r in [""] + REST_PROXIES if self._route_block.get(r, 0.0) <= now]
+            for r in free:
+                if r in self._route_probe:                    # reserva la prueba para esta petición
+                    self._route_block[r] = now + REST_PROBE_HOLD_S
+            if "" in free:
+                return [""] + [r for r in free if r]
+            if not free:
+                return []
+            k = self._proxy_rr % len(free)
+            self._proxy_rr += 1
+            return free[k:] + free[:k]
+
+    def _ban_route(self, route: str, exc: urllib.error.HTTPError, path: str) -> float:
+        """418/429 por esa ruta: descanso de 1-2 ciclos (REST_BAN_RETRY_CYCLES), no el baneo entero que
+        anuncia Binance; luego queda a prueba (ver _rest_routes). Devuelve los segundos de descanso."""
+        try:
+            body = exc.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            body = ""
+        retry_after = exc.headers.get("Retry-After") if exc.headers else None
+        cap = REST_BAN_RETRY_CYCLES * RATIO_REFRESH_S
+        rest = route_ban_s(retry_after, cap, REST_BAN_MIN_S)
+        until_bin = ban_until_from_body(body)
+        try:
+            ra = float(retry_after) if retry_after is not None else None
+        except (TypeError, ValueError):
+            ra = None
+        if until_bin is None and ra is not None:
+            until_bin = time.time() + ra
+        with self._route_lock:
+            now = time.time()
+            self._route_block[route] = now + rest
+            self._route_probe.add(route)
+            self._route_bans[route] = self._route_bans.get(route, 0) + 1
+            if until_bin:
+                self._route_ban_until[route] = until_bin
+            routes = [""] + REST_PROXIES
+            left = [r for r in routes if self._route_block.get(r, 0.0) <= now]
+            self._rest_block_until = 0.0 if left else min(self._route_block[r] for r in routes)
+        weight = self._route_weight.get(route)
+        binance_txt = (f"Binance pide {_fmt_wait(until_bin - time.time())} (hasta {_utc(until_bin, '%H:%M')} UTC)"
+                       if until_bin else "Binance no dice hasta cuándo")
+        self.log(f"[REST] Binance respondió {exc.code} por {proxy_label(route)} en {path}"
+                 f"{f' (peso visto antes: {weight}/min)' if weight is not None else ''}: {binance_txt}; "
+                 f"la vuelvo a probar en {_fmt_wait(rest)} con 1 petición"
+                 f"{f' · mientras tanto {len(left)} ruta(s) libres' if left else ' · sin rutas libres'}"
+                 + (f" · {body.strip()[:160]}" if body.strip() else ""))
+        return rest
+
+    def _route_ok_hit(self, route: str) -> None:
+        """Respuesta correcta por esa ruta: si estaba a prueba, queda rehabilitada."""
+        with self._route_lock:
+            self._route_ok[route] = self._route_ok.get(route, 0) + 1
+            was_probe = route in self._route_probe
+            if was_probe:
+                self._route_probe.discard(route)
+                self._route_ban_until.pop(route, None)
+                if self._route_block.get(route, 0.0) > time.time():
+                    self._route_block[route] = 0.0
+        if was_probe:
+            self.log(f"[REST] ✓ {proxy_label(route)} vuelve a responder: el ratio sigue por ahí")
+
+    def _route_fail_soft(self, route: str) -> None:
+        """Fallo de red (no 418/429): si era la petición de prueba, suelta la reserva para reintentar luego."""
+        with self._route_lock:
+            self._route_errors[route] = self._route_errors.get(route, 0) + 1
+            if route in self._route_probe and self._route_block.get(route, 0.0) > time.time():
+                self._route_block[route] = time.time() + 5.0
 
     def _rest_get(self, path: str, params: Optional[dict] = None, timeout: float = 15.0):
         """GET público a Binance (gzip). Un 429/418 veta SOLO la ruta que lo recibió (es la IP la que
-        queda bloqueada) y se sigue por la siguiente; con todas vetadas no sale ninguna petición hasta
-        que venza el veto (insistir lo alarga)."""
+        queda bloqueada) durante 1-2 ciclos y se sigue por la siguiente; con todas vetadas no sale
+        ninguna petición hasta que venza el primer veto (como mucho REST_BAN_RETRY_CYCLES ciclos)."""
         order = self._rest_routes()
         if not order:
             raise RuntimeError(f"REST de Binance en pausa {self._rest_block_until - time.time():.0f} s (418/429 en todas las rutas)")
@@ -3048,25 +3162,17 @@ class KlineBot:
                 data, nbytes = http_get_json(url, route, timeout, headers_out=hdrs)
             except urllib.error.HTTPError as exc:
                 if exc.code not in (418, 429):
+                    self._route_fail_soft(route)
                     raise RuntimeError(f"HTTP {exc.code}")
-                try:
-                    wait = float(exc.headers.get("Retry-After") or 60)
-                except (TypeError, ValueError):
-                    wait = 60.0
-                self._route_block[route] = time.time() + max(wait, 30.0)
-                routes = [""] + REST_PROXIES
-                left = [r for r in routes if self._route_block.get(r, 0.0) <= time.time()]
-                self._rest_block_until = 0.0 if left else min(self._route_block[r] for r in routes)
-                self.log(f"[REST] Binance respondió {exc.code} por {proxy_label(route)} en {path}: esa ruta queda "
-                         f"en pausa {max(wait, 30.0):.0f} s{f' · quedan {len(left)} ruta(s)' if left else ' · sin rutas libres'}")
+                self._ban_route(route, exc, path)
                 last_exc = RuntimeError(f"HTTP {exc.code}")
                 continue
             except Exception as exc:
                 last_exc = exc
-                self._route_errors[route] = self._route_errors.get(route, 0) + 1
+                self._route_fail_soft(route)
                 continue
             self.rx_rest_bytes += nbytes
-            self._route_ok[route] = self._route_ok.get(route, 0) + 1
+            self._route_ok_hit(route)
             self._note_weight(route, hdrs.get("x-mbx-used-weight-1m"))
             if route != self._rest_last_route:
                 if route or self._rest_last_route is not None:
@@ -3100,6 +3206,8 @@ class KlineBot:
     def rest_routes_snapshot(self) -> List[dict]:
         now = time.time()
         return [{"route": proxy_label(r), "blocked_s": max(0.0, self._route_block.get(r, 0.0) - now),
+                 "probe": r in self._route_probe, "bans": self._route_bans.get(r, 0),
+                 "binance_ban_s": max(0.0, self._route_ban_until.get(r, 0.0) - now),
                  "ok": self._route_ok.get(r, 0), "errors": self._route_errors.get(r, 0),
                  "weight": self._route_weight.get(r),
                  "current": r == self._rest_last_route} for r in [""] + REST_PROXIES]
@@ -4096,9 +4204,55 @@ class KlineBot:
                 ex.shutdown(wait=False)
         return res
 
+    async def _clock_keeper_loop(self) -> None:
+        """Guardián del reloj, aparte de _funding_loop (que a 3 min del cobro está ocupado con la consulta):
+          • sync completa FUNDING_CLOCK_RECHECK_BEFORE_S (2 min) antes de cada cobro, además de la de 5 min;
+          • re-medición rápida (solo Binance) cada FUNDING_CLOCK_RESYNC_S si la última es más vieja.
+        Nada a menos de FUNDING_CLOCK_QUIET_S de la apertura: ahí está la verificación de último momento."""
+        await asyncio.sleep(60.0)                            # la primera sync la hace _funding_loop al arrancar
+        while self.running:
+            now_srv = self._srv_now()
+            target = self._funding_target_ts or next_funding_ts(now_srv, 0.0)
+            left = target - now_srv                          # hasta el cobro
+            to_open = left - self.funding_cfg["open_before_s"]
+            quiet = -5.0 < to_open < FUNDING_CLOCK_QUIET_S
+            recheck = FUNDING_CLOCK_RECHECK_BEFORE_S
+            if (recheck > 0 and self._clock_rechecked_for != target and left <= recheck
+                    and to_open > FUNDING_CLOCK_QUIET_S):
+                self._clock_rechecked_for = target           # una vez por cobro, salga bien o no
+                await self._funding_clock_sync(full=True)
+                continue
+            age = time.time() - self.funding_clock_ts if self.funding_clock_ts else 1e9
+            if FUNDING_CLOCK_RESYNC_S > 0 and age >= FUNDING_CLOCK_RESYNC_S and not quiet and not self._clock_busy:
+                await self._funding_clock_sync(full=False)
+                if time.time() - self.funding_clock_ts > FUNDING_CLOCK_RESYNC_S:
+                    await asyncio.sleep(30.0)                # falló: reintenta en 30 s, no en bucle
+                    continue
+                age = 0.0
+            nxt = [60.0]
+            if FUNDING_CLOCK_RESYNC_S > 0:
+                nxt.append(max(FUNDING_CLOCK_RESYNC_S - age, 10.0))
+            if recheck > 0 and self._clock_rechecked_for != target and left > recheck:
+                nxt.append(left - recheck)
+            await asyncio.sleep(max(min(nxt), 1.0))
+
     async def _funding_clock_sync(self, full: bool = True) -> bool:
         """Mide la hora de Binance (y, en la completa, la de proveedores externos), las compara y fija el ancla
         monotónica con la que opera el bot. Si no hay medición fiable conserva la anterior y avisa."""
+        if self._clock_busy:                                 # otra medición en curso: no se pisan
+            for _ in range(150):
+                await asyncio.sleep(0.1)
+                if not self._clock_busy:
+                    break
+            if not full:
+                return bool(self.funding_clock_ts)
+        self._clock_busy = True
+        try:
+            return await self._funding_clock_sync_run(full)
+        finally:
+            self._clock_busy = False
+
+    async def _funding_clock_sync_run(self, full: bool) -> bool:
         try:
             raw = await asyncio.to_thread(self._clock_sync_thread, full)
         except Exception as exc:
@@ -6529,7 +6683,8 @@ function render(d) {
       + (r.filters === 0 ? ` · <span class="neg">sin filtros de cantidad (exchangeInfo): no se puede abrir</span>` : '')
       + (r.ticker_error && !r.ticker_connected ? ` · <span class="warn">24 h: ${esc(r.ticker_error)}</span>` : '')
       + (r.rest_blocked_s > 0 ? ` · <span class="neg">ratio en pausa ${dur(r.rest_blocked_s)} (418/429 en todas las rutas)</span>` : '')
-      + ((r.routes || []).length ? ` · REST Binance: ${esc((r.routes.find(x => x.current) || r.routes[0]).route)}${(r.routes.find(x => x.current) || {}).weight != null ? ` (peso ${(r.routes.find(x => x.current)).weight}/min)` : ''}, ${r.routes.filter(x => !x.blocked_s).length}/${r.routes.length} rutas libres` : '')
+      + ((r.routes || []).length ? ` · REST Binance: ${esc((r.routes.find(x => x.current) || r.routes[0]).route)}${(r.routes.find(x => x.current) || {}).weight != null ? ` (peso ${(r.routes.find(x => x.current)).weight}/min)` : ''}, ${r.routes.filter(x => !x.blocked_s).length}/${r.routes.length} rutas libres`
+        + (r.routes[0] && r.routes[0].blocked_s > 0 ? ` · <span class="neg">IP pública vetada por Binance, se reintenta en ${dur(r.routes[0].blocked_s)}</span>` : '') : '')
       + (r.last_error ? ` · <span class="warn">${esc(r.last_error)}</span>` : '');
     q('tRt').innerHTML = r.rows.map(z => `<tr>
       <td><b>${esc(z.symbol)}</b></td><td>${z.pct24 === null ? '—' : pct(z.pct24)}</td><td>${num(z.price, 8)}</td>
