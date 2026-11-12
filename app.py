@@ -80,6 +80,7 @@ import json
 import http.client
 import os
 import queue
+import re
 import socket
 import ssl
 import statistics
@@ -237,12 +238,15 @@ FUNDING_REST_MIN_INTERVAL_S = float(os.getenv("FUNDING_REST_MIN_INTERVAL_S", "30
 # FUNDING_CACHE_TTL_S: un par que un escaneo por WebSocket no trajo no desaparece de la lista.
 FUNDING_CACHE_TTL_S = float(os.getenv("FUNDING_CACHE_TTL_S", "900"))
 FUNDING_COLLECT_MAX_S = float(os.getenv("FUNDING_COLLECT_MAX_S", "12"))
+# Escaneo de la hora: con la lista fija de operables, se escucha !markPrice@arr hasta tener el funding de TODOS
+# (si llegan antes, corta antes) y como mucho FUNDING_SCAN_WAIT_S segundos.
+FUNDING_SCAN_WAIT_S = float(os.getenv("FUNDING_SCAN_WAIT_S", "60"))
 # Seguimiento en vivo tras la consulta final: el funding de Binance es una ESTIMACIÓN que cambia hasta el cobro.
 # Los pares que cobran en esa hora y están a ≥ FUNDING_TRACK_RATIO del umbral se siguen por su stream propio
 # (<par>@markPrice@1s, pocos pares: poco ancho de banda) hasta FUNDING_TRACK_END_S antes de abrir. Si uno cruza
 # el umbral entra; si uno que cumplía baja del umbral, no se abre.
 FUNDING_TRACK = os.getenv("FUNDING_TRACK", "true").lower() in ("1", "true", "yes")
-FUNDING_TRACK_RATIO = float(os.getenv("FUNDING_TRACK_RATIO", "0.5"))
+FUNDING_TRACK_RATIO = float(os.getenv("FUNDING_TRACK_RATIO", "1.0"))   # 1.0 = solo los que cumplen; 0.5 = también los cercanos
 FUNDING_TRACK_MAX = int(os.getenv("FUNDING_TRACK_MAX", "40"))
 FUNDING_TRACK_END_S = float(os.getenv("FUNDING_TRACK_END_S", "0.5"))
 FUNDING_TRACK_WS_BASES = [u.strip() for u in os.getenv(
@@ -251,6 +255,14 @@ FUNDING_TRACK_WS_BASES = [u.strip() for u in os.getenv(
 # Pares nuevos con funding alto sin filtros de cantidad (la caché de exchangeInfo dura días): se pide
 # exchangeInfo otra vez, como mucho una vez cada FUNDING_FILTERS_RETRY_S.
 FUNDING_FILTERS_RETRY_S = float(os.getenv("FUNDING_FILTERS_RETRY_S", "1800"))
+# Solo se opera lo que es OPERABLE en futuros: perpetuo USDT en estado TRADING según exchangeInfo (pedido por la API
+# WebSocket de futuros). El stream !markPrice@arr trae también contratos en liquidación o deslistándose, que suelen
+# tener funding extremo y no se pueden abrir. Los cambios de estado llegan en vivo por !contractInfo (como en el
+# executor): conexión siempre abierta, casi sin tráfico (solo hay mensajes cuando un contrato cambia de estado).
+CONTRACT_INFO_WS = os.getenv("CONTRACT_INFO_WS", "true").lower() in ("1", "true", "yes")
+CONTRACT_INFO_WS_URLS = [u.strip() for u in os.getenv(
+    "CONTRACT_INFO_WS_URLS", "wss://fstream.binance.com/market/ws/!contractInfo,"
+                             "wss://fstream.binance.com/ws/!contractInfo").split(",") if u.strip()]
 FUNDING_PERIOD_S      = 3600            # Binance cobra en horas en punto (cada 1, 4 u 8 h según el par)
 # El funding se lee por WebSocket (!markPrice@arr: tasa "r", próximo cobro "T", mark "p" y hora "E" de
 # todos los pares). Se abre antes del cobro, se juntan mensajes hasta tener todos los pares y se cierra:
@@ -269,7 +281,13 @@ API_WS_TIMEOUT_S = float(os.getenv("API_WS_TIMEOUT_S", "20"))
 # devuelve Binance, con o sin el envoltorio {"result": ...}). Se puede refrescar a mano cuando quieras.
 # Reloj de Binance: se mide con el método "time" de la API WebSocket (ida y vuelta, varias muestras, se queda
 # con las de menor latencia) FUNDING_CLOCK_SYNC_BEFORE_S segundos antes de cada cobro, en un hilo aparte.
-FUNDING_CLOCK_SYNC_BEFORE_S = float(os.getenv("FUNDING_CLOCK_SYNC_BEFORE_S", "120"))   # sincronización completa: 2 min antes
+FUNDING_CLOCK_SYNC_BEFORE_S = float(os.getenv("FUNDING_CLOCK_SYNC_BEFORE_S", "300"))   # sincronización completa: 5 min antes
+# Además, el reloj se re-mide solo (rápido, solo Binance, ~1 KB) cada FUNDING_CLOCK_RESYNC_S aunque no haya
+# cobro cerca, para que el ancla nunca envejezca (el reloj del servidor deriva unos ms por hora). 0 = apagado.
+FUNDING_CLOCK_RESYNC_S = float(os.getenv("FUNDING_CLOCK_RESYNC_S", "600"))
+# Segunda sincronización completa, 2 min antes del cobro, por si algo cambió desde la de 5 min. 0 = apagada.
+FUNDING_CLOCK_RECHECK_BEFORE_S = float(os.getenv("FUNDING_CLOCK_RECHECK_BEFORE_S", "120"))
+FUNDING_CLOCK_QUIET_S = 20.0       # la re-medición periódica no se hace tan cerca de la apertura
 FUNDING_MIN_LEAD_S = float(os.getenv("FUNDING_MIN_LEAD_S", "0.4"))       # si al abrir faltan menos s, NO se entra (no alcanzaría el cobro)
 FUNDING_OPEN_MIN_S = round(max(0.2, FUNDING_MIN_LEAD_S + 0.1), 2)      # mínimo de "abrir N s antes del cobro"
 FUNDING_CLOCK_VERIFY_BEFORE_S = float(os.getenv("FUNDING_CLOCK_VERIFY_BEFORE_S", "8"))  # re-medición rápida (solo Binance)
@@ -284,10 +302,10 @@ FUNDING_CLOCK_TOLERANCE_S = float(os.getenv("FUNDING_CLOCK_TOLERANCE_S", "0.15")
 # Exploración horaria propia del bot de funding (independiente de la de los demás bots): lee TODOS los
 # pares por WebSocket, como máximo FUNDING_HOURLY_MAX_SYMBOLS pares y FUNDING_HOURLY_MAX_S segundos, y deja
 # la lista de los que ya cumplen el umbral (se les calienta el precio en vivo antes de la consulta final).
-FUNDING_HOURLY_SCAN = os.getenv("FUNDING_HOURLY_SCAN", "true").lower() in ("1", "true", "yes")
+FUNDING_HOURLY_SCAN = os.getenv("FUNDING_HOURLY_SCAN", "false").lower() in ("1", "true", "yes")   # la de 3 min ya basta
 FUNDING_HOURLY_BEFORE_S = float(os.getenv("FUNDING_HOURLY_BEFORE_S", "300"))      # cuánto antes de cada hora en punto
 FUNDING_HOURLY_MAX_SYMBOLS = int(os.getenv("FUNDING_HOURLY_MAX_SYMBOLS", "3000"))   # tope de seguridad, no de diseño
-FUNDING_HOURLY_MAX_S = float(os.getenv("FUNDING_HOURLY_MAX_S", "30"))
+FUNDING_HOURLY_MAX_S = float(os.getenv("FUNDING_HOURLY_MAX_S", "60"))
 FUNDING_WATCH_PRICE_MAX = int(os.getenv("FUNDING_WATCH_PRICE_MAX", "10"))         # precios en vivo que se calientan
 FUNDING_CLOCK_SAMPLES = int(os.getenv("FUNDING_CLOCK_SAMPLES", "12"))
 FUNDING_CLOCK_MAX_RTT_S = float(os.getenv("FUNDING_CLOCK_MAX_RTT_S", "0.4"))   # muestras más lentas se descartan
@@ -371,6 +389,13 @@ BINANCE_KLINES_CHUNK = max(1, min(499, int(os.getenv("BINANCE_KLINES_CHUNK", "49
 # Peso usado por minuto que Binance devuelve en X-MBX-USED-WEIGHT-1M: al pasar este tope la ruta
 # descansa hasta el minuto siguiente, antes de que llegue el 429 (y luego el 418 por insistir).
 REST_WEIGHT_BUDGET = int(os.getenv("REST_WEIGHT_BUDGET", str(int(2400 * 0.8))))
+# Veto de una ruta tras un 418/429: Binance manda en Retry-After el tiempo del baneo, que puede ser de horas o
+# días. No se espera tanto: la ruta descansa REST_BAN_RETRY_CYCLES ciclos del ratio (5 min c/u) y luego se
+# vuelve a probar con UNA sola petición. Si responde, se sigue por ella (la IP pública manda); si vuelve el
+# 418, otro descanso igual. Mientras tanto el ratio sale por los proxies.
+REST_BAN_RETRY_CYCLES = max(float(os.getenv("REST_BAN_RETRY_CYCLES", "2")), 0.2)
+REST_BAN_MIN_S = float(os.getenv("REST_BAN_MIN_S", "30"))
+REST_PROBE_HOLD_S = 20.0           # mientras la petición de prueba está en vuelo nadie más usa esa ruta
 
 
 def price_stream_for(klines_on: bool, fast: bool = True) -> str:
@@ -394,6 +419,39 @@ def http_get_json(url: str, proxy: str = "", timeout: float = 15.0,
         else:
             body = raw
     return json.loads(body), len(raw)
+
+
+def route_ban_s(retry_after, cap_s: float, min_s: float = 30.0) -> float:
+    """Cuánto descansa una ruta tras un 418/429: lo que pide Binance (Retry-After, s), pero nunca más de cap_s
+    (1-2 ciclos) ni menos de min_s. Retry-After ausente o raro → cap_s."""
+    try:
+        wait = float(retry_after)
+    except (TypeError, ValueError):
+        wait = cap_s
+    if wait != wait or wait <= 0:          # NaN o ≤ 0
+        wait = cap_s
+    return max(min(wait, cap_s), min(min_s, cap_s))
+
+
+def _fmt_wait(sec: float) -> str:
+    """Duración legible: 45 s, 10 min, 3 h 20 min, 2 d 4 h."""
+    sec = max(0.0, float(sec))
+    if sec < 90:
+        return f"{sec:.0f} s"
+    m = int(round(sec / 60))
+    if m < 60:
+        return f"{m} min"
+    h, m = divmod(m, 60)
+    if h < 48:
+        return f"{h} h {m} min" if m else f"{h} h"
+    d, h = divmod(h, 24)
+    return f"{d} d {h} h" if h else f"{d} d"
+
+
+def ban_until_from_body(body: str) -> Optional[float]:
+    """Binance explica el 418 en el cuerpo: "...IP banned until 1731370000000..." (ms). Devuelve s o None."""
+    m = re.search(r"banned until (\d{12,14})", body or "")
+    return int(m.group(1)) / 1000.0 if m else None
 
 
 def _utc(ts: float, pattern: str = "%Y-%m-%d %H:%M:%S") -> str:
@@ -1274,11 +1332,14 @@ class KlineBot:
         self.funding_clock_rtt_ms = 0.0               # latencia mínima de esa medición
         self._clock_synced_for = 0                    # cobro para el que ya se sincronizó el reloj
         self._clock_next_try = 0.0
+        self._clock_busy = False                      # hay una medición del reloj en curso
+        self._clock_rechecked_for = 0                 # cobro para el que ya se hizo la sync de 2 min antes
         self.loop_lag_ms = 0.0                        # mayor retraso reciente del event loop
         self.funding_scans = 0
         self._funding_ws_ok = ""                      # última URL del stream de funding que respondió
         self._funding_track_ok = ""                   # última base del stream combinado que respondió
         self._funding_snap_msgs = 0                   # mensajes que hizo falta juntar en la última consulta
+        self._funding_snap_s = 0.0
         self._funding_src: dict = {}                  # cuántos pares trajo cada fuente en la última consulta
         self._funding_rest_ts = 0.0                   # última vez que se pidió premiumIndex por REST (≤ 1 por hora)
         self._funding_seen: Dict[str, tuple] = {}     # símbolo → (cuándo, última fila vista)
@@ -1287,6 +1348,8 @@ class KlineBot:
         self._funding_launched: set = set()           # pares ya programados para el cobro en curso
         self._filters_retry_ts = 0.0                  # último reintento de exchangeInfo por un par sin filtros
         self._filters_busy = False
+        self._filters_ok_ts = 0.0                     # último exchangeInfo REAL pedido ahora (no caché ni archivo)
+        self._not_trading: Dict[str, str] = {}        # símbolo → estado (SETTLING, CLOSE, PENDING_TRADING…)
         self._filters_from_file = False               # los filtros vienen del archivo de respaldo, no de Binance
         self.funding_errors = 0
         self.funding_last_error = ""
@@ -1312,6 +1375,10 @@ class KlineBot:
         self._route_errors: Dict[str, int] = {}
         self._route_weight: Dict[str, int] = {}    # último X-MBX-USED-WEIGHT-1M visto por ruta
         self._proxy_rr = 0
+        self._route_lock = threading.Lock()
+        self._route_probe: set = set()                 # rutas con el veto vencido que esperan su petición de prueba
+        self._route_bans: Dict[str, int] = {}          # 418/429 recibidos por ruta desde el arranque
+        self._route_ban_until: Dict[str, float] = {}   # hasta cuándo dice Binance que dura el baneo (informativo)
         self._rest_last_route: Optional[str] = None
         self._rest_times: Deque[float] = deque()      # peticiones de los últimos 5 min
         self._scan_seen: Optional[set] = None         # símbolos vistos en la exploración en curso
@@ -1805,6 +1872,8 @@ class KlineBot:
             *([self._supervised(self._ticker_loop, "ticker")] if TICKER_MODE == "ws" else []),
             self._supervised(self._ratio_loop, "ratio"),
             self._supervised(self._funding_loop, "funding"),
+            *([self._supervised(self._contract_info_loop, "contractInfo")] if CONTRACT_INFO_WS else []),
+            self._supervised(self._clock_keeper_loop, "reloj"),
             self._supervised(self._loop_lag_monitor, "lag del loop"),
             self._supervised(self._ind_alt_loop, "velas de otros exchanges"),
             self._supervised(self._symbols_retry_loop, "symbols"),
@@ -1902,23 +1971,20 @@ class KlineBot:
                 data, nbytes = http_get_json(url, route, 25.0, headers_out=hdrs)
             except urllib.error.HTTPError as exc:
                 if exc.code in (418, 429):
-                    try:
-                        wait = float(exc.headers.get("Retry-After") or 60)
-                    except (TypeError, ValueError):
-                        wait = 60.0
-                    self._route_block[route] = time.time() + max(wait, 30.0)
+                    self._ban_route(route, exc, "/fapi/v1/exchangeInfo")
+                else:
+                    self._route_fail_soft(route)
                 last_exc = RuntimeError(f"HTTP {exc.code} por {proxy_label(route)}")
-                self._route_errors[route] = self._route_errors.get(route, 0) + 1
                 continue
             except Exception as exc:
                 last_exc = RuntimeError(f"{proxy_label(route)}: {exc}")
-                self._route_errors[route] = self._route_errors.get(route, 0) + 1
+                self._route_fail_soft(route)
                 continue
             if not isinstance(data, dict) or not data.get("symbols"):
                 last_exc = RuntimeError(f"{proxy_label(route)}: respuesta sin símbolos")
                 continue
             self.rx_rest_bytes += nbytes
-            self._route_ok[route] = self._route_ok.get(route, 0) + 1
+            self._route_ok_hit(route)
             self._note_weight(route, hdrs.get("x-mbx-used-weight-1m"))
             self.log(f"exchangeInfo por {proxy_label(route)} ({nbytes / 1024:.0f} KB)")
             return data
@@ -1979,7 +2045,7 @@ class KlineBot:
                     # Del archivo: no se guarda como caché fresca y el WebSocket se reintenta en 1 h (no cada minuto).
                     self._filters_ts = time.time() - max(SYMBOL_REFRESH_HOURS - 1, 0) * 3600
                 else:
-                    self._filters_ts = time.time()
+                    self._filters_ts = self._filters_ok_ts = time.time()
                     tmp = f"{SYMBOLS_CACHE_FILE}.tmp"
                     with open(tmp, "w", encoding="utf-8") as fh:
                         json.dump({"symbols": sorted(self.filters), "filters": self.filters,
@@ -3007,21 +3073,84 @@ class KlineBot:
 
     def _rest_routes(self) -> List[str]:
         """Orden de rutas para el REST de Binance: la IP directa mientras no esté vetada; si lo
-        está, las proxies rotando (una distinta en cada petición) y saltando las vetadas."""
-        now = time.time()
-        free = [r for r in [""] + REST_PROXIES if self._route_block.get(r, 0.0) <= now]
-        if "" in free:
-            return [""] + [r for r in free if r]
-        if not free:
-            return []
-        k = self._proxy_rr % len(free)
-        self._proxy_rr += 1
-        return free[k:] + free[:k]
+        está, las proxies rotando (una distinta en cada petición) y saltando las vetadas.
+        Una ruta cuyo veto acaba de vencer va "a prueba": la reserva UNA sola petición (las demás,
+        concurrentes, no la ven) hasta saber si Binance ya la deja pasar."""
+        with self._route_lock:
+            now = time.time()
+            free = [r for r in [""] + REST_PROXIES if self._route_block.get(r, 0.0) <= now]
+            for r in free:
+                if r in self._route_probe:                    # reserva la prueba para esta petición
+                    self._route_block[r] = now + REST_PROBE_HOLD_S
+            if "" in free:
+                return [""] + [r for r in free if r]
+            if not free:
+                return []
+            k = self._proxy_rr % len(free)
+            self._proxy_rr += 1
+            return free[k:] + free[:k]
+
+    def _ban_route(self, route: str, exc: urllib.error.HTTPError, path: str) -> float:
+        """418/429 por esa ruta: descanso de 1-2 ciclos (REST_BAN_RETRY_CYCLES), no el baneo entero que
+        anuncia Binance; luego queda a prueba (ver _rest_routes). Devuelve los segundos de descanso."""
+        try:
+            body = exc.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            body = ""
+        retry_after = exc.headers.get("Retry-After") if exc.headers else None
+        cap = REST_BAN_RETRY_CYCLES * RATIO_REFRESH_S
+        rest = route_ban_s(retry_after, cap, REST_BAN_MIN_S)
+        until_bin = ban_until_from_body(body)
+        try:
+            ra = float(retry_after) if retry_after is not None else None
+        except (TypeError, ValueError):
+            ra = None
+        if until_bin is None and ra is not None:
+            until_bin = time.time() + ra
+        with self._route_lock:
+            now = time.time()
+            self._route_block[route] = now + rest
+            self._route_probe.add(route)
+            self._route_bans[route] = self._route_bans.get(route, 0) + 1
+            if until_bin:
+                self._route_ban_until[route] = until_bin
+            routes = [""] + REST_PROXIES
+            left = [r for r in routes if self._route_block.get(r, 0.0) <= now]
+            self._rest_block_until = 0.0 if left else min(self._route_block[r] for r in routes)
+        weight = self._route_weight.get(route)
+        binance_txt = (f"Binance pide {_fmt_wait(until_bin - time.time())} (hasta {_utc(until_bin, '%H:%M')} UTC)"
+                       if until_bin else "Binance no dice hasta cuándo")
+        self.log(f"[REST] Binance respondió {exc.code} por {proxy_label(route)} en {path}"
+                 f"{f' (peso visto antes: {weight}/min)' if weight is not None else ''}: {binance_txt}; "
+                 f"la vuelvo a probar en {_fmt_wait(rest)} con 1 petición"
+                 f"{f' · mientras tanto {len(left)} ruta(s) libres' if left else ' · sin rutas libres'}"
+                 + (f" · {body.strip()[:160]}" if body.strip() else ""))
+        return rest
+
+    def _route_ok_hit(self, route: str) -> None:
+        """Respuesta correcta por esa ruta: si estaba a prueba, queda rehabilitada."""
+        with self._route_lock:
+            self._route_ok[route] = self._route_ok.get(route, 0) + 1
+            was_probe = route in self._route_probe
+            if was_probe:
+                self._route_probe.discard(route)
+                self._route_ban_until.pop(route, None)
+                if self._route_block.get(route, 0.0) > time.time():
+                    self._route_block[route] = 0.0
+        if was_probe:
+            self.log(f"[REST] ✓ {proxy_label(route)} vuelve a responder: el ratio sigue por ahí")
+
+    def _route_fail_soft(self, route: str) -> None:
+        """Fallo de red (no 418/429): si era la petición de prueba, suelta la reserva para reintentar luego."""
+        with self._route_lock:
+            self._route_errors[route] = self._route_errors.get(route, 0) + 1
+            if route in self._route_probe and self._route_block.get(route, 0.0) > time.time():
+                self._route_block[route] = time.time() + 5.0
 
     def _rest_get(self, path: str, params: Optional[dict] = None, timeout: float = 15.0):
         """GET público a Binance (gzip). Un 429/418 veta SOLO la ruta que lo recibió (es la IP la que
-        queda bloqueada) y se sigue por la siguiente; con todas vetadas no sale ninguna petición hasta
-        que venza el veto (insistir lo alarga)."""
+        queda bloqueada) durante 1-2 ciclos y se sigue por la siguiente; con todas vetadas no sale
+        ninguna petición hasta que venza el primer veto (como mucho REST_BAN_RETRY_CYCLES ciclos)."""
         order = self._rest_routes()
         if not order:
             raise RuntimeError(f"REST de Binance en pausa {self._rest_block_until - time.time():.0f} s (418/429 en todas las rutas)")
@@ -3033,25 +3162,17 @@ class KlineBot:
                 data, nbytes = http_get_json(url, route, timeout, headers_out=hdrs)
             except urllib.error.HTTPError as exc:
                 if exc.code not in (418, 429):
+                    self._route_fail_soft(route)
                     raise RuntimeError(f"HTTP {exc.code}")
-                try:
-                    wait = float(exc.headers.get("Retry-After") or 60)
-                except (TypeError, ValueError):
-                    wait = 60.0
-                self._route_block[route] = time.time() + max(wait, 30.0)
-                routes = [""] + REST_PROXIES
-                left = [r for r in routes if self._route_block.get(r, 0.0) <= time.time()]
-                self._rest_block_until = 0.0 if left else min(self._route_block[r] for r in routes)
-                self.log(f"[REST] Binance respondió {exc.code} por {proxy_label(route)} en {path}: esa ruta queda "
-                         f"en pausa {max(wait, 30.0):.0f} s{f' · quedan {len(left)} ruta(s)' if left else ' · sin rutas libres'}")
+                self._ban_route(route, exc, path)
                 last_exc = RuntimeError(f"HTTP {exc.code}")
                 continue
             except Exception as exc:
                 last_exc = exc
-                self._route_errors[route] = self._route_errors.get(route, 0) + 1
+                self._route_fail_soft(route)
                 continue
             self.rx_rest_bytes += nbytes
-            self._route_ok[route] = self._route_ok.get(route, 0) + 1
+            self._route_ok_hit(route)
             self._note_weight(route, hdrs.get("x-mbx-used-weight-1m"))
             if route != self._rest_last_route:
                 if route or self._rest_last_route is not None:
@@ -3085,6 +3206,8 @@ class KlineBot:
     def rest_routes_snapshot(self) -> List[dict]:
         now = time.time()
         return [{"route": proxy_label(r), "blocked_s": max(0.0, self._route_block.get(r, 0.0) - now),
+                 "probe": r in self._route_probe, "bans": self._route_bans.get(r, 0),
+                 "binance_ban_s": max(0.0, self._route_ban_until.get(r, 0.0) - now),
                  "ok": self._route_ok.get(r, 0), "errors": self._route_errors.get(r, 0),
                  "weight": self._route_weight.get(r),
                  "current": r == self._rest_last_route} for r in [""] + REST_PROXIES]
@@ -3881,12 +4004,14 @@ class KlineBot:
             return 0.0
         return funding_income_usd(p.notional, p.funding_rate, p.direction)
 
-    async def _funding_ws_snapshot(self, max_s: Optional[float] = None, cap: Optional[int] = None) -> List[dict]:
-        """Funding de TODOS los perpetuos por WebSocket (!markPrice@arr): se conecta y junta mensajes (el último valor
-        de cada par gana) hasta que dos seguidos no traen pares nuevos (mínimo FUNDING_COLLECT_MIN_S, máximo `max_s`),
-        y se cierra. Un solo mensaje no basta: puede llegar incompleto y entonces faltaban pares que cumplían.
-        Sin REST. NO toca el reloj (ver _funding_clock_sync)."""
+    async def _funding_ws_snapshot(self, max_s: Optional[float] = None, cap: Optional[int] = None,
+                                   want: Optional[set] = None) -> List[dict]:
+        """Funding de TODOS los perpetuos por WebSocket (!markPrice@arr, un solo stream con todo el mercado): junta
+        mensajes (el último valor de cada par gana) y se cierra. Con `want` (la lista fija de operables) corta en cuanto
+        tiene el funding de TODOS ellos, o a los `max_s` s; sin `want`, cuando dos mensajes seguidos no traen pares
+        nuevos (mínimo FUNDING_COLLECT_MIN_S). Sin REST. NO toca el reloj (ver _funding_clock_sync)."""
         max_s = FUNDING_COLLECT_MAX_S if max_s is None else max_s
+        want = set(want or ())
         cap = max(cap or FUNDING_HOURLY_MAX_SYMBOLS, 1)
         t0 = time.monotonic()
         deadline = t0 + max(max_s, 1.0)
@@ -3918,7 +4043,10 @@ class KlineBot:
                         if r["symbol"] in seen or len(seen) < cap:
                             seen[r["symbol"]] = r                   # el último mensaje gana
                     stale = stale + 1 if len(seen) == before else 0
-                    if seen and stale >= 2 and time.monotonic() - t0 >= FUNDING_COLLECT_MIN_S:
+                    if want:
+                        if want.issubset(seen):
+                            break                                   # ya está el funding de todos los operables
+                    elif seen and stale >= 2 and time.monotonic() - t0 >= FUNDING_COLLECT_MIN_S:
                         break                                       # dos mensajes sin pares nuevos: ya están todos
             except Exception as exc:
                 last_exc = exc
@@ -3934,6 +4062,7 @@ class KlineBot:
             self.funding_last_scan_ms = (time.monotonic() - t0) * 1000
             self._funding_ws_ok = url
             self._funding_snap_msgs = msgs
+            self._funding_snap_s = time.monotonic() - t0
             return list(seen.values())
         raise RuntimeError(f"sin funding por WebSocket: {last_exc!r}")
 
@@ -3957,33 +4086,50 @@ class KlineBot:
             raise RuntimeError("premiumIndex: sin pares")
         return rows
 
+    def _funding_universe(self) -> set:
+        """Lista fija de símbolos operables en futuros (perpetuos USDT en TRADING), la que se escanea cada hora."""
+        with self.lock:
+            return {sym for sym in self.filters if sym not in self._not_trading}
+
     async def _funding_full_snapshot(self, max_s: Optional[float] = None, cap: Optional[int] = None,
                                      rest: bool = False) -> List[dict]:
-        """Pares por WebSocket y, solo si rest=True (consulta final) y no se pidió en la última
-        FUNDING_REST_MIN_INTERVAL_S, también premiumIndex por REST en paralelo (lista completa). Se unen: de cada par
-        vale el WebSocket si lo trajo (más reciente) y si no el REST. Con que uno responda, basta."""
+        """Funding de TODOS los operables: !markPrice@arr por WebSocket hasta tener el de cada símbolo de la lista fija
+        (corta antes si ya están todos; como mucho `max_s`, por defecto FUNDING_SCAN_WAIT_S). Si aun así faltan y
+        rest=True, premiumIndex por REST de respaldo, como mucho una vez cada FUNDING_REST_MIN_INTERVAL_S."""
         t0 = time.monotonic()
-        tasks = [self._funding_ws_snapshot(max_s, cap)]
-        if rest and FUNDING_REST_SNAPSHOT and time.time() - self._funding_rest_ts >= FUNDING_REST_MIN_INTERVAL_S:
+        want = self._funding_universe()
+        errs: List[str] = []
+        try:
+            ws = await self._funding_ws_snapshot(FUNDING_SCAN_WAIT_S if max_s is None else max_s, cap, want)
+        except Exception as exc:
+            ws, errs = [], [f"WebSocket: {exc!r}"]
+        got = {r["symbol"] for r in ws}
+        missing = sorted(want - got)
+        rest_rows: List[dict] = []
+        if (rest and FUNDING_REST_SNAPSHOT and (missing or not ws)
+                and time.time() - self._funding_rest_ts >= FUNDING_REST_MIN_INTERVAL_S):
             self._funding_rest_ts = time.time()
-            tasks.append(asyncio.to_thread(self._funding_rest_rows))
-        res = await asyncio.gather(*tasks, return_exceptions=True)
-        ws = res[0] if isinstance(res[0], list) else []
-        rest = res[1] if len(res) > 1 and isinstance(res[1], list) else []
-        errs = [f"{n}: {r!r}" for n, r in zip(("WebSocket", "REST"), res) if isinstance(r, BaseException)]
-        if not ws and not rest:
+            try:
+                rest_rows = await asyncio.to_thread(self._funding_rest_rows)
+            except Exception as exc:
+                errs.append(f"REST: {exc!r}")
+        if not ws and not rest_rows:
             raise RuntimeError(" | ".join(errs) or "sin datos")
-        merged: Dict[str, dict] = {r["symbol"]: r for r in rest}
+        merged: Dict[str, dict] = {r["symbol"]: r for r in rest_rows}
         merged.update({r["symbol"]: r for r in ws})
-        only_rest = len(set(merged) - {r["symbol"] for r in ws}) if ws else 0
-        self._funding_src = {"ws": len(ws), "rest": len(rest), "total": len(merged), "only_rest": only_rest,
-                             "errors": errs}
+        still = sorted(want - set(merged))
+        only_rest = len(set(merged) - got) if rest_rows else 0
+        self._funding_src = {"ws": len(ws), "rest": len(rest_rows), "total": len(merged), "only_rest": only_rest,
+                             "want": len(want), "have": len(want & set(merged)), "missing": still[:20],
+                             "wait_s": round(time.monotonic() - t0, 1), "errors": errs}
         self.funding_last_scan_ms = (time.monotonic() - t0) * 1000
         if errs:
             self.log(f"[funding] consulta con una sola fuente ({len(merged)} pares): {' | '.join(errs)}")
-        elif only_rest:
-            self.log(f"[funding] el WebSocket trajo {len(ws)} pares y el REST {len(rest)}: "
-                     f"{only_rest} solo llegaron por REST (se incluyen)")
+        if want:
+            self.log(f"[funding] funding de {len(want & set(merged))}/{len(want)} operables en "
+                     f"{time.monotonic() - t0:.1f} s (WebSocket {len(ws)}"
+                     + (f", REST {len(rest_rows)}" if rest_rows else "") + ")"
+                     + (f" · faltan {len(still)}: {', '.join(still[:10])}" if still else " · todos ✓"))
         return list(merged.values())
 
     def _funding_remember(self, rows: List[dict]) -> List[dict]:
@@ -4058,9 +4204,55 @@ class KlineBot:
                 ex.shutdown(wait=False)
         return res
 
+    async def _clock_keeper_loop(self) -> None:
+        """Guardián del reloj, aparte de _funding_loop (que a 3 min del cobro está ocupado con la consulta):
+          • sync completa FUNDING_CLOCK_RECHECK_BEFORE_S (2 min) antes de cada cobro, además de la de 5 min;
+          • re-medición rápida (solo Binance) cada FUNDING_CLOCK_RESYNC_S si la última es más vieja.
+        Nada a menos de FUNDING_CLOCK_QUIET_S de la apertura: ahí está la verificación de último momento."""
+        await asyncio.sleep(60.0)                            # la primera sync la hace _funding_loop al arrancar
+        while self.running:
+            now_srv = self._srv_now()
+            target = self._funding_target_ts or next_funding_ts(now_srv, 0.0)
+            left = target - now_srv                          # hasta el cobro
+            to_open = left - self.funding_cfg["open_before_s"]
+            quiet = -5.0 < to_open < FUNDING_CLOCK_QUIET_S
+            recheck = FUNDING_CLOCK_RECHECK_BEFORE_S
+            if (recheck > 0 and self._clock_rechecked_for != target and left <= recheck
+                    and to_open > FUNDING_CLOCK_QUIET_S):
+                self._clock_rechecked_for = target           # una vez por cobro, salga bien o no
+                await self._funding_clock_sync(full=True)
+                continue
+            age = time.time() - self.funding_clock_ts if self.funding_clock_ts else 1e9
+            if FUNDING_CLOCK_RESYNC_S > 0 and age >= FUNDING_CLOCK_RESYNC_S and not quiet and not self._clock_busy:
+                await self._funding_clock_sync(full=False)
+                if time.time() - self.funding_clock_ts > FUNDING_CLOCK_RESYNC_S:
+                    await asyncio.sleep(30.0)                # falló: reintenta en 30 s, no en bucle
+                    continue
+                age = 0.0
+            nxt = [60.0]
+            if FUNDING_CLOCK_RESYNC_S > 0:
+                nxt.append(max(FUNDING_CLOCK_RESYNC_S - age, 10.0))
+            if recheck > 0 and self._clock_rechecked_for != target and left > recheck:
+                nxt.append(left - recheck)
+            await asyncio.sleep(max(min(nxt), 1.0))
+
     async def _funding_clock_sync(self, full: bool = True) -> bool:
         """Mide la hora de Binance (y, en la completa, la de proveedores externos), las compara y fija el ancla
         monotónica con la que opera el bot. Si no hay medición fiable conserva la anterior y avisa."""
+        if self._clock_busy:                                 # otra medición en curso: no se pisan
+            for _ in range(150):
+                await asyncio.sleep(0.1)
+                if not self._clock_busy:
+                    break
+            if not full:
+                return bool(self.funding_clock_ts)
+        self._clock_busy = True
+        try:
+            return await self._funding_clock_sync_run(full)
+        finally:
+            self._clock_busy = False
+
+    async def _funding_clock_sync_run(self, full: bool) -> bool:
         try:
             raw = await asyncio.to_thread(self._clock_sync_thread, full)
         except Exception as exc:
@@ -4301,7 +4493,8 @@ class KlineBot:
             return
         thr = self.funding_cfg["min_pct"]
         rows = sorted(self._funding_remember(list(seen.values())), key=lambda r: abs(r["rate_pct"]), reverse=True)
-        cands = [r for r in rows if abs(r["rate_pct"]) >= thr and abs(r["next_ts"] - ts) <= 1.5]
+        cands = [r for r in rows if abs(r["rate_pct"]) >= thr and abs(r["next_ts"] - ts) <= 1.5
+                 and self._funding_operable(r["symbol"]) is not False]
         hot = ([r["symbol"] for r in cands if r["symbol"] in self.filters][:max(FUNDING_WATCH_PRICE_MAX, 0)]
                if warm else [])                              # la de arranque/reintento solo llena la tabla
         with self.lock:
@@ -4324,12 +4517,72 @@ class KlineBot:
                  + (f"{len(cands)} ≥ ±{thr:g}%: " + ", ".join(f"{r['symbol']} {r['rate_pct']:+.3f}%" for r in cands[:10])
                     if cands else f"ninguno ≥ ±{thr:g}%"))
 
-    def _funding_ensure_filters(self, syms) -> None:
-        """Pares con funding alto sin filtros de cantidad (p. ej. listados después de la última caché de exchangeInfo):
-        pide exchangeInfo otra vez en segundo plano (como mucho una vez cada FUNDING_FILTERS_RETRY_S)."""
-        missing = sorted(s for s in syms if s not in self.filters)
-        if not missing or self._filters_busy or time.time() - self._filters_retry_ts < FUNDING_FILTERS_RETRY_S:
+    def _apply_contract_info(self, d: dict) -> None:
+        """Evento de !contractInfo: un contrato cambió de estado (listado nuevo, liquidación, deslistado…)."""
+        sym = str(d.get("s") or d.get("ps") or "").upper()
+        cs = str(d.get("cs") or "")
+        if not sym.endswith(QUOTE_ASSET) or not cs:
             return
+        if d.get("ct") and d.get("ct") != "PERPETUAL":
+            return
+        if cs == "TRADING":
+            was = self._not_trading.pop(sym, None)
+            if sym not in self.filters:
+                self.log(f"[contratos] {sym} pasa a TRADING{f' (antes {was})' if was else ''}: pido sus filtros")
+                self._funding_ensure_filters([sym], force=True)
+            elif was:
+                self.log(f"[contratos] {sym} vuelve a TRADING (antes {was})")
+        elif self._not_trading.get(sym) != cs:
+            self._not_trading[sym] = cs
+            self.log(f"[contratos] {sym} → {cs}: deja de ser operable")
+
+    async def _contract_info_loop(self) -> None:
+        """!contractInfo siempre conectado (como el executor): casi no hay tráfico, solo cambios de estado."""
+        idx, backoff = 0, 2.0
+        while self.running:
+            url = CONTRACT_INFO_WS_URLS[idx % len(CONTRACT_INFO_WS_URLS)]
+            t0 = time.time()
+            try:
+                async for raw in _ws_messages(url):
+                    backoff = 2.0
+                    try:
+                        d = json.loads(raw)
+                    except ValueError:
+                        continue
+                    d = d.get("data", d) if isinstance(d, dict) else None
+                    if isinstance(d, dict) and d.get("e") == "contractInfo":
+                        self._apply_contract_info(d)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if time.time() - t0 < 5:
+                    idx += 1                                 # no conectó: probar la siguiente URL
+                    self.log(f"[contratos] {url}: {exc!r}")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 300.0)
+
+    def _funding_operable(self, sym: str) -> Optional[bool]:
+        """True: perpetuo USDT en TRADING (tiene filtros y !contractInfo no dijo lo contrario). False: seguro que no se
+        puede operar. None: aún no se sabe (no está en un exchangeInfo viejo; se está pidiendo otro)."""
+        if sym in self._not_trading:
+            return False
+        if sym in self.filters:
+            return True
+        if self._filters_ok_ts and time.time() - self._filters_ok_ts < 2 * 3600 and not self._filters_busy:
+            return False                                    # exchangeInfo reciente y no está: no es operable
+        return None
+
+    def _funding_ensure_filters(self, syms, force: bool = False) -> None:
+        """Pares con funding alto sin filtros de cantidad (p. ej. listados después de la última caché de exchangeInfo):
+        pide exchangeInfo otra vez en segundo plano, primero por la API WebSocket de futuros (sin REST), como mucho
+        una vez cada FUNDING_FILTERS_RETRY_S (force: un listado nuevo avisado por !contractInfo)."""
+        missing = sorted(s for s in syms if s not in self.filters and s not in self._not_trading)
+        if not missing or self._filters_busy:
+            return
+        if not force and time.time() - self._filters_retry_ts < FUNDING_FILTERS_RETRY_S:
+            return
+        if not force and self._filters_ok_ts and time.time() - self._filters_ok_ts < 2 * 3600:
+            return                                          # exchangeInfo reciente: los que faltan no son operables
         if not self._on_loop():
             return
         self._filters_retry_ts = time.time()
@@ -4337,8 +4590,19 @@ class KlineBot:
 
         async def run() -> None:
             try:
-                self.log(f"[funding] sin filtros de cantidad para {', '.join(missing[:10])}: pido exchangeInfo de nuevo")
-                got = await self._fetch_exchange_info()
+                self.log(f"[funding] sin filtros de cantidad para {', '.join(missing[:10])}: pido exchangeInfo de nuevo "
+                         f"(API WebSocket de futuros)")
+                try:
+                    got = self._exchange_filters_checked(await self._ws_exchange_info())
+                    self._filters_from_file = False
+                except Exception as exc:
+                    self.log(f"[funding] exchangeInfo por WebSocket falló ({exc}); pruebo la ruta normal")
+                    got = await self._fetch_exchange_info()
+                if not self._filters_from_file:
+                    self._filters_ok_ts = time.time()
+                    with self.lock:
+                        for sym in got:
+                            self._not_trading.pop(sym, None)
                 if self._filters_from_file:
                     self.log("[funding] exchangeInfo no respondió (solo el archivo de respaldo): sigo sin esos filtros")
                     got = {k: v for k, v in got.items() if k not in self.filters}   # el archivo solo suma, no pisa
@@ -4348,6 +4612,9 @@ class KlineBot:
                     self.symbols = sorted(self.filters)
                 if added:
                     self.log(f"[funding] filtros nuevos: {', '.join(added[:15])}")
+                still = [s for s in missing if s not in self.filters]
+                if still and not self._filters_from_file:
+                    self.log(f"[funding] no son operables en futuros (no están en TRADING en exchangeInfo): {', '.join(still[:10])}")
             except Exception as exc:
                 self.log(f"[funding] ✗ exchangeInfo: {exc}")
             finally:
@@ -4375,7 +4642,9 @@ class KlineBot:
         umbral y deja el seguimiento en vivo de los que están cerca (el funding cambia hasta el cobro)."""
         rows = await self._funding_scan()
         thr = self.funding_cfg["min_pct"]
-        due = [r for r in rows if abs(r["next_ts"] - ts) <= 1.5]
+        due_all = [r for r in rows if abs(r["next_ts"] - ts) <= 1.5]
+        nope = [r for r in due_all if abs(r["rate_pct"]) >= thr and self._funding_operable(r["symbol"]) is False]
+        due = [r for r in due_all if self._funding_operable(r["symbol"]) is not False]   # solo operables en futuros
         cands = [r for r in due if abs(r["rate_pct"]) >= thr]
         later = [r for r in rows if abs(r["rate_pct"]) >= thr and abs(r["next_ts"] - ts) > 1.5]
         with self.lock:
@@ -4389,6 +4658,11 @@ class KlineBot:
         self._funding_ensure_filters([r["symbol"] for r in cands])
         extra = (f" · {len(later)} con funding alto cobran más tarde (intervalo 4/8 h): "
                  + ", ".join(f"{r['symbol']} {_utc(r['next_ts'], '%H:%M')}" for r in later[:5])) if later else ""
+        if nope:
+            extra += (f" · {len(nope)} con funding alto NO operables en futuros (se ignoran): "
+                      + ", ".join(f"{r['symbol']} {r['rate_pct']:+.3f}%"
+                                  + (f" [{self._not_trading[r['symbol']]}]" if r['symbol'] in self._not_trading else "")
+                                  for r in nope[:5]))
         if rows:
             src = self._funding_src
             info = (f"{len(rows)} pares leídos (WebSocket {src.get('ws', 0)} en {self._funding_snap_msgs} mensajes"
@@ -4482,7 +4756,7 @@ class KlineBot:
             fell = [s for s in self._funding_launched
                     if s in self._funding_live and abs(self._funding_live[s]["rate_pct"]) < thr]
             self._funding_over = sum(1 for row in self._funding_rows if abs(row["rate_pct"]) >= thr)
-        self.log(f"[funding] seguimiento en vivo de {len(syms)} par(es) cerca de ±{thr0:g}%: {msgs} actualizaciones"
+        self.log(f"[funding] seguimiento en vivo de {len(syms)} par(es) (≥ {FUNDING_TRACK_RATIO:g}× ±{thr0:g}%): {msgs} actualizaciones"
                  + (f" · entraron {', '.join(joined)}" if joined else "")
                  + (f" · bajaron del umbral (no se abren): {', '.join(sorted(fell))}" if fell else "")
                  + ("" if msgs else " · ✗ el stream no respondió: se opera con la consulta de 3 min antes"))
@@ -4526,6 +4800,8 @@ class KlineBot:
 
         def skip(action: str) -> None:
             self._funding_signal(sym, side, rate, ts, mark, action)
+            if action != "pausado":                     # que quede en el log por qué NO salió la señal
+                self.log(f"[{eng.label}] {side} {sym} (funding {rate:+.4f}%) NO se abre: {action}")
 
         left = ts - self._srv_now()
         if left <= max(FUNDING_MIN_LEAD_S, 0.05):
@@ -4542,8 +4818,10 @@ class KlineBot:
             dup = any(p.symbol == sym and p.funding_ts == ts for p in eng.positions.values())
         if dup:
             return skip("ya hay una abierta para este cobro")
+        if sym in self._not_trading:
+            return skip(f"no operable en futuros (estado {self._not_trading[sym]})")
         if sym not in self.filters:
-            return skip("saltada: sin filtros del símbolo (exchangeInfo no cargó)")
+            return skip("no operable en futuros o sin filtros (no está en TRADING en exchangeInfo)")
         price = self._live_price(sym)
         src = "precio en vivo"
         if not price:
@@ -4554,7 +4832,6 @@ class KlineBot:
         qty, eff, why = size_order(self.funding_cfg["notional"], price, f.get("stepSize", 0.001),
                                    f.get("minQty", 0.0), f.get("minNotional", 5.0), MAX_NOTIONAL_OVER)
         if qty <= 0:
-            self.log(f"[{eng.label}] {side} {sym} saltada: {why}")
             return skip(f"saltada: {why}")
         pos = Position(
             trade_id=self._next_trade_id(), symbol=sym, direction=side, entry_price=price, qty=qty,
@@ -4621,6 +4898,8 @@ class KlineBot:
             r["next"] = _utc(r["next_ts"], "%H:%M") if r["next_ts"] else ""
             r["in_s"] = round(r["next_ts"] - now) if r["next_ts"] else None
             r["over"] = abs(r["rate_pct"]) >= c["min_pct"]
+            r["operable"] = self._funding_operable(r["symbol"]) is not False
+            r["status"] = self._not_trading.get(r["symbol"], "")
             r["due"] = bool(r["next_ts"]) and abs(r["next_ts"] - ts) <= 1.5   # cobra en el cobro que apunta el bot
         return {"cfg": c, "rows": top, "over": self._funding_over, "scans": self.funding_scans,
                 "errors": self.funding_errors, "last_error": self.funding_last_error,
@@ -6286,17 +6565,17 @@ function render(d) {
   q('fdCurMin').textContent = `(ahora ±${fdc.min_pct}%)`; q('fdCurNot').textContent = `(ahora ${fdc.notional})`;
   q('fdCurOpen').textContent = `(ahora ${fdc.open_before_s} s)`; q('fdCurClose').textContent = `(ahora ${fdc.close_after_s} s)`;
   q('fdCurScan').textContent = `(ahora ${fdc.scan_before_s} s)`;
-  q('fdNote').innerHTML = `Antes de cada cobro (horas en punto UTC) consulta el funding de <b>todos</b> los pares ${fdc.scan_before_s} s antes (WebSocket, sin REST) y sigue en vivo hasta abrir los que están cerca del umbral: si uno lo cruza entra, si baja no se abre. `
+  q('fdNote').innerHTML = `Antes de cada cobro (horas en punto UTC) escucha el funding de <b>todos</b> los símbolos operables en futuros ${fdc.scan_before_s} s antes (WebSocket, hasta tenerlos todos, máx. 60 s; REST solo de respaldo, como mucho 1 vez por hora). Los que cumplen quedan suscritos en vivo hasta abrir (si el funding baja del umbral, no se abre); el resto se suelta hasta el próximo cobro. ${fd.src && fd.src.want ? 'Último escaneo: ' + fd.src.have + '/' + fd.src.want + ' operables en ' + fd.src.wait_s + ' s. ' : ''}`
     + `Si un par tiene funding ≥ +${fdc.min_pct}% abre <b>SHORT</b> (los LONG le pagan); si es ≤ −${fdc.min_pct}%, <b>LONG</b>. Entra ${fdc.open_before_s} s antes del cobro, `
     + `manda la orden al executor al instante con el precio en vivo (la entrada en papel se corrige después con el libro) y cierra ${fdc.close_after_s} s después. El PnL suma el funding cobrado. `
     + `Próximo cobro ${esc(fd.next || '—')} UTC (en <b data-cd="${fd.next_ts || 0}" data-off="0" data-done="cobrando">${cdFmt(fd.next_in_s || 0)}</b>) · última consulta ${esc(fd.last_scan || '—')}${fd.scan_ms ? ' (' + fd.scan_ms + ' ms)' : ''}${fd.src && fd.src.total ? ': ' + fd.src.total + ' pares (WebSocket ' + fd.src.ws + ' · REST ' + fd.src.rest + ')' : ''} · `
     + `${fd.over || 0} par(es) ≥ umbral · reloj Binance ${fd.clock_off_ms >= 0 ? '+' : ''}${fd.clock_off_ms || 0} ms${fd.clock_age_s == null ? ' <span class="neg">(sin sincronizar)</span>' : ' (medido hace ' + dur(fd.clock_age_s) + ', latencia ' + (fd.clock_rtt_ms || 0) + ' ms)'}${fd.clock_diff_ms != null ? ' · vs proveedores ' + (fd.clock_diff_ms >= 0 ? '+' : '') + fd.clock_diff_ms + ' ms ' + (fd.clock_agree ? '✓' : '<span class=\"neg\">⚠ difieren</span>') : (fd.clock_age_s != null ? ' · sin proveedores externos' : '')}${fd.watch && fd.watch.ts ? ' · exploración horaria: ' + fd.watch.scanned + ' pares en ' + fd.watch.elapsed_s + ' s, ' + fd.watch.n + ' ≥ umbral' : ''}${fd.loop_lag_ms > 500 ? ` · <span class="neg">loop con retraso ${fd.loop_lag_ms} ms</span>` : ''}${fd.last_error ? ` · <span class="neg">${esc(fd.last_error)}</span>` : ''}`;
   if (view === 'bots') q('fdTbl').innerHTML = (fd.rows || []).map(z => {
       const cobro = z.next_ts ? `<b data-cd="${z.next_ts}" data-off="0" data-done="cobrado">${cdFmt(z.in_s || 0)}</b>` : '—';
-      const pick = z.over && z.due;
+      const pick = z.over && z.due && z.operable !== false;
       const abre = pick ? ` <span class="muted">abre en <span data-cd="${z.next_ts}" data-off="${fdc.open_before_s || 0}" data-done="abriendo">${cdFmt((z.in_s || 0) - (fdc.open_before_s || 0))}</span></span>` : '';
       return `<tr><td><b>${esc(z.symbol)}</b></td><td class="${z.over ? (z.rate_pct > 0 ? 'neg' : 'pos') : 'muted'}">${z.rate_pct > 0 ? '+' : ''}${(+z.rate_pct).toFixed(4)}%</td>
-      <td>${esc(z.next)}</td><td>${cobro}</td><td>${num(z.mark, 8)}</td><td>${pick ? tag(z.rate_pct > 0 ? 'SHORT' : 'LONG') + abre : z.over ? '<span class="muted">funding alto, pero cobra más tarde</span>' : '<span class="muted">no cumple</span>'}</td></tr>`;
+      <td>${esc(z.next)}</td><td>${cobro}</td><td>${num(z.mark, 8)}</td><td>${pick ? tag(z.rate_pct > 0 ? 'SHORT' : 'LONG') + abre : z.operable === false ? `<span class="muted">no operable en futuros${z.status ? ' (' + esc(z.status) + ')' : ''}</span>` : z.over ? '<span class="muted">funding alto, pero cobra más tarde</span>' : '<span class="muted">no cumple</span>'}</td></tr>`;
     }).join('')
     || '<tr><td colspan="6" class="muted">Aún no hay consulta del funding</td></tr>';
   tickCountdowns();
@@ -6404,7 +6683,8 @@ function render(d) {
       + (r.filters === 0 ? ` · <span class="neg">sin filtros de cantidad (exchangeInfo): no se puede abrir</span>` : '')
       + (r.ticker_error && !r.ticker_connected ? ` · <span class="warn">24 h: ${esc(r.ticker_error)}</span>` : '')
       + (r.rest_blocked_s > 0 ? ` · <span class="neg">ratio en pausa ${dur(r.rest_blocked_s)} (418/429 en todas las rutas)</span>` : '')
-      + ((r.routes || []).length ? ` · REST Binance: ${esc((r.routes.find(x => x.current) || r.routes[0]).route)}${(r.routes.find(x => x.current) || {}).weight != null ? ` (peso ${(r.routes.find(x => x.current)).weight}/min)` : ''}, ${r.routes.filter(x => !x.blocked_s).length}/${r.routes.length} rutas libres` : '')
+      + ((r.routes || []).length ? ` · REST Binance: ${esc((r.routes.find(x => x.current) || r.routes[0]).route)}${(r.routes.find(x => x.current) || {}).weight != null ? ` (peso ${(r.routes.find(x => x.current)).weight}/min)` : ''}, ${r.routes.filter(x => !x.blocked_s).length}/${r.routes.length} rutas libres`
+        + (r.routes[0] && r.routes[0].blocked_s > 0 ? ` · <span class="neg">IP pública vetada por Binance, se reintenta en ${dur(r.routes[0].blocked_s)}</span>` : '') : '')
       + (r.last_error ? ` · <span class="warn">${esc(r.last_error)}</span>` : '');
     q('tRt').innerHTML = r.rows.map(z => `<tr>
       <td><b>${esc(z.symbol)}</b></td><td>${z.pct24 === null ? '—' : pct(z.pct24)}</td><td>${num(z.price, 8)}</td>

@@ -199,6 +199,7 @@ def test_seguimiento_entra_si_cruza_y_no_abre_si_baja(tmp_path, monkeypatch):
     bot._refine_entry = lambda *a, **k: None
     bot.funding_cfg.update(open_before_s=0.6, close_after_s=0.1)
     monkeypatch.setattr(st, "FUNDING_TRACK_END_S", 0.05)
+    monkeypatch.setattr(st, "FUNDING_TRACK_RATIO", 0.5)              # también los cercanos
     eng = bot.engines[st.ENGINE_FUNDING]
     urls = []
 
@@ -270,35 +271,57 @@ def test_la_consulta_final_es_3_min_antes_aunque_se_guardara_menos():
 
 
 def test_la_consulta_une_rest_y_websocket(tmp_path, monkeypatch):
-    """El REST de premiumIndex trae todos los pares; los que el WebSocket no trajo no se pierden."""
+    """REST solo de respaldo: si el WebSocket no trajo a todos los operables, una vez por hora."""
     bot = _bot_sin_red(tmp_path, monkeypatch)
-    bot._rest_get = lambda path, *a, **k: [
-        {"symbol": "AUSDT", "markPrice": "1.1", "lastFundingRate": "0.0035", "nextFundingTime": 3600000},
-        {"symbol": "BUSDT", "markPrice": "2", "lastFundingRate": "-0.004", "nextFundingTime": 3600000},
-        {"symbol": "ABTC", "markPrice": "1", "lastFundingRate": "0.01", "nextFundingTime": 3600000}]
+    bot.filters = {s: {"stepSize": 1, "minQty": 0, "minNotional": 5} for s in ("AUSDT", "BUSDT")}
+    llamadas = []
 
-    async def ws(*a, **k):
+    def rest(path, *a, **k):
+        llamadas.append(path)
+        return [{"symbol": "AUSDT", "markPrice": "1.1", "lastFundingRate": "0.0035", "nextFundingTime": 3600000},
+                {"symbol": "BUSDT", "markPrice": "2", "lastFundingRate": "-0.004", "nextFundingTime": 3600000},
+                {"symbol": "ABTC", "markPrice": "1", "lastFundingRate": "0.01", "nextFundingTime": 3600000}]
+    bot._rest_get = rest
+    vistos = []
+
+    async def ws(max_s, cap, want):
+        vistos.append(set(want))
         return [{"symbol": "AUSDT", "rate_pct": 0.36, "next_ts": 3600.0, "mark": 1.2}]
     bot._funding_ws_snapshot = ws
-    assert len(asyncio.run(bot._funding_full_snapshot())) == 1         # sin rest=True: solo WebSocket
+    assert len(asyncio.run(bot._funding_full_snapshot())) == 1          # sin rest=True: solo WebSocket
+    assert vistos[0] == {"AUSDT", "BUSDT"} and llamadas == []           # espera a la lista fija de operables
     rows = {r["symbol"]: r for r in asyncio.run(bot._funding_full_snapshot(rest=True))}
-    assert set(rows) == {"AUSDT", "BUSDT"}
-    assert rows["AUSDT"]["rate_pct"] == pytest.approx(0.36)          # del WebSocket (más reciente)
-    assert rows["BUSDT"]["rate_pct"] == pytest.approx(-0.4) and rows["BUSDT"]["next_ts"] == 3600.0
-    assert bot._funding_src["only_rest"] == 1
+    assert set(rows) == {"AUSDT", "BUSDT"} and len(llamadas) == 1      # faltaba BUSDT: REST de respaldo
+    assert rows["AUSDT"]["rate_pct"] == pytest.approx(0.36)             # del WebSocket (más reciente)
+    assert rows["BUSDT"]["rate_pct"] == pytest.approx(-0.4)
+    assert bot._funding_src["have"] == 2 and bot._funding_src["want"] == 2
+    asyncio.run(bot._funding_full_snapshot(rest=True))
+    assert len(llamadas) == 1                                           # ya se pidió esta hora: no repite
 
-    async def ws_caido(*a, **k):
-        raise RuntimeError("sin WebSocket")
-    llamadas = []
-    rest0 = bot._rest_get
-    bot._rest_get = lambda *a, **k: llamadas.append(1) or rest0(*a, **k)
-    bot._funding_ws_snapshot = ws_caido
-    with pytest.raises(RuntimeError):                                    # REST ya pedido esta hora: no repite
-        asyncio.run(bot._funding_full_snapshot(rest=True))
-    assert llamadas == []
+    async def ws_todos(max_s, cap, want):
+        return [{"symbol": s, "rate_pct": 0.1, "next_ts": 3600.0, "mark": 1.0} for s in want]
+    bot._funding_ws_snapshot = ws_todos
     bot._funding_rest_ts = 0.0
-    assert len(asyncio.run(bot._funding_full_snapshot(rest=True))) == 2  # con una sola fuente basta
-    assert llamadas == [1]
+    asyncio.run(bot._funding_full_snapshot(rest=True))
+    assert len(llamadas) == 1                                           # el WebSocket trajo todos: nada de REST
+
+
+def test_el_escaneo_corta_cuando_tiene_a_todos_los_operables(tmp_path, monkeypatch):
+    import json
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    ts = 3600 * 1000
+    lotes = [[_mark("AUSDT", 0.1, ts)], [_mark("AUSDT", 0.1, ts)], [_mark("AUSDT", 0.1, ts)],
+             [_mark("BUSDT", 0.5, ts)], [_mark("CUSDT", 0.5, ts)]]
+    leidos = []
+
+    async def fake_ws(url):
+        for lote in lotes:
+            leidos.append(1)
+            yield json.dumps(lote)
+
+    monkeypatch.setattr(st, "_ws_messages", fake_ws)
+    rows = asyncio.run(bot._funding_ws_snapshot(30, None, {"AUSDT", "BUSDT"}))
+    assert len(leidos) == 4 and {r["symbol"] for r in rows} == {"AUSDT", "BUSDT"}   # no paró por mensajes repetidos
 
 
 def test_un_par_que_un_escaneo_no_trajo_no_desaparece(tmp_path, monkeypatch):
@@ -309,3 +332,46 @@ def test_un_par_que_un_escaneo_no_trajo_no_desaparece(tmp_path, monkeypatch):
     assert {r["symbol"] for r in bot._funding_remember([b])} == {"AUSDT", "BUSDT"}
     monkeypatch.setattr(st, "FUNDING_CACHE_TTL_S", -1)                    # caducado: ya no cuenta
     assert bot._funding_remember([]) == []
+
+
+def test_solo_opera_contratos_en_trading(tmp_path, monkeypatch):
+    """!markPrice@arr trae también contratos en liquidación/deslistado: esos se ignoran y queda en el log."""
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    for s in ("AUSDT", "BUSDT"):
+        bot.filters[s] = {"stepSize": 1, "minQty": 0, "minNotional": 5}
+    bot._price = lambda sym: 1.0
+    bot._refine_entry = lambda *a, **k: None
+    bot.funding_cfg.update(open_before_s=0.6, close_after_s=0.1)
+    monkeypatch.setattr(st, "FUNDING_TRACK", False)
+    bot._filters_ok_ts = time.time()                     # exchangeInfo recién pedido: lo que falta no es operable
+    bot._apply_contract_info({"e": "contractInfo", "s": "BUSDT", "ct": "PERPETUAL", "cs": "SETTLING"})
+    assert bot._funding_operable("BUSDT") is False and bot._funding_operable("CUSDT") is False
+    assert bot._funding_operable("AUSDT") is True
+    eng = bot.engines[st.ENGINE_FUNDING]
+
+    async def run():
+        bot.loop = asyncio.get_running_loop()
+        ts = time.time() + 0.9
+
+        async def snap(*a, **k):
+            return [{"symbol": s, "rate_pct": 0.5, "next_ts": ts, "mark": 1.0} for s in ("AUSDT", "BUSDT", "CUSDT")]
+        bot._funding_ws_snapshot = snap
+        await bot._funding_cycle(ts)
+        await asyncio.sleep(0.6)
+        return {p.symbol for p in eng.positions.values()}
+
+    assert asyncio.run(run()) == {"AUSDT"}
+    assert any("NO operables" in e and "BUSDT" in e and "CUSDT" in e for e in bot.events)
+    bot._apply_contract_info({"e": "contractInfo", "s": "BUSDT", "ct": "PERPETUAL", "cs": "TRADING"})
+    assert bot._funding_operable("BUSDT") is True
+
+
+def test_si_no_abre_queda_en_el_log_el_motivo(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    bot.max_open = 1
+    bot._price = lambda sym: 1.0
+    eng = bot.engines[st.ENGINE_FUNDING]
+    ts = bot._srv_now() + 5
+    assert bot._funding_open("AUSDT", st.SHORT, 0.5, ts, 1.0) is not None
+    assert bot._funding_open("ZUSDT", st.SHORT, 0.6, ts, 1.0) is None
+    assert any("ZUSDT" in e and "NO se abre" in e and "límite" in e for e in bot.events)
