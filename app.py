@@ -1043,12 +1043,18 @@ class Engine:
 # BOT
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Tipos de contrato perpetuo que se consideran operables. Binance tiene los cripto ("PERPETUAL") y los TradFi
+# ("TRADIFI_PERPETUAL": acciones y materias primas como TSLAUSDT o XAUUSDT), que también se abren en futuros.
+PERP_CONTRACT_TYPES = {t.strip().upper() for t in os.getenv(
+    "PERP_CONTRACT_TYPES", "PERPETUAL,TRADIFI_PERPETUAL").split(",") if t.strip()}
+
+
 def exchange_filters(data: dict) -> Dict[str, Dict[str, float]]:
-    """Filtros de cantidad (stepSize, minQty, minNotional) de los perpetuos USDT en TRADING."""
+    """Filtros de cantidad (stepSize, minQty, minNotional) de los perpetuos USDT en TRADING (cripto y TradFi)."""
     data = data.get("result", data) if isinstance(data, dict) else {}
     out: Dict[str, Dict[str, float]] = {}
     for s in data.get("symbols", []):
-        if (s.get("quoteAsset") != QUOTE_ASSET or s.get("contractType") != "PERPETUAL"
+        if (s.get("quoteAsset") != QUOTE_ASSET or s.get("contractType") not in PERP_CONTRACT_TYPES
                 or s.get("status") != "TRADING"):
             continue
         row = {"stepSize": 0.001, "minQty": 0.0, "minNotional": 5.0}
@@ -2034,6 +2040,10 @@ class KlineBot:
         except Exception:
             pass
         age_h = (time.time() - float(cached.get("saved_at", 0))) / 3600 if cached else None
+        types = sorted(PERP_CONTRACT_TYPES)
+        if cached and cached.get("contract_types", ["PERPETUAL"]) != types:
+            cached = None                                   # caché hecha con otros tipos de contrato: se rehace
+            age_h = None
         if cached and cached.get("filters") and age_h is not None and age_h < SYMBOL_REFRESH_HOURS:
             self.filters = dict(cached["filters"])
             self._filters_ts = float(cached.get("saved_at", 0))
@@ -2049,7 +2059,7 @@ class KlineBot:
                     tmp = f"{SYMBOLS_CACHE_FILE}.tmp"
                     with open(tmp, "w", encoding="utf-8") as fh:
                         json.dump({"symbols": sorted(self.filters), "filters": self.filters,
-                                   "saved_at": time.time()}, fh)
+                                   "saved_at": time.time(), "contract_types": types}, fh)
                     os.replace(tmp, SYMBOLS_CACHE_FILE)
             except Exception as exc:
                 self.last_error = str(exc)
@@ -4523,7 +4533,7 @@ class KlineBot:
         cs = str(d.get("cs") or "")
         if not sym.endswith(QUOTE_ASSET) or not cs:
             return
-        if d.get("ct") and d.get("ct") != "PERPETUAL":
+        if d.get("ct") and str(d.get("ct")).upper() not in PERP_CONTRACT_TYPES:
             return
         if cs == "TRADING":
             was = self._not_trading.pop(sym, None)
