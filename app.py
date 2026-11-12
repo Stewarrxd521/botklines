@@ -274,6 +274,8 @@ FUNDING_CLOCK_SYNC_BEFORE_S = float(os.getenv("FUNDING_CLOCK_SYNC_BEFORE_S", "30
 # Además, el reloj se re-mide solo (rápido, solo Binance, ~1 KB) cada FUNDING_CLOCK_RESYNC_S aunque no haya
 # cobro cerca, para que el ancla nunca envejezca (el reloj del servidor deriva unos ms por hora). 0 = apagado.
 FUNDING_CLOCK_RESYNC_S = float(os.getenv("FUNDING_CLOCK_RESYNC_S", "600"))
+# Segunda sincronización completa, 2 min antes del cobro, por si algo cambió desde la de 5 min. 0 = apagada.
+FUNDING_CLOCK_RECHECK_BEFORE_S = float(os.getenv("FUNDING_CLOCK_RECHECK_BEFORE_S", "120"))
 FUNDING_CLOCK_QUIET_S = 20.0       # la re-medición periódica no se hace tan cerca de la apertura
 FUNDING_MIN_LEAD_S = float(os.getenv("FUNDING_MIN_LEAD_S", "0.4"))       # si al abrir faltan menos s, NO se entra (no alcanzaría el cobro)
 FUNDING_OPEN_MIN_S = round(max(0.2, FUNDING_MIN_LEAD_S + 0.1), 2)      # mínimo de "abrir N s antes del cobro"
@@ -1320,6 +1322,7 @@ class KlineBot:
         self._clock_synced_for = 0                    # cobro para el que ya se sincronizó el reloj
         self._clock_next_try = 0.0
         self._clock_busy = False                      # hay una medición del reloj en curso
+        self._clock_rechecked_for = 0                 # cobro para el que ya se hizo la sync de 2 min antes
         self.loop_lag_ms = 0.0                        # mayor retraso reciente del event loop
         self.funding_scans = 0
         self._funding_ws_ok = ""                      # última URL del stream de funding que respondió
@@ -4164,22 +4167,36 @@ class KlineBot:
         return res
 
     async def _clock_keeper_loop(self) -> None:
-        """Re-mide el reloj cada FUNDING_CLOCK_RESYNC_S (verificación rápida, solo Binance) si la última medición
-        es más vieja que eso. No lo hace a menos de FUNDING_CLOCK_QUIET_S de la apertura del funding, donde ya
-        están la sync completa (5 min antes) y la verificación de último momento."""
-        if FUNDING_CLOCK_RESYNC_S <= 0:
-            return
+        """Guardián del reloj, aparte de _funding_loop (que a 3 min del cobro está ocupado con la consulta):
+          • sync completa FUNDING_CLOCK_RECHECK_BEFORE_S (2 min) antes de cada cobro, además de la de 5 min;
+          • re-medición rápida (solo Binance) cada FUNDING_CLOCK_RESYNC_S si la última es más vieja.
+        Nada a menos de FUNDING_CLOCK_QUIET_S de la apertura: ahí está la verificación de último momento."""
         await asyncio.sleep(60.0)                            # la primera sync la hace _funding_loop al arrancar
         while self.running:
+            now_srv = self._srv_now()
+            target = self._funding_target_ts or next_funding_ts(now_srv, 0.0)
+            left = target - now_srv                          # hasta el cobro
+            to_open = left - self.funding_cfg["open_before_s"]
+            quiet = -5.0 < to_open < FUNDING_CLOCK_QUIET_S
+            recheck = FUNDING_CLOCK_RECHECK_BEFORE_S
+            if (recheck > 0 and self._clock_rechecked_for != target and left <= recheck
+                    and to_open > FUNDING_CLOCK_QUIET_S):
+                self._clock_rechecked_for = target           # una vez por cobro, salga bien o no
+                await self._funding_clock_sync(full=True)
+                continue
             age = time.time() - self.funding_clock_ts if self.funding_clock_ts else 1e9
-            target = self._funding_target_ts or next_funding_ts(self._srv_now(), 0.0)
-            left = target - self.funding_cfg["open_before_s"] - self._srv_now()
-            if age >= FUNDING_CLOCK_RESYNC_S and not (-5.0 < left < FUNDING_CLOCK_QUIET_S) and not self._clock_busy:
+            if FUNDING_CLOCK_RESYNC_S > 0 and age >= FUNDING_CLOCK_RESYNC_S and not quiet and not self._clock_busy:
                 await self._funding_clock_sync(full=False)
                 if time.time() - self.funding_clock_ts > FUNDING_CLOCK_RESYNC_S:
                     await asyncio.sleep(30.0)                # falló: reintenta en 30 s, no en bucle
                     continue
-            await asyncio.sleep(max(5.0, min(FUNDING_CLOCK_RESYNC_S - age, 60.0)) if age < FUNDING_CLOCK_RESYNC_S else 10.0)
+                age = 0.0
+            nxt = [60.0]
+            if FUNDING_CLOCK_RESYNC_S > 0:
+                nxt.append(max(FUNDING_CLOCK_RESYNC_S - age, 10.0))
+            if recheck > 0 and self._clock_rechecked_for != target and left > recheck:
+                nxt.append(left - recheck)
+            await asyncio.sleep(max(min(nxt), 1.0))
 
     async def _funding_clock_sync(self, full: bool = True) -> bool:
         """Mide la hora de Binance (y, en la completa, la de proveedores externos), las compara y fija el ancla

@@ -275,6 +275,7 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 | `REST_PROXY_URLS` | 5 proxies Fixie | Proxies (separadas por comas) para el REST de Binance cuando la IP directa está vetada; rotan. `REST_PROXY_URL` añade una más. |
 | `REST_BAN_RETRY_CYCLES` | `2` | Tras un 418/429, ciclos del ratio (5 min) que descansa esa ruta antes de volver a probarla con 1 petición. |
 | `FUNDING_CLOCK_SYNC_BEFORE_S` | `300` | Sincronización completa del reloj con Binance antes de cada cobro (5 min). |
+| `FUNDING_CLOCK_RECHECK_BEFORE_S` | `120` | Segunda sincronización completa del reloj, 2 min antes del cobro. `0` la apaga. |
 | `FUNDING_CLOCK_RESYNC_S` | `600` | Re-medición rápida del reloj (solo Binance, ~1 KB) cada 10 min aunque no haya cobro cerca. `0` la apaga. |
 | `SYMBOL_REFRESH_HOURS` | `240` | Cada cuánto se renueva `exchangeInfo` (filtros de cantidad): 10 días. |
 | `RATIO_TP_PCT` | `10` | Bots `ratio` y `ratio_rev`: take profit por precio, % a favor (0 = sin TP). |

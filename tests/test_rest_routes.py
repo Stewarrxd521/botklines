@@ -128,3 +128,29 @@ def test_reloj_se_re_mide_solo_si_envejece(tmp_path, monkeypatch):
     asyncio.run(bot._clock_keeper_loop())
     assert llamadas == [False]                                # verificación rápida, solo Binance
     assert st.FUNDING_CLOCK_SYNC_BEFORE_S == 300              # la completa, 5 min antes del cobro
+
+
+def test_reloj_sync_completa_tambien_2_min_antes(tmp_path, monkeypatch):
+    import asyncio
+    bot = _bot(tmp_path, monkeypatch)
+    llamadas = []
+
+    async def sync(full=True):
+        llamadas.append(full)
+        bot.funding_clock_ts = time.time()
+        bot.running = False
+        return True
+
+    real_sleep = asyncio.sleep
+
+    async def rapido(s):
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", rapido)
+    bot._funding_clock_sync = sync
+    bot.running = True
+    bot.funding_clock_ts = time.time()                      # medición reciente (la de 5 min)
+    bot._funding_target_ts = int(bot._srv_now()) + 110       # faltan 110 s para el cobro
+    asyncio.run(bot._clock_keeper_loop())
+    assert llamadas == [True]
+    assert st.FUNDING_CLOCK_RECHECK_BEFORE_S == 120
