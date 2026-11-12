@@ -237,12 +237,15 @@ FUNDING_REST_MIN_INTERVAL_S = float(os.getenv("FUNDING_REST_MIN_INTERVAL_S", "30
 # FUNDING_CACHE_TTL_S: un par que un escaneo por WebSocket no trajo no desaparece de la lista.
 FUNDING_CACHE_TTL_S = float(os.getenv("FUNDING_CACHE_TTL_S", "900"))
 FUNDING_COLLECT_MAX_S = float(os.getenv("FUNDING_COLLECT_MAX_S", "12"))
+# Escaneo de la hora: con la lista fija de operables, se escucha !markPrice@arr hasta tener el funding de TODOS
+# (si llegan antes, corta antes) y como mucho FUNDING_SCAN_WAIT_S segundos.
+FUNDING_SCAN_WAIT_S = float(os.getenv("FUNDING_SCAN_WAIT_S", "60"))
 # Seguimiento en vivo tras la consulta final: el funding de Binance es una ESTIMACIÓN que cambia hasta el cobro.
 # Los pares que cobran en esa hora y están a ≥ FUNDING_TRACK_RATIO del umbral se siguen por su stream propio
 # (<par>@markPrice@1s, pocos pares: poco ancho de banda) hasta FUNDING_TRACK_END_S antes de abrir. Si uno cruza
 # el umbral entra; si uno que cumplía baja del umbral, no se abre.
 FUNDING_TRACK = os.getenv("FUNDING_TRACK", "true").lower() in ("1", "true", "yes")
-FUNDING_TRACK_RATIO = float(os.getenv("FUNDING_TRACK_RATIO", "0.5"))
+FUNDING_TRACK_RATIO = float(os.getenv("FUNDING_TRACK_RATIO", "1.0"))   # 1.0 = solo los que cumplen; 0.5 = también los cercanos
 FUNDING_TRACK_MAX = int(os.getenv("FUNDING_TRACK_MAX", "40"))
 FUNDING_TRACK_END_S = float(os.getenv("FUNDING_TRACK_END_S", "0.5"))
 FUNDING_TRACK_WS_BASES = [u.strip() for u in os.getenv(
@@ -292,10 +295,10 @@ FUNDING_CLOCK_TOLERANCE_S = float(os.getenv("FUNDING_CLOCK_TOLERANCE_S", "0.15")
 # Exploración horaria propia del bot de funding (independiente de la de los demás bots): lee TODOS los
 # pares por WebSocket, como máximo FUNDING_HOURLY_MAX_SYMBOLS pares y FUNDING_HOURLY_MAX_S segundos, y deja
 # la lista de los que ya cumplen el umbral (se les calienta el precio en vivo antes de la consulta final).
-FUNDING_HOURLY_SCAN = os.getenv("FUNDING_HOURLY_SCAN", "true").lower() in ("1", "true", "yes")
+FUNDING_HOURLY_SCAN = os.getenv("FUNDING_HOURLY_SCAN", "false").lower() in ("1", "true", "yes")   # la de 3 min ya basta
 FUNDING_HOURLY_BEFORE_S = float(os.getenv("FUNDING_HOURLY_BEFORE_S", "300"))      # cuánto antes de cada hora en punto
 FUNDING_HOURLY_MAX_SYMBOLS = int(os.getenv("FUNDING_HOURLY_MAX_SYMBOLS", "3000"))   # tope de seguridad, no de diseño
-FUNDING_HOURLY_MAX_S = float(os.getenv("FUNDING_HOURLY_MAX_S", "30"))
+FUNDING_HOURLY_MAX_S = float(os.getenv("FUNDING_HOURLY_MAX_S", "60"))
 FUNDING_WATCH_PRICE_MAX = int(os.getenv("FUNDING_WATCH_PRICE_MAX", "10"))         # precios en vivo que se calientan
 FUNDING_CLOCK_SAMPLES = int(os.getenv("FUNDING_CLOCK_SAMPLES", "12"))
 FUNDING_CLOCK_MAX_RTT_S = float(os.getenv("FUNDING_CLOCK_MAX_RTT_S", "0.4"))   # muestras más lentas se descartan
@@ -1287,6 +1290,7 @@ class KlineBot:
         self._funding_ws_ok = ""                      # última URL del stream de funding que respondió
         self._funding_track_ok = ""                   # última base del stream combinado que respondió
         self._funding_snap_msgs = 0                   # mensajes que hizo falta juntar en la última consulta
+        self._funding_snap_s = 0.0
         self._funding_src: dict = {}                  # cuántos pares trajo cada fuente en la última consulta
         self._funding_rest_ts = 0.0                   # última vez que se pidió premiumIndex por REST (≤ 1 por hora)
         self._funding_seen: Dict[str, tuple] = {}     # símbolo → (cuándo, última fila vista)
@@ -3892,12 +3896,14 @@ class KlineBot:
             return 0.0
         return funding_income_usd(p.notional, p.funding_rate, p.direction)
 
-    async def _funding_ws_snapshot(self, max_s: Optional[float] = None, cap: Optional[int] = None) -> List[dict]:
-        """Funding de TODOS los perpetuos por WebSocket (!markPrice@arr): se conecta y junta mensajes (el último valor
-        de cada par gana) hasta que dos seguidos no traen pares nuevos (mínimo FUNDING_COLLECT_MIN_S, máximo `max_s`),
-        y se cierra. Un solo mensaje no basta: puede llegar incompleto y entonces faltaban pares que cumplían.
-        Sin REST. NO toca el reloj (ver _funding_clock_sync)."""
+    async def _funding_ws_snapshot(self, max_s: Optional[float] = None, cap: Optional[int] = None,
+                                   want: Optional[set] = None) -> List[dict]:
+        """Funding de TODOS los perpetuos por WebSocket (!markPrice@arr, un solo stream con todo el mercado): junta
+        mensajes (el último valor de cada par gana) y se cierra. Con `want` (la lista fija de operables) corta en cuanto
+        tiene el funding de TODOS ellos, o a los `max_s` s; sin `want`, cuando dos mensajes seguidos no traen pares
+        nuevos (mínimo FUNDING_COLLECT_MIN_S). Sin REST. NO toca el reloj (ver _funding_clock_sync)."""
         max_s = FUNDING_COLLECT_MAX_S if max_s is None else max_s
+        want = set(want or ())
         cap = max(cap or FUNDING_HOURLY_MAX_SYMBOLS, 1)
         t0 = time.monotonic()
         deadline = t0 + max(max_s, 1.0)
@@ -3929,7 +3935,10 @@ class KlineBot:
                         if r["symbol"] in seen or len(seen) < cap:
                             seen[r["symbol"]] = r                   # el último mensaje gana
                     stale = stale + 1 if len(seen) == before else 0
-                    if seen and stale >= 2 and time.monotonic() - t0 >= FUNDING_COLLECT_MIN_S:
+                    if want:
+                        if want.issubset(seen):
+                            break                                   # ya está el funding de todos los operables
+                    elif seen and stale >= 2 and time.monotonic() - t0 >= FUNDING_COLLECT_MIN_S:
                         break                                       # dos mensajes sin pares nuevos: ya están todos
             except Exception as exc:
                 last_exc = exc
@@ -3945,6 +3954,7 @@ class KlineBot:
             self.funding_last_scan_ms = (time.monotonic() - t0) * 1000
             self._funding_ws_ok = url
             self._funding_snap_msgs = msgs
+            self._funding_snap_s = time.monotonic() - t0
             return list(seen.values())
         raise RuntimeError(f"sin funding por WebSocket: {last_exc!r}")
 
@@ -3968,33 +3978,50 @@ class KlineBot:
             raise RuntimeError("premiumIndex: sin pares")
         return rows
 
+    def _funding_universe(self) -> set:
+        """Lista fija de símbolos operables en futuros (perpetuos USDT en TRADING), la que se escanea cada hora."""
+        with self.lock:
+            return {sym for sym in self.filters if sym not in self._not_trading}
+
     async def _funding_full_snapshot(self, max_s: Optional[float] = None, cap: Optional[int] = None,
                                      rest: bool = False) -> List[dict]:
-        """Pares por WebSocket y, solo si rest=True (consulta final) y no se pidió en la última
-        FUNDING_REST_MIN_INTERVAL_S, también premiumIndex por REST en paralelo (lista completa). Se unen: de cada par
-        vale el WebSocket si lo trajo (más reciente) y si no el REST. Con que uno responda, basta."""
+        """Funding de TODOS los operables: !markPrice@arr por WebSocket hasta tener el de cada símbolo de la lista fija
+        (corta antes si ya están todos; como mucho `max_s`, por defecto FUNDING_SCAN_WAIT_S). Si aun así faltan y
+        rest=True, premiumIndex por REST de respaldo, como mucho una vez cada FUNDING_REST_MIN_INTERVAL_S."""
         t0 = time.monotonic()
-        tasks = [self._funding_ws_snapshot(max_s, cap)]
-        if rest and FUNDING_REST_SNAPSHOT and time.time() - self._funding_rest_ts >= FUNDING_REST_MIN_INTERVAL_S:
+        want = self._funding_universe()
+        errs: List[str] = []
+        try:
+            ws = await self._funding_ws_snapshot(FUNDING_SCAN_WAIT_S if max_s is None else max_s, cap, want)
+        except Exception as exc:
+            ws, errs = [], [f"WebSocket: {exc!r}"]
+        got = {r["symbol"] for r in ws}
+        missing = sorted(want - got)
+        rest_rows: List[dict] = []
+        if (rest and FUNDING_REST_SNAPSHOT and (missing or not ws)
+                and time.time() - self._funding_rest_ts >= FUNDING_REST_MIN_INTERVAL_S):
             self._funding_rest_ts = time.time()
-            tasks.append(asyncio.to_thread(self._funding_rest_rows))
-        res = await asyncio.gather(*tasks, return_exceptions=True)
-        ws = res[0] if isinstance(res[0], list) else []
-        rest = res[1] if len(res) > 1 and isinstance(res[1], list) else []
-        errs = [f"{n}: {r!r}" for n, r in zip(("WebSocket", "REST"), res) if isinstance(r, BaseException)]
-        if not ws and not rest:
+            try:
+                rest_rows = await asyncio.to_thread(self._funding_rest_rows)
+            except Exception as exc:
+                errs.append(f"REST: {exc!r}")
+        if not ws and not rest_rows:
             raise RuntimeError(" | ".join(errs) or "sin datos")
-        merged: Dict[str, dict] = {r["symbol"]: r for r in rest}
+        merged: Dict[str, dict] = {r["symbol"]: r for r in rest_rows}
         merged.update({r["symbol"]: r for r in ws})
-        only_rest = len(set(merged) - {r["symbol"] for r in ws}) if ws else 0
-        self._funding_src = {"ws": len(ws), "rest": len(rest), "total": len(merged), "only_rest": only_rest,
-                             "errors": errs}
+        still = sorted(want - set(merged))
+        only_rest = len(set(merged) - got) if rest_rows else 0
+        self._funding_src = {"ws": len(ws), "rest": len(rest_rows), "total": len(merged), "only_rest": only_rest,
+                             "want": len(want), "have": len(want & set(merged)), "missing": still[:20],
+                             "wait_s": round(time.monotonic() - t0, 1), "errors": errs}
         self.funding_last_scan_ms = (time.monotonic() - t0) * 1000
         if errs:
             self.log(f"[funding] consulta con una sola fuente ({len(merged)} pares): {' | '.join(errs)}")
-        elif only_rest:
-            self.log(f"[funding] el WebSocket trajo {len(ws)} pares y el REST {len(rest)}: "
-                     f"{only_rest} solo llegaron por REST (se incluyen)")
+        if want:
+            self.log(f"[funding] funding de {len(want & set(merged))}/{len(want)} operables en "
+                     f"{time.monotonic() - t0:.1f} s (WebSocket {len(ws)}"
+                     + (f", REST {len(rest_rows)}" if rest_rows else "") + ")"
+                     + (f" · faltan {len(still)}: {', '.join(still[:10])}" if still else " · todos ✓"))
         return list(merged.values())
 
     def _funding_remember(self, rows: List[dict]) -> List[dict]:
@@ -4575,7 +4602,7 @@ class KlineBot:
             fell = [s for s in self._funding_launched
                     if s in self._funding_live and abs(self._funding_live[s]["rate_pct"]) < thr]
             self._funding_over = sum(1 for row in self._funding_rows if abs(row["rate_pct"]) >= thr)
-        self.log(f"[funding] seguimiento en vivo de {len(syms)} par(es) cerca de ±{thr0:g}%: {msgs} actualizaciones"
+        self.log(f"[funding] seguimiento en vivo de {len(syms)} par(es) (≥ {FUNDING_TRACK_RATIO:g}× ±{thr0:g}%): {msgs} actualizaciones"
                  + (f" · entraron {', '.join(joined)}" if joined else "")
                  + (f" · bajaron del umbral (no se abren): {', '.join(sorted(fell))}" if fell else "")
                  + ("" if msgs else " · ✗ el stream no respondió: se opera con la consulta de 3 min antes"))
@@ -6384,7 +6411,7 @@ function render(d) {
   q('fdCurMin').textContent = `(ahora ±${fdc.min_pct}%)`; q('fdCurNot').textContent = `(ahora ${fdc.notional})`;
   q('fdCurOpen').textContent = `(ahora ${fdc.open_before_s} s)`; q('fdCurClose').textContent = `(ahora ${fdc.close_after_s} s)`;
   q('fdCurScan').textContent = `(ahora ${fdc.scan_before_s} s)`;
-  q('fdNote').innerHTML = `Antes de cada cobro (horas en punto UTC) consulta el funding de <b>todos</b> los pares ${fdc.scan_before_s} s antes (WebSocket, sin REST) y sigue en vivo hasta abrir los que están cerca del umbral: si uno lo cruza entra, si baja no se abre. `
+  q('fdNote').innerHTML = `Antes de cada cobro (horas en punto UTC) escucha el funding de <b>todos</b> los símbolos operables en futuros ${fdc.scan_before_s} s antes (WebSocket, hasta tenerlos todos, máx. 60 s; REST solo de respaldo, como mucho 1 vez por hora). Los que cumplen quedan suscritos en vivo hasta abrir (si el funding baja del umbral, no se abre); el resto se suelta hasta el próximo cobro. ${fd.src && fd.src.want ? 'Último escaneo: ' + fd.src.have + '/' + fd.src.want + ' operables en ' + fd.src.wait_s + ' s. ' : ''}`
     + `Si un par tiene funding ≥ +${fdc.min_pct}% abre <b>SHORT</b> (los LONG le pagan); si es ≤ −${fdc.min_pct}%, <b>LONG</b>. Entra ${fdc.open_before_s} s antes del cobro, `
     + `manda la orden al executor al instante con el precio en vivo (la entrada en papel se corrige después con el libro) y cierra ${fdc.close_after_s} s después. El PnL suma el funding cobrado. `
     + `Próximo cobro ${esc(fd.next || '—')} UTC (en <b data-cd="${fd.next_ts || 0}" data-off="0" data-done="cobrando">${cdFmt(fd.next_in_s || 0)}</b>) · última consulta ${esc(fd.last_scan || '—')}${fd.scan_ms ? ' (' + fd.scan_ms + ' ms)' : ''}${fd.src && fd.src.total ? ': ' + fd.src.total + ' pares (WebSocket ' + fd.src.ws + ' · REST ' + fd.src.rest + ')' : ''} · `
