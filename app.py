@@ -215,6 +215,11 @@ REVENGE_DIR         = os.getenv("REVENGE_DIR", "opposite")            # opposite
 REVENGE_SKIP_REASONS = ("OBJETIVO", "CERRAR_TODAS")                   # cierres que no disparan venganza
 # Cierres "por TP": si a ese precio el PnL neto sale negativo, el cierre se cancela (_tp_without_profit).
 TP_REASONS = ("TP", "TP_RATIO", "TP_RSI_VWAP")
+# Venganza ya puesta en Binance: entra como stop LÍMITE con este tope (%) peor que el disparo, nunca a mercado.
+REV_STOP_LIMIT_PCT = abs(float(os.getenv("REV_STOP_LIMIT_PCT", "0.1")))
+# TP tocado de una posición con su TP (límite) puesto en Binance: Binance la cierra a ese precio. El bot solo
+# manda el close de respaldo pasados estos segundos (si Binance ya la cerró, el executor no hace nada).
+TP_EXCHANGE_GRACE_S = max(0.0, float(os.getenv("TP_EXCHANGE_GRACE_S", "3")))
 
 # Bot de funding alto: abre en el lado que COBRA el funding justo antes del cobro y cierra justo después.
 FUNDING_ENABLED       = os.getenv("FUNDING_ENABLED", "true").lower() in ("1", "true", "yes")
@@ -2396,6 +2401,13 @@ class KlineBot:
             shared = pos.sent and any(p.sent and p.symbol == symbol and p.direction == pos.direction
                                       for e in self.engines.values() for p in e.positions.values())
         sent_at = time.time()                   # el segundo del cierre: el de la orden
+        src = "precio en vivo"
+        # TP tocado con su TP límite en Binance: lo cierra Binance a ese precio exacto (o mejor). El close a
+        # mercado del bot sale solo de respaldo, tras TP_EXCHANGE_GRACE_S.
+        by_exchange = (reason in TP_REASONS and pos.sent and pos.ex_tp > 0
+                       and (price >= pos.ex_tp if pos.direction == LONG else price <= pos.ex_tp))
+        if by_exchange:
+            price, src = pos.ex_tp, "TP límite en Binance"
         try:
             self._refresh_pos_syms()
             if pos.sent:                        # simulada: el executor nunca la abrió
@@ -2411,12 +2423,17 @@ class KlineBot:
                 }
                 if shared:
                     payload["quantity"] = pos.qty   # cierre parcial; la última cierra todo lo real
-                self.executor.send(payload)
+                if by_exchange and TP_EXCHANGE_GRACE_S > 0:
+                    t = threading.Timer(TP_EXCHANGE_GRACE_S, self.executor.send, args=(payload,))
+                    t.daemon = True
+                    t.start()
+                else:
+                    self.executor.send(payload)
         except Exception:
             with self.lock:
                 self._closing.discard(trade_id)
             raise
-        self._finish_close(eng, pos, price, "precio en vivo", reason, on_done, sent_at)
+        self._finish_close(eng, pos, price, src, reason, on_done, sent_at)
         return True
 
     def _may_revenge(self, eng: Engine, pos: Position, reason: str) -> bool:
@@ -2786,13 +2803,21 @@ class KlineBot:
         side = plan["side"]
         self.executor.send({
             "action": "open_stop", "trade_id": pos.rev_stop_id, "symbol": pos.symbol, "direction": side,
-            "trigger_price": plan["trigger"], "quantity": plan["qty"],
+            "trigger_price": plan["trigger"], "quantity": plan["qty"], **self._rev_stop_limit(side, plan["trigger"]),
             "notional": round(plan["qty"] * plan["trigger"], 4), "tp": plan["tp"], "sl": plan["sl"],
             "level": round(-plan["loss"], 4), "strategy": ENGINE_RATIO_REV,
         })
         self.log(f"[{ENGINE_LABELS[ENGINE_RATIO_REV]}] venganza puesta en Binance para #{pos.trade_id}: STOP {side} "
                  f"{pos.symbol} a {plan['trigger']:g} qty={plan['qty']:g} (×{self.rev_cfg['rev_mult']:g}) | TP "
                  f"{plan['tp']:g} (+{plan['tp_usd']:.4f} USD) · SL {plan['sl']:g} | trade #{pos.rev_stop_id}")
+
+    @staticmethod
+    def _rev_stop_limit(side: str, trigger: float) -> dict:
+        """Precio tope de la entrada stop: REV_STOP_LIMIT_PCT % peor que el disparo (0 = a mercado)."""
+        if REV_STOP_LIMIT_PCT <= 0:
+            return {}
+        k = REV_STOP_LIMIT_PCT / 100.0
+        return {"limit_price": trigger * (1 + k) if side == LONG else trigger * (1 - k)}
 
     def _cancel_rev_stop(self, pos: Position) -> None:
         if not pos.rev_stop_id:

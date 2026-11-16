@@ -940,3 +940,33 @@ def test_al_restaurar_el_estado_arranca_y_pone_la_venganza_de_las_abiertas(tmp_p
     p = eng.positions[pos.trade_id]
     stops = [e for e in enviados if e["action"] == "open_stop"]
     assert len(stops) == 1 and stops[0]["trade_id"] == p.rev_stop_id and stops[0]["direction"] == st.LONG
+
+
+def test_la_venganza_puesta_entra_como_stop_limite_con_tope(tmp_path, monkeypatch):
+    bot, enviados, eng, pos = _rev_bot(tmp_path, monkeypatch)
+    s = [e for e in enviados if e["action"] == "open_stop"][-1]
+    assert s["direction"] == st.LONG                                      # compra: tope por encima del disparo
+    assert s["limit_price"] == pytest.approx(s["trigger_price"] * (1 + st.REV_STOP_LIMIT_PCT / 100))
+
+
+def test_tp_tocado_con_tp_en_binance_lo_cierra_binance_y_el_close_va_de_respaldo(tmp_path, monkeypatch):
+    import time as _t
+    monkeypatch.setattr(st, "TP_EXCHANGE_GRACE_S", 0.2)
+    bot, enviados, eng, pos = _rev_bot(tmp_path, monkeypatch)
+    bot.send_tp = True
+    pos.ex_tp = 0.9                                                      # TP límite en Binance (SHORT)
+    enviados.clear()
+    assert bot._close(pos.trade_id, 0.895, "TP")
+    rec = eng.closed_trades[0]
+    assert rec["close_price"] == pytest.approx(0.9)
+    assert not [e for e in enviados if e["action"] == "close"]           # aún no: primero Binance
+    _t.sleep(0.4)
+    assert [e["action"] for e in enviados if e.get("trade_id") == pos.trade_id] == ["close"]
+
+
+def test_tp_del_bot_sin_llegar_al_tp_de_binance_cierra_al_momento(tmp_path, monkeypatch):
+    bot, enviados, eng, pos = _rev_bot(tmp_path, monkeypatch)
+    pos.ex_tp = 0.85
+    enviados.clear()
+    assert bot._close(pos.trade_id, 0.88, "TP")
+    assert [e["action"] for e in enviados if e.get("trade_id") == pos.trade_id] == ["close"]
