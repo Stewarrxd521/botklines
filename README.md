@@ -74,6 +74,15 @@ Cuando una operación de este bot cierra **en pérdida** por cualquier motivo (S
 - **SL**: `rev_sl_pct` % de (pérdida × `rev_mult`), en USD (150 % por defecto).
 - Si la venganza pierde, **no se encadena otra**. Tampoco se dispara al alcanzar el objetivo global ni con «Cerrar todas».
 
+**Contraria: ya puesta en Binance desde la apertura.** Con `rev_dir=opposite`, en cuanto el bot abre la operación (y la manda al executor), le manda también la venganza como **entrada STOP_MARKET pendiente** (`"action": "open_stop"`) en el **SL de esa operación**, con su TP y su SL ya calculados con la pérdida que tendría al cerrar ahí. Binance la dispara por último precio (`CONTRACT_PRICE`) en el mismo instante en que se toca el SL, sin esperar al bot; al llenarse, el executor le pone su TP y su SL. En el bot:
+
+- Si la operación cierra **por SL**, la venganza se registra en papel con el trade_id de la stop, sin mandar otra apertura.
+- Si cierra por **cualquier otro motivo** (TP, manual, objetivo, «Cerrar todas»…), se manda `cancel_stop` y la stop se quita; si cerró en pérdida antes del SL (p. ej. manual), la venganza sale a mercado como antes.
+- Si se cambia el SL o la venganza (×N, %, dirección, apagarla), la stop se mueve o se quita en caliente.
+- Necesita el executor con `open_stop` y la cuenta en **modo Hedge**. Si los envíos al executor están pausados (simuladas), no se pone nada y la venganza sale a mercado al cerrar.
+
+**Misma dirección**: se espera al cierre y entonces se abre la nueva a mercado, con su TP.
+
 Su salida y su venganza se ajustan en *Bots → Bot ratio + venganza*, o con:
 
 ```bash

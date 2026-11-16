@@ -984,6 +984,12 @@ class Position:
     rev_tp_usd:    float = 0.0  # objetivo de la venganza en USD (neto) y su stop en USD
     rev_sl_usd:    float = 0.0
     ex_tp:         float = 0.0      # TP puesto en Binance por el executor (0 = ninguno)
+    # ── Venganza contraria ya puesta en Binance (entrada STOP_MARKET en el SL de esta posición) ──
+    rev_stop_id:   int = 0          # trade_id de esa venganza (0 = ninguna puesta)
+    rev_stop_px:   float = 0.0      # nivel de disparo (= SL de esta posición)
+    rev_stop_qty:  float = 0.0
+    rev_stop_tp:   float = 0.0      # TP y SL de la venganza (precio)
+    rev_stop_sl:   float = 0.0
     signal_price:  float = 0.0      # precio de la señal (entry_price es el precio en vivo)
     entry_src:     str = ""         # de dónde salió entry_price: precio en vivo | señal | executor
     tp_rejects:    int = 0          # cierres por TP cancelados porque el PnL neto salía negativo
@@ -2452,8 +2458,12 @@ class KlineBot:
                      f"{price:g} ({rec['move_pct']:+.2f}%) | PnL neto {pnl:+.4f} USDT (fees {fees:.4f}"
                      f"{f' · funding {funding:+.4f}' if pos.funding_ts else ''}) | "
                      f"{rec['duration_s']:.1f} s | trade #{pos.trade_id}")
-            if pnl < 0 and self._may_revenge(eng, pos, reason):
-                self._open_revenge(eng, pos, price, -pnl, reason)
+            if pos.rev_stop_id and reason == "SL":
+                self._adopt_rev_stop(eng, pos, price, max(-pnl, 0.0), reason)   # ya entró en Binance
+            else:
+                self._cancel_rev_stop(pos)          # cerró sin llegar al SL: la venganza puesta sobra
+                if pnl < 0 and self._may_revenge(eng, pos, reason):
+                    self._open_revenge(eng, pos, price, -pnl, reason)
         finally:
             with self.lock:
                 self._closing.discard(pos.trade_id)
@@ -2637,6 +2647,7 @@ class KlineBot:
                         changed.append(p)
         for p in changed:
             self._sync_executor_tp(p)
+            self._sync_rev_stop(p)
         for sym in syms:
             self._on_price_event(sym, "config")
 
@@ -2673,6 +2684,11 @@ class KlineBot:
         self.rev_cfg = new
         if new["tp_pct"] != old["tp_pct"] or new["sl_pct"] != old["sl_pct"]:
             self._apply_ratio_exits((ENGINE_RATIO_REV,))
+        else:                                   # venganza activa, dirección, ×N o %: se rehace la puesta
+            with self.lock:
+                open_rev = [p for p in self.engines[ENGINE_RATIO_REV].positions.values() if not p.revenge]
+            for p in open_rev:
+                self._sync_rev_stop(p)
         self._save_settings()
         self.store.mark_dirty(True)
         self.log(f"[config] {ENGINE_LABELS[ENGINE_RATIO_REV]}: {self._rev_desc()}")
@@ -2713,21 +2729,110 @@ class KlineBot:
         px, src = self._fill_price(sym, ref)
         self._open_revenge_at(eng, lost, side, qty, ref, px, src, price, loss, reason, note)
 
+    def _revenge_levels(self, side: str, px: float, qty: float, loss: float) -> Tuple[float, float, float, float]:
+        """(TP, SL, TP en USD, SL en USD) de una venganza de `qty` que entra a `px` tras perder `loss` USD:
+        TP = rev_recover_pct % de la pérdida y SL = rev_sl_pct % de (pérdida × N), netos de fees."""
+        c = self.rev_cfg
+        tp_usd = loss * c["rev_recover_pct"] / 100.0
+        sl_usd = loss * c["rev_mult"] * c["rev_sl_pct"] / 100.0
+        fees = 2 * qty * px * self.fee_pct / 100.0            # entrada + salida (aprox.)
+        tp_move = (tp_usd + fees) / qty
+        sl_move = max(sl_usd - fees, sl_usd * 0.1) / qty
+        if side == LONG:
+            return px + tp_move, max(px - sl_move, 0.0), tp_usd, sl_usd
+        return max(px - tp_move, 0.0), px + sl_move, tp_usd, sl_usd
+
+    def _rev_stop_plan(self, pos: Position) -> Optional[dict]:
+        """La venganza contraria que se deja puesta en Binance al abrir: una entrada STOP_MARKET en el SL de
+        `pos`, con la pérdida que tendría `pos` al cerrar ahí. None si no toca (o no se puede)."""
+        c = self.rev_cfg
+        if (pos.strategy != ENGINE_RATIO_REV or pos.revenge or not pos.sent or not c["revenge"]
+                or c["rev_dir"] != "opposite" or pos.sl_price <= 0 or not self.executor.target.url):
+            return None
+        trig = pos.sl_price
+        loss = -net_pnl_usd(trig, pos.entry_price, pos.qty, pos.direction, self.fee_pct)
+        if loss <= 0:
+            return None
+        side = SHORT if pos.direction == LONG else LONG
+        f = self.filters.get(pos.symbol, {})
+        qty, _eff, _why = size_order(pos.notional * c["rev_mult"], trig, f.get("stepSize", 0.001),
+                                     f.get("minQty", 0.0), f.get("minNotional", 5.0), MAX_NOTIONAL_OVER)
+        if qty <= 0:
+            return None
+        tp, sl, tp_usd, sl_usd = self._revenge_levels(side, trig, qty, loss)
+        return {"side": side, "trigger": trig, "qty": qty, "tp": tp, "sl": sl, "tp_usd": tp_usd,
+                "sl_usd": sl_usd, "loss": loss}
+
+    def _sync_rev_stop(self, pos: Position) -> None:
+        """Pone, mueve o quita en Binance la venganza contraria de `pos` según su SL y la config vigente."""
+        plan = self._rev_stop_plan(pos)
+        if plan is None:
+            self._cancel_rev_stop(pos)
+            return
+        levels = (plan["trigger"], plan["qty"], plan["tp"], plan["sl"])
+        if pos.rev_stop_id and levels == (pos.rev_stop_px, pos.rev_stop_qty, pos.rev_stop_tp, pos.rev_stop_sl):
+            return
+        if not pos.rev_stop_id:
+            pos.rev_stop_id = self._next_trade_id()
+        pos.rev_stop_px, pos.rev_stop_qty, pos.rev_stop_tp, pos.rev_stop_sl = levels
+        self.store.mark_dirty(True)
+        side = plan["side"]
+        self.executor.send({
+            "action": "open_stop", "trade_id": pos.rev_stop_id, "symbol": pos.symbol, "direction": side,
+            "trigger_price": plan["trigger"], "quantity": plan["qty"],
+            "notional": round(plan["qty"] * plan["trigger"], 4), "tp": plan["tp"], "sl": plan["sl"],
+            "level": round(-plan["loss"], 4), "strategy": ENGINE_RATIO_REV,
+        })
+        self.log(f"[{ENGINE_LABELS[ENGINE_RATIO_REV]}] venganza puesta en Binance para #{pos.trade_id}: STOP {side} "
+                 f"{pos.symbol} a {plan['trigger']:g} qty={plan['qty']:g} (×{self.rev_cfg['rev_mult']:g}) | TP "
+                 f"{plan['tp']:g} (+{plan['tp_usd']:.4f} USD) · SL {plan['sl']:g} | trade #{pos.rev_stop_id}")
+
+    def _cancel_rev_stop(self, pos: Position) -> None:
+        if not pos.rev_stop_id:
+            return
+        self.executor.send({"action": "cancel_stop", "trade_id": pos.rev_stop_id, "symbol": pos.symbol,
+                            "direction": SHORT if pos.direction == LONG else LONG, "strategy": ENGINE_RATIO_REV})
+        pos.rev_stop_id = 0
+        pos.rev_stop_px = pos.rev_stop_qty = pos.rev_stop_tp = pos.rev_stop_sl = 0.0
+        self.store.mark_dirty(True)
+
+    def _adopt_rev_stop(self, eng: Engine, lost: Position, price: float, loss: float, reason: str) -> None:
+        """`lost` cerró en su SL: la venganza contraria ya entró en Binance con su TP y SL (la puso el executor
+        al dispararse). Aquí solo se registra en papel, sin mandar otra apertura."""
+        side = SHORT if lost.direction == LONG else LONG
+        c = self.rev_cfg
+        now = time.time()
+        qty = lost.rev_stop_qty
+        pos = Position(
+            trade_id=lost.rev_stop_id, symbol=lost.symbol, direction=side, entry_price=price, qty=qty,
+            notional=qty * price, tp_price=lost.rev_stop_tp, sl_price=lost.rev_stop_sl, signal_pct=-loss,
+            candle_open=lost.entry_price, candle_close=price, candle_time=int(now * 1000), last_price=price,
+            strategy=eng.name, inverted=False, sent=True, revenge=True, rev_parent=lost.trade_id,
+            rev_tp_usd=loss * c["rev_recover_pct"] / 100.0, rev_sl_usd=loss * c["rev_mult"] * c["rev_sl_pct"] / 100.0,
+            ex_tp=lost.rev_stop_tp, signal_price=lost.rev_stop_px, entry_src="stop en Binance",
+        )
+        with self.lock:
+            eng.positions[pos.trade_id] = pos
+            eng.opened_count += 1
+            self.revenge_count += 1
+            eng.signals.appendleft({
+                "ts": now, "time": _utc(now, "%H:%M:%S"), "symbol": lost.symbol, "direction": side,
+                "body_pct": -loss, "open": lost.entry_price, "close": price, "candle": f"#{lost.trade_id}",
+                "candle_age_s": 0.0, "action": f"venganza abierta #{pos.trade_id} (stop en Binance)",
+            })
+        self._refresh_pos_syms()
+        self.store.mark_dirty(True)
+        self.log(f"[{eng.label}] VENGANZA {side} {lost.symbol} tras #{lost.trade_id} ({reason}, {-loss:+.4f} USDT): "
+                 f"entró en Binance con el stop a {lost.rev_stop_px:g} | px={price:g} qty={qty:g} | "
+                 f"TP {pos.tp_price:g} · SL {pos.sl_price:g} | trade #{pos.trade_id}")
+
     def _open_revenge_at(self, eng: Engine, lost: Position, side: str, qty: float, ref: float, px: float,
                          src: str, price: float, loss: float, reason: str, note) -> None:
         c = self.rev_cfg
         sym = lost.symbol
         now = time.time()
         eff = qty * px
-        tp_usd = loss * c["rev_recover_pct"] / 100.0
-        sl_usd = loss * c["rev_mult"] * c["rev_sl_pct"] / 100.0
-        fees = 2 * eff * self.fee_pct / 100.0                 # entrada + salida (aprox.)
-        tp_move = (tp_usd + fees) / qty
-        sl_move = max(sl_usd - fees, sl_usd * 0.1) / qty
-        if side == LONG:
-            tp_px, sl_px = px + tp_move, max(px - sl_move, 0.0)
-        else:
-            tp_px, sl_px = max(px - tp_move, 0.0), px + sl_move
+        tp_px, sl_px, tp_usd, sl_usd = self._revenge_levels(side, px, qty, loss)
         pos = Position(
             trade_id=self._next_trade_id(), symbol=sym, direction=side,
             entry_price=px, qty=qty, notional=eff, tp_price=tp_px, sl_price=sl_px,
@@ -3766,6 +3871,7 @@ class KlineBot:
                 "price": signal_px, "quantity": qty, "notional": round(eff, 4),
                 "level": round(chg, 4), "strategy": eng.name, **self._open_tp(pos),
             }, time.perf_counter())
+            self._sync_rev_stop(pos)            # venganza contraria: ya puesta en Binance
 
     def _ratio_snapshot(self, all_rows: bool = True) -> dict:
         eng = self.engines[ENGINE_RATIO]

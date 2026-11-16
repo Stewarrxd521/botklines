@@ -352,8 +352,8 @@ def test_el_tp_va_en_la_apertura_y_se_mueve_en_caliente(tmp_path, monkeypatch):
 def test_con_varios_bots_en_el_mismo_par_cada_uno_lleva_su_tp(tmp_path, monkeypatch):
     bot, enviados, ts = _bot_con_envios(tmp_path, monkeypatch)
     bot._on_ratio_points("AUSDT", [(ts - 300_000, 1.18), (ts, 0.86)])
-    assert [e["action"] for e in enviados] == ["open", "open", "open"]
-    por_bot = {e["strategy"]: e for e in enviados}
+    assert [e["action"] for e in enviados if e["action"] == "open"] == ["open", "open", "open"]
+    por_bot = {e["strategy"]: e for e in enviados if e["action"] == "open"}
     assert "tp" in por_bot[st.ENGINE_RATIO] and "tp" in por_bot[st.ENGINE_RATIO_REV]
     assert "tp" not in por_bot[st.ENGINE_RATIO_TP]          # el bot "solo TP ratio" no tiene TP por precio
 
@@ -854,4 +854,77 @@ def test_el_tp_en_binance_nunca_queda_por_debajo_de_las_fees(tmp_path, monkeypat
     assert tp == pytest.approx(0.9995 / 1.0005) and bot._net_pnl(p, tp) == pytest.approx(0.0, abs=1e-9)
     p.tp_price = 0.9                                                   # un TP normal no se toca
     assert bot._open_tp(p) == {"tp": 0.9}
+
+
+# ── Venganza contraria ya puesta en Binance desde la primera apertura ────────
+
+def _rev_bot(tmp_path, monkeypatch, rev_dir="opposite"):
+    bot, enviados, ts = _bot_con_envios(tmp_path, monkeypatch)
+    bot.executor.set_target("http://executor.test")
+    bot.fee_pct = 0.05
+    bot.rev_cfg.update(revenge=True, rev_mult=10, rev_recover_pct=65, rev_sl_pct=100, rev_dir=rev_dir,
+                       tp_pct=10, sl_pct=5)
+    bot._on_ratio_points("AUSDT", [(ts - 300_000, 1.18), (ts, 0.86)])
+    eng = bot.engines[st.ENGINE_RATIO_REV]
+    pos = next(p for p in eng.positions.values() if not p.revenge)
+    return bot, enviados, eng, pos
+
+
+def test_al_abrir_la_venganza_contraria_queda_puesta_en_el_sl(tmp_path, monkeypatch):
+    bot, enviados, eng, pos = _rev_bot(tmp_path, monkeypatch)
+    stops = [e for e in enviados if e["action"] == "open_stop"]
+    assert len(stops) == 1
+    s = stops[0]
+    assert s["direction"] == st.LONG and s["trigger_price"] == pytest.approx(pos.sl_price) == pytest.approx(1.05)
+    assert s["trade_id"] == pos.rev_stop_id and s["strategy"] == st.ENGINE_RATIO_REV
+    assert s["quantity"] * 1.05 >= 5.0 * 10 * 0.99                       # notional × 10 al precio del SL
+    loss = -st.net_pnl_usd(1.05, 1.0, 5, st.SHORT, 0.05)
+    assert s["level"] == pytest.approx(-loss, abs=1e-4)
+    # TP = 65 % de la pérdida, neto de fees: a ese precio la venganza gana eso.
+    gana = st.net_pnl_usd(s["tp"], 1.05, s["quantity"], st.LONG, 0.05)
+    assert gana == pytest.approx(loss * 0.65, rel=0.02) and s["sl"] < 1.05
+    assert pos.rev_stop_tp == s["tp"] and pos.rev_stop_qty == s["quantity"]
+
+
+def test_al_tocar_el_sl_la_venganza_se_registra_sin_otra_apertura(tmp_path, monkeypatch):
+    bot, enviados, eng, pos = _rev_bot(tmp_path, monkeypatch)
+    enviados.clear()
+    bot._price = lambda sym: 1.05
+    bot._check_take_profit("AUSDT")
+    assert [e["action"] for e in enviados if e.get("trade_id") == pos.trade_id] == ["close"]
+    assert not [e for e in enviados if e["action"] in ("open", "open_stop", "cancel_stop")]   # ya está en Binance
+    v = eng.positions[pos.rev_stop_id]
+    assert v.revenge and v.direction == st.LONG and v.sent and v.entry_src == "stop en Binance"
+    assert v.tp_price == pos.rev_stop_tp and v.sl_price == pos.rev_stop_sl and v.rev_parent == pos.trade_id
+    assert len([p for p in eng.positions.values() if p.revenge]) == 1
+
+
+def test_si_cierra_sin_llegar_al_sl_se_cancela_la_venganza_puesta(tmp_path, monkeypatch):
+    bot, enviados, eng, pos = _rev_bot(tmp_path, monkeypatch)
+    rid = pos.rev_stop_id
+    bot._price = lambda sym: 0.9
+    bot._check_take_profit("AUSDT")                                       # TP
+    assert eng.closed_trades[0]["reason"] == "TP"
+    assert any(e["action"] == "cancel_stop" and e["trade_id"] == rid for e in enviados)
+    assert not [p for p in eng.positions.values() if p.revenge]
+
+
+def test_cambiar_el_sl_mueve_la_venganza_puesta_y_apagarla_la_quita(tmp_path, monkeypatch):
+    bot, enviados, eng, pos = _rev_bot(tmp_path, monkeypatch)
+    rid = pos.rev_stop_id
+    bot.set_rev_config(sl_pct=3)
+    s = [e for e in enviados if e["action"] == "open_stop"][-1]
+    assert s["trade_id"] == rid and s["trigger_price"] == pytest.approx(1.03)
+    bot.set_rev_config(rev_dir="same")                                    # misma dirección: espera al cierre
+    assert enviados[-1]["action"] == "cancel_stop" and enviados[-1]["trade_id"] == rid and pos.rev_stop_id == 0
+
+
+def test_venganza_en_la_misma_direccion_espera_al_cierre(tmp_path, monkeypatch):
+    bot, enviados, eng, pos = _rev_bot(tmp_path, monkeypatch, rev_dir="same")
+    assert not [e for e in enviados if e["action"] == "open_stop"] and pos.rev_stop_id == 0
+    bot._price = lambda sym: 1.05
+    bot._check_take_profit("AUSDT")
+    v = [p for p in eng.positions.values() if p.revenge]
+    assert len(v) == 1 and v[0].direction == st.SHORT
+    assert enviados[-1]["action"] == "open" and enviados[-1]["direction"] == st.SHORT and "tp" in enviados[-1]
 
