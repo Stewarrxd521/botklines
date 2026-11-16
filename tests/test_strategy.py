@@ -383,70 +383,6 @@ def test_ahorro_de_datos_desde_la_web(tmp_path, monkeypatch):
 
 # ── Precio de libro (como el executor) ────────────────────────────────────────
 
-def test_recorrer_el_libro_da_el_precio_medio_y_el_peor_mas_alla_de_20_niveles():
-    asks = [["1.0", "2"], ["1.1", "3"]]
-    assert st.walk_book(asks, 4) == pytest.approx((2 * 1.0 + 2 * 1.1) / 4)
-    assert st.walk_book(asks, 10) == pytest.approx((2 * 1.0 + 3 * 1.1 + 5 * 1.1) / 10)   # resto al peor
-    assert st.walk_book(asks, 1) == pytest.approx(1.0)
-    assert st.walk_book([], 1) is None and st.walk_book([["0", "5"]], 1) is None
-
-
-def _libro(bot, bids, asks):
-    """El libro llega por el WebSocket depth20 (sin REST)."""
-    pedidos = []
-
-    async def ws(sym):
-        pedidos.append(sym)
-        if bids is None:
-            raise RuntimeError("sin libro")
-        return bids, asks
-    bot._ws_depth = ws
-    return pedidos
-
-
-def test_las_aperturas_de_ratio_entran_al_precio_del_libro(tmp_path, monkeypatch):
-    bot, enviados, ts = _bot_con_envios(tmp_path, monkeypatch)
-    pedidos = _libro(bot, bids=[["0.99", "3"], ["0.98", "10"]], asks=[["1.01", "10"]])
-    bot._on_ratio_points("AUSDT", [(ts - 300_000, 1.18), (ts, 0.86)])
-    abiertas = [p for n in st.RATIO_ENGINES for p in bot.engines[n].positions.values()]
-    assert len(abiertas) == 3 and pedidos == ["AUSDT"]                       # un libro para los 3 bots
-    esperado = (3 * 0.99 + 2 * 0.98) / 5                                    # SHORT vende contra los bids
-    for p in abiertas:
-        assert p.entry_price == pytest.approx(esperado) and p.entry_src == "libro" and p.signal_price == 1.0
-    pos = next(iter(bot.engines[st.ENGINE_RATIO].positions.values()))
-    # La orden salió sin esperar el libro, con el precio en vivo; su TP es el que tiene Binance.
-    assert pos.tp_price == pytest.approx(1.0 * 0.9)
-    assert enviados[0]["price"] == 1.0 and enviados[0]["tp"] == pytest.approx(pos.tp_price)
-
-
-def test_el_cierre_se_valora_con_el_libro_y_la_orden_sale_antes(tmp_path, monkeypatch):
-    bot, enviados, _ = _bot_con_envios(tmp_path, monkeypatch)
-    eng = bot.engines[st.ENGINE_RATIO]
-    eng.positions[7] = st.Position(trade_id=7, symbol="AUSDT", direction=st.SHORT, entry_price=1.0, qty=5,
-                                   notional=5.0, tp_price=0.9, sl_price=1.05, signal_pct=-27, candle_open=1.18,
-                                   candle_close=0.86, candle_time=0, last_price=1.0, strategy=st.ENGINE_RATIO)
-    _libro(bot, bids=[["0.89", "10"]], asks=[["0.90", "2"], ["0.92", "10"]])
-    assert bot._close(7, 0.9, "TP")
-    assert enviados[0]["action"] == "close" and enviados[0]["close_price"] == 0.9
-    rec = eng.closed_trades[0]
-    esperado = (2 * 0.90 + 3 * 0.92) / 5                                    # cerrar SHORT = comprar asks
-    assert rec["close_price"] == pytest.approx(esperado) and rec["close_src"] == "libro"
-    assert rec["trigger_price"] == 0.9 and rec["pnl"] == pytest.approx((1.0 - esperado) * 5)
-
-
-def test_sin_libro_usa_el_precio_en_vivo_y_sin_eso_el_de_la_senal(tmp_path, monkeypatch):
-    bot = _bot_sin_red(tmp_path, monkeypatch)
-    rest = []
-    bot._rest_get = lambda *a, **k: rest.append(a)            # el libro NUNCA va por REST
-    _libro(bot, bids=None, asks=None)
-    bot._fetch_book("AUSDT")
-    assert not rest and bot.book_errors == 1
-    bot._price = lambda sym: 1.02
-    assert bot._fill_from_book("AUSDT", True, 5, 1.0) == (1.02, "precio en vivo")
-    bot._price = lambda sym: None
-    assert bot._fill_from_book("AUSDT", True, 5, 1.0) == (1.0, "señal")
-
-
 # ── Demora mínima antes de cerrar ─────────────────────────────────────────────
 
 def test_no_cierra_por_precio_antes_de_la_demora_minima(tmp_path, monkeypatch):
@@ -581,31 +517,6 @@ def test_ws_velas_1m_de_los_pares_con_tp_por_indicadores():
     assert got == []                                                 # la vela en curso no cuenta
     pc._dispatch_event({"e": "kline", "s": "AUSDT", "k": {**k, "x": True}}, time.time())
     assert got == [("AUSDT", 60_000, 1.0, 2.0, 0.5, 1.5, 10.0)]
-
-
-def test_en_el_loop_el_libro_se_pide_en_segundo_plano_sin_bloquear(tmp_path, monkeypatch):
-    import asyncio
-    bot, enviados, _ = _bot_con_envios(tmp_path, monkeypatch)
-    eng = bot.engines[st.ENGINE_RATIO]
-    eng.positions[31] = st.Position(trade_id=31, symbol="AUSDT", direction=st.LONG, entry_price=1.0, qty=5,
-                                    notional=5.0, tp_price=1.1, sl_price=0.95, signal_pct=27, candle_open=1,
-                                    candle_close=1, candle_time=0, last_price=1.0, strategy=st.ENGINE_RATIO)
-
-    async def ws(sym):
-        await asyncio.sleep(0.05)
-        return [["1.09", "100"]], [["1.11", "100"]]
-    bot._ws_depth = ws
-
-    async def run():
-        bot.loop = asyncio.get_running_loop()
-        bot._close(31, 1.1, "TP")
-        assert enviados[-1]["action"] == "close" and not eng.closed_trades    # la orden ya salió; el papel, después
-        for _ in range(100):
-            if eng.closed_trades:
-                break
-            await asyncio.sleep(0.01)
-    asyncio.run(run())
-    assert eng.closed_trades[0]["close_price"] == pytest.approx(1.09)          # LONG cierra vendiendo a bids
 
 
 def test_al_encender_se_cargan_las_velas_una_vez_por_rest(tmp_path, monkeypatch):
@@ -821,75 +732,6 @@ def test_velas_de_otro_exchange_no_se_mezclan_y_rellenan_minutos_sin_operaciones
     assert bot.ind_snapshot()["symbols"]["AUSDT"]["src"] == "coinbase"
 
 
-def test_el_libro_se_toma_del_websocket_depth20(tmp_path, monkeypatch):
-    import asyncio
-    monkeypatch.setattr(st, "SETTINGS_FILE", str(tmp_path / "s.json"))
-    bot = st.KlineBot()
-    urls = []
-
-    async def fake_ws(url):
-        urls.append(url)
-        if "/public/" in url:
-            raise OSError("404")
-        yield '{"e":"depthUpdate","s":"AUSDT","b":[["0.99","3"]],"a":[["1.01","4"]]}'
-    monkeypatch.setattr(st, "_ws_messages", fake_ws)
-    bids, asks = asyncio.run(bot._ws_depth("AUSDT"))
-    assert bids == [["0.99", "3"]] and asks == [["1.01", "4"]]
-    assert urls == ["wss://fstream.binance.com/public/ws/ausdt@depth20@100ms",
-                    "wss://fstream.binance.com/market/ws/ausdt@depth20@100ms"]
-
-
-def test_tp_por_precio_se_confirma_con_el_libro_antes_de_cerrar(tmp_path, monkeypatch):
-    bot = _bot_sin_red(tmp_path, monkeypatch)
-    enviados = []
-    bot.executor.send = lambda payload, *a, **k: enviados.append(payload)
-    p = _abierta_ratio(bot, st.ENGINE_RATIO_REV, 61)          # SHORT desde 1.0, TP al 0.5 %
-    p.tp_price = 0.995
-    eng = bot.engines[st.ENGINE_RATIO_REV]
-    bot._price = lambda sym: 0.9948                            # el mechazo toca el TP...
-    _libro(bot, [["0.997", "100"]], [["0.9974", "100"]])       # ...pero los asks están en +0.26 %
-    bot._check_take_profit("AUSDT")
-    assert 61 in eng.positions and not enviados and not eng.closed_trades   # rechazado: sigue abierta
-    assert p.tp_rejects == 1 and not bot._tp_checking
-    bot._books.clear()
-    _libro(bot, [["0.9945", "100"]], [["0.9949", "100"]])      # ahora sí hay asks al TP o mejor
-    bot._check_take_profit("AUSDT")
-    assert 61 not in eng.positions and enviados[-1]["action"] == "close"
-    assert enviados[-1]["close_price"] == pytest.approx(0.9949)
-    assert eng.closed_trades[0]["close_price"] == pytest.approx(0.9949) and eng.closed_trades[0]["reason"] == "TP"
-
-
-def test_la_venganza_sale_sin_esperar_el_libro(tmp_path, monkeypatch):
-    # En el loop del bot y sin libro reciente: el cierre por SL y la venganza no esperan la foto
-    # del libro (que abre un WebSocket y tarda segundos); salen en el mismo instante.
-    bot = _bot_sin_red(tmp_path, monkeypatch)
-    bot.executor_paused = False
-    bot.rev_cfg.update(revenge=True, rev_mult=10, rev_recover_pct=65, rev_sl_pct=100, rev_dir="opposite")
-    enviados = []
-    bot.executor.send = lambda payload, *a, **k: enviados.append(payload)
-    bot._on_loop = lambda: True
-    pedidos = []
-    bot._with_fill = lambda *a, **k: pedidos.append(a)   # el libro "no llega": nada lo espera
-    eng = bot.engines[st.ENGINE_RATIO_REV]
-    eng.positions[1] = st.Position(trade_id=1, symbol="AUSDT", direction=st.SHORT, entry_price=1.0, qty=5,
-                                   notional=5.0, tp_price=0.9, sl_price=1.05, signal_pct=-27, candle_open=1.18,
-                                   candle_close=0.86, candle_time=0, last_price=1.0, strategy=st.ENGINE_RATIO_REV)
-    bot._price = lambda sym: 1.06
-    bot._close(1, 1.05, "SL")
-    assert [p["action"] for p in enviados] == ["close", "open"]        # ambas ya salieron
-    v = [p for p in eng.positions.values() if p.revenge]
-    assert len(v) == 1 and v[0].entry_src == "precio en vivo"
-    assert len(pedidos) == 2 and not eng.closed_trades                   # el papel espera el libro
-    # Llega el libro: se corrige la entrada en papel de la venganza (no su TP) y el cierre.
-    tp = v[0].tp_price
-    bot._books["AUSDT"] = (time.time(), [["1.05", "100"]], [["1.07", "100"]], "libro")
-    for sym, buy, qty, fb, cont in pedidos:
-        cont(*bot._fill_from_book(sym, buy, qty, fb))
-    assert v[0].entry_price == pytest.approx(1.07) and v[0].entry_src == "libro" and v[0].tp_price == tp
-    assert eng.closed_trades[0]["close_price"] == pytest.approx(1.07)
-    assert len([p for p in eng.positions.values() if p.revenge]) == 1  # no abre una segunda venganza
-
-
 def test_el_tp_con_las_aperturas_se_enciende_y_apaga(tmp_path, monkeypatch):
     bot = _bot_sin_red(tmp_path, monkeypatch)
     enviados = []
@@ -908,19 +750,97 @@ def test_el_tp_con_las_aperturas_se_enciende_y_apaga(tmp_path, monkeypatch):
     assert enviados[-1]["action"] == "open_tp" and enviados[-1]["trigger_price"] == 0.9
 
 
-def test_el_libro_prueba_primero_la_url_que_funciono(tmp_path, monkeypatch):
-    import asyncio, json
+# ── Precio en vivo para abrir y cerrar (sin libro ni consultas al executor) ───
+
+def test_las_aperturas_de_ratio_entran_al_precio_en_vivo(tmp_path, monkeypatch):
+    bot, enviados, ts = _bot_con_envios(tmp_path, monkeypatch)
+    bot._on_ratio_points("AUSDT", [(ts - 300_000, 1.18), (ts, 0.86)])
+    abiertas = [p for n in st.RATIO_ENGINES for p in bot.engines[n].positions.values()]
+    assert len(abiertas) == 3
+    for p in abiertas:
+        assert p.entry_price == 1.0 and p.entry_src == "precio en vivo" and p.signal_price == 1.0
+    pos = next(iter(bot.engines[st.ENGINE_RATIO].positions.values()))
+    assert pos.tp_price == pytest.approx(1.0 * 0.9)
+    assert enviados[0]["price"] == 1.0 and enviados[0]["tp"] == pytest.approx(pos.tp_price)
+    assert not hasattr(bot, "fills")                                         # nada que consultar al executor
+
+
+def test_sin_precio_en_vivo_entra_con_el_de_la_senal(tmp_path, monkeypatch):
     bot = _bot_sin_red(tmp_path, monkeypatch)
-    monkeypatch.setattr(st, "BOOK_WS_URLS", ["wss://a/ws", "wss://b/ws"])
-    intentos = []
+    bot._price = lambda sym: 1.02
+    assert bot._fill_price("AUSDT", 1.0) == (1.02, "precio en vivo")
+    bot._price = lambda sym: None
+    assert bot._fill_price("AUSDT", 1.0) == (1.0, "señal")
 
-    async def falso_ws(url):
-        intentos.append(url.split("/")[2])
-        if url.startswith("wss://a"):
-            raise RuntimeError("sin libro aquí")
-        yield json.dumps({"b": [["1", "5"]], "a": [["1.01", "5"]]})
 
-    monkeypatch.setattr(st, "_ws_messages", falso_ws)
-    asyncio.run(st.KlineBot._ws_depth(bot, "AUSDT"))
-    asyncio.run(st.KlineBot._ws_depth(bot, "AUSDT"))
-    assert intentos == ["a", "b", "b"]          # la segunda vez va directa a la que funcionó
+def test_el_cierre_se_contabiliza_al_instante_con_el_precio_en_vivo(tmp_path, monkeypatch):
+    import asyncio
+    bot, enviados, _ = _bot_con_envios(tmp_path, monkeypatch)
+    eng = bot.engines[st.ENGINE_RATIO]
+    eng.positions[31] = st.Position(trade_id=31, symbol="AUSDT", direction=st.LONG, entry_price=1.0, qty=5,
+                                    notional=5.0, tp_price=1.1, sl_price=0.95, signal_pct=27, candle_open=1,
+                                    candle_close=1, candle_time=0, last_price=1.0, strategy=st.ENGINE_RATIO)
+
+    async def run():
+        bot.loop = asyncio.get_running_loop()            # en el loop del bot: tampoco espera nada
+        bot._price = lambda sym: 1.1
+        bot._check_take_profit("AUSDT")
+    asyncio.run(run())
+    assert enviados[-1]["action"] == "close" and enviados[-1]["close_price"] == 1.1
+    rec = eng.closed_trades[0]
+    assert rec["close_price"] == 1.1 and rec["close_src"] == "precio en vivo" and rec["reason"] == "TP"
+    assert rec["pnl"] == pytest.approx(0.5) and 31 not in eng.positions
+
+
+def test_la_venganza_sale_en_el_mismo_instante_que_el_cierre(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    bot.executor_paused = False
+    bot.rev_cfg.update(revenge=True, rev_mult=10, rev_recover_pct=65, rev_sl_pct=100, rev_dir="opposite")
+    enviados = []
+    bot.executor.send = lambda payload, *a, **k: enviados.append(payload)
+    eng = bot.engines[st.ENGINE_RATIO_REV]
+    eng.positions[1] = st.Position(trade_id=1, symbol="AUSDT", direction=st.SHORT, entry_price=1.0, qty=5,
+                                   notional=5.0, tp_price=0.9, sl_price=1.05, signal_pct=-27, candle_open=1.18,
+                                   candle_close=0.86, candle_time=0, last_price=1.0, strategy=st.ENGINE_RATIO_REV)
+    bot._price = lambda sym: 1.05
+    bot._check_take_profit("AUSDT")
+    assert [p["action"] for p in enviados] == ["close", "open"]
+    assert eng.closed_trades[0]["reason"] == "SL" and eng.closed_trades[0]["close_price"] == 1.05
+    v = [p for p in eng.positions.values() if p.revenge]
+    assert len(v) == 1 and v[0].direction == st.LONG and v[0].entry_price == 1.05
+    assert v[0].rev_tp_usd == pytest.approx(0.25 * 0.65)                     # 65 % de la pérdida (0.25 USD)
+
+
+# ── Un cierre "por TP" nunca sale con PnL neto negativo ───────────────────────
+
+def test_tp_por_precio_con_pnl_negativo_se_cancela(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    bot.fee_pct = 0.05
+    enviados = []
+    bot.executor.send = lambda payload, *a, **k: enviados.append(payload)
+    p = _abierta_ratio(bot, st.ENGINE_RATIO_REV, 61, revenge=True)   # SHORT desde 1.0
+    p.tp_price, p.sl_price = 0.9995, 1.05                              # TP más corto que las fees (0,1 %)
+    eng = bot.engines[st.ENGINE_RATIO_REV]
+    bot._price = lambda sym: 0.9994
+    bot._check_take_profit("AUSDT")
+    assert 61 in eng.positions and not enviados and not eng.closed_trades   # cancelado: sigue abierta
+    assert p.tp_rejects == 1
+    bot._price = lambda sym: 0.998                                      # ya cubre las fees: cierra
+    bot._check_take_profit("AUSDT")
+    assert 61 not in eng.positions and enviados[-1]["action"] == "close"
+    assert eng.closed_trades[0]["reason"] == "TP" and eng.closed_trades[0]["pnl"] > 0
+
+
+def test_tp_por_ratio_o_rsi_con_pnl_negativo_se_cancela_pero_el_sl_no(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    enviados = []
+    bot.executor.send = lambda payload, *a, **k: enviados.append(payload)
+    eng = bot.engines[st.ENGINE_RATIO]
+    for tid in (71, 72, 73):
+        _abierta_ratio(bot, st.ENGINE_RATIO, tid)                       # SHORT desde 1.0
+    assert not bot._close(71, 1.02, "TP_RATIO")                         # el precio subió: perdería
+    assert not bot._close(72, 1.02, "TP_RSI_VWAP")
+    assert 71 in eng.positions and 72 in eng.positions and not enviados
+    assert bot._close(73, 1.02, "SL") and eng.closed_trades[0]["pnl"] < 0   # el SL y los demás no se frenan
+    assert bot._close(71, 0.98, "TP_RATIO") and eng.closed_trades[0]["pnl"] > 0
+
