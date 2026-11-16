@@ -194,7 +194,6 @@ def test_seguimiento_entra_si_cruza_y_no_abre_si_baja(tmp_path, monkeypatch):
         bot.filters[s] = {"stepSize": 1, "minQty": 0, "minNotional": 5}
     bot.executor.send = lambda *a, **k: None
     bot._price = lambda sym: 1.0
-    bot._refine_entry = lambda *a, **k: None
     bot.funding_cfg.update(open_before_s=0.6, close_after_s=0.1)
     monkeypatch.setattr(st, "FUNDING_TRACK_END_S", 0.05)
     monkeypatch.setattr(st, "FUNDING_TRACK_RATIO", 0.5)              # también los cercanos
@@ -338,7 +337,6 @@ def test_solo_opera_contratos_en_trading(tmp_path, monkeypatch):
     for s in ("AUSDT", "BUSDT"):
         bot.filters[s] = {"stepSize": 1, "minQty": 0, "minNotional": 5}
     bot._price = lambda sym: 1.0
-    bot._refine_entry = lambda *a, **k: None
     bot.funding_cfg.update(open_before_s=0.6, close_after_s=0.1)
     monkeypatch.setattr(st, "FUNDING_TRACK", False)
     bot._filters_ok_ts = time.time()                     # exchangeInfo recién pedido: lo que falta no es operable
