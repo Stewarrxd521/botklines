@@ -844,3 +844,14 @@ def test_tp_por_ratio_o_rsi_con_pnl_negativo_se_cancela_pero_el_sl_no(tmp_path, 
     assert bot._close(73, 1.02, "SL") and eng.closed_trades[0]["pnl"] < 0   # el SL y los demás no se frenan
     assert bot._close(71, 0.98, "TP_RATIO") and eng.closed_trades[0]["pnl"] > 0
 
+
+def test_el_tp_en_binance_nunca_queda_por_debajo_de_las_fees(tmp_path, monkeypatch):
+    bot = _bot_sin_red(tmp_path, monkeypatch)
+    bot.fee_pct = 0.05
+    p = _abierta_ratio(bot, st.ENGINE_RATIO_REV, 81, revenge=True)    # SHORT desde 1.0
+    p.tp_price = 0.9995                                                # más corto que las fees
+    tp = bot._open_tp(p)["tp"]
+    assert tp == pytest.approx(0.9995 / 1.0005) and bot._net_pnl(p, tp) == pytest.approx(0.0, abs=1e-9)
+    p.tp_price = 0.9                                                   # un TP normal no se toca
+    assert bot._open_tp(p) == {"tp": 0.9}
+

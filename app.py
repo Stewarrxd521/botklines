@@ -2576,10 +2576,22 @@ class KlineBot:
         cfg = self._exit_cfg(name)
         return tp_sl_prices(entry, direction, cfg["tp_pct"], cfg["sl_pct"])
 
+    def _exchange_tp(self, pos: Position) -> float:
+        """TP que se pone en Binance: el de la posición, pero nunca por debajo del punto en que el
+        PnL neto (fees de entrada y salida) es 0. Así Binance no cierra el lote en un nivel que el
+        bot rechazaría como TP en negativo (_tp_without_profit)."""
+        tp = pos.tp_price
+        if tp <= 0 or pos.entry_price <= 0:
+            return tp
+        f = self.fee_pct / 100.0
+        if pos.direction == LONG:
+            return max(tp, pos.entry_price * (1 + f) / (1 - f))
+        return min(tp, pos.entry_price * (1 - f) / (1 + f))
+
     def _open_tp(self, pos: Position) -> dict:
         """Campo "tp" de la apertura. El executor pone un TP POR trade_id, con la cantidad de
         esa posición (su lote), aunque haya otros bots en el mismo par y dirección."""
-        tp = 0.0 if pos.inverted else pos.tp_price          # invertida: tp_price es su SL
+        tp = 0.0 if pos.inverted else self._exchange_tp(pos)   # invertida: tp_price es su SL
         if tp > 0 and self.send_tp:
             pos.ex_tp = tp
             return {"tp": tp}
@@ -2590,7 +2602,7 @@ class KlineBot:
         Binance (open_tp de ese trade_id) o lo quita (close_tp) si ya no tiene TP por precio."""
         if not pos.sent:
             return
-        tp = 0.0 if pos.inverted or not self.send_tp else pos.tp_price
+        tp = 0.0 if pos.inverted or not self.send_tp else self._exchange_tp(pos)
         if tp == pos.ex_tp:
             return
         base = {"trade_id": pos.trade_id, "symbol": pos.symbol, "direction": pos.direction, "strategy": pos.strategy}
