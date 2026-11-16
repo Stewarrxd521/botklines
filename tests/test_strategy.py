@@ -131,9 +131,6 @@ def _bot_sin_red(tmp_path, monkeypatch):
         raise RuntimeError("sin red en las pruebas")
     bot._rest_get = sin_red
 
-    async def sin_ws(sym):
-        raise RuntimeError("sin red en las pruebas")
-    bot._ws_depth = sin_ws
     bot._alt_http = sin_red
     return bot
 
@@ -928,3 +925,18 @@ def test_venganza_en_la_misma_direccion_espera_al_cierre(tmp_path, monkeypatch):
     assert len(v) == 1 and v[0].direction == st.SHORT
     assert enviados[-1]["action"] == "open" and enviados[-1]["direction"] == st.SHORT and "tp" in enviados[-1]
 
+
+
+def test_al_restaurar_el_estado_arranca_y_pone_la_venganza_de_las_abiertas(tmp_path, monkeypatch):
+    """Tras un reinicio con estado guardado el arranque no falla y las ratio_rev abiertas (también las de antes
+    de esta versión, sin venganza puesta) dejan su entrada stop contraria en Binance."""
+    bot, enviados, eng, pos = _rev_bot(tmp_path, monkeypatch)
+    doc = {"positions": {str(pos.trade_id): {**st.asdict(pos), "rev_stop_id": 0, "rev_stop_px": 0.0}}}
+    enviados.clear()
+    eng.positions.clear()
+    bot.store.take_restore = lambda: (doc, [], "test")
+    bot.store.enable_writes = lambda: True
+    bot._restore_from_store()
+    p = eng.positions[pos.trade_id]
+    stops = [e for e in enviados if e["action"] == "open_stop"]
+    assert len(stops) == 1 and stops[0]["trade_id"] == p.rev_stop_id and stops[0]["direction"] == st.LONG

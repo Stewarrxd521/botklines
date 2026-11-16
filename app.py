@@ -859,6 +859,13 @@ class ExecutorBridge:
         self.last_total_ms = total_ms
         since = f" | desde el mensaje de Binance {total_ms:.0f} ms" if t0 else ""
         self._log(f"[executor] ✓ {what} → {target.url} | HTTP {http_ms:.0f} ms{since}")
+        try:   # HTTP 200 con ok:false = el executor la rechazó (pausado, bloqueado, cuenta One-way…)
+            body = json.loads(data or b"{}")
+        except (ValueError, TypeError):
+            body = None
+        if isinstance(body, dict) and body.get("ok") is False:
+            self.last_error = f"{what}: rechazada por el executor: {body.get('error') or body.get('detail') or body}"
+            self._log(f"[executor] ⚠ {self.last_error}")
         return True
 
     def send(self, payload: dict, t0: float = 0.0) -> None:
@@ -4988,9 +4995,8 @@ class KlineBot:
             self.target_hits = int(doc.get("target_hits") or 0)
             self.trade_id_seq = max(int(doc.get("trade_id_seq") or 0), *[p.trade_id for p in all_pos], 0)
         self._refresh_pos_syms()
-        self._apply_ratio_exits()                   # TP/SL vigentes también para las recuperadas
-        for p in all_pos:                           # entrada real de las que aún no la tenían
-            self._watch_executor_entry(self.engines[p.strategy], p)
+        # TP/SL vigentes también para las recuperadas (y su venganza contraria puesta en Binance).
+        self._apply_ratio_exits()
         if not self.store.enable_writes():
             self.log("[estado] Perdí el control mientras aplicaba el estado; sigo esperando")
             return
@@ -5072,6 +5078,7 @@ class KlineBot:
         self.store.mark_dirty(True)
         for p in added:
             self._sync_executor_tp(p)                   # su TP en Binance, con la config vigente
+            self._sync_rev_stop(p)                      # y su venganza contraria (si toca)
             self._on_price_event(p.symbol, "recuperada")
         self.log("[estado] Recuperadas del executor: " + ", ".join(
             f"{ENGINE_LABELS[p.strategy]}: {p.direction} {p.symbol} #{p.trade_id} @ {p.entry_price:g} qty {p.qty:g}"
