@@ -213,6 +213,8 @@ REVENGE_RECOVER_PCT = float(os.getenv("REVENGE_RECOVER_PCT", "64"))   # TP = est
 REVENGE_SL_PCT      = float(os.getenv("REVENGE_SL_PCT", "150"))       # SL = este % de (pérdida × N) en USD
 REVENGE_DIR         = os.getenv("REVENGE_DIR", "opposite")            # opposite | same (respecto a la perdedora)
 REVENGE_SKIP_REASONS = ("OBJETIVO", "CERRAR_TODAS")                   # cierres que no disparan venganza
+# Cierres "por TP": si a ese precio el PnL neto sale negativo, el cierre se cancela (_tp_without_profit).
+TP_REASONS = ("TP", "TP_RATIO", "TP_RSI_VWAP")
 
 # Bot de funding alto: abre en el lado que COBRA el funding justo antes del cobro y cierra justo después.
 FUNDING_ENABLED       = os.getenv("FUNDING_ENABLED", "true").lower() in ("1", "true", "yes")
@@ -332,22 +334,10 @@ EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "clave-secreta-aleatoria")
 ADMIN_TOKEN     = os.getenv("ADMIN_TOKEN", "").strip()
 EXECUTOR_WORKERS = max(1, int(os.getenv("EXECUTOR_WORKERS", "4")))      # envíos en paralelo
 EXECUTOR_WARM_S  = float(os.getenv("EXECUTOR_WARM_S", "20"))            # HEAD para mantener viva la conexión
-# Precios REALES de entrada y salida: se le piden al executor (GET /api/state, comprimido), que es
-# quien ejecuta en Binance. Solo se consulta mientras haya aperturas o cierres esperando su precio:
-# una consulta sirve para todos los pendientes. Si el executor no lo da a tiempo, queda el del libro.
-EXECUTOR_FILLS = os.getenv("EXECUTOR_FILLS", "true").lower() in ("1", "true", "yes")
-EXECUTOR_FILL_FIRST_S = max(0.3, float(os.getenv("EXECUTOR_FILL_FIRST_S", "1")))   # 1.ª consulta tras la señal
-EXECUTOR_FILL_EVERY_S = max(0.5, float(os.getenv("EXECUTOR_FILL_EVERY_S", "1.5")))   # reintentos
-EXECUTOR_FILL_WAIT_S  = max(5.0, float(os.getenv("EXECUTOR_FILL_WAIT_S", "45")))   # entrada: espera máxima
-# Cierre: el cierre en papel espera como mucho esto al precio del executor antes de usar el del libro.
-EXECUTOR_CLOSE_WAIT_S = max(0.0, float(os.getenv("EXECUTOR_CLOSE_WAIT_S", "15")))
 # Tras un reinicio, las abiertas que el bot perdió (sin estado guardado) se recuperan del executor:
 # cada lote abierto con un trade_id del bot que el bot no tiene vuelve como posición.
 EXECUTOR_RECOVER = os.getenv("EXECUTOR_RECOVER", "true").lower() in ("1", "true", "yes")
 EXECUTOR_RECOVER_TRIES = max(1, int(os.getenv("EXECUTOR_RECOVER_TRIES", "6")))   # Render puede estar dormido
-# Un cierre del executor sin ese trade_id (cierre parcial, o lo cerró Binance) se empareja por par,
-# dirección y SEGUNDO de cierre: el del bot y el del executor no difieren en más que esto.
-EXECUTOR_CLOSE_MATCH_S = max(0.5, float(os.getenv("EXECUTOR_CLOSE_MATCH_S", "2")))
 
 # ── Persistencia ──────────────────────────────────────────────────────────────
 SETTINGS_FILE     = os.getenv("SETTINGS_FILE", os.path.join(_HERE, "bot_settings.json"))
@@ -374,18 +364,6 @@ WATCH_LIVE_PRICE = os.getenv("WATCH_LIVE_PRICE", "true").lower() in ("1", "true"
 # Demora mínima (s) entre la apertura y un cierre por precio, ratio o indicador (editable en la web):
 # evita cerrar en el mismo tick de la apertura (las de 0 s salían con el precio del disparo, no el real).
 MIN_HOLD_S = max(0.0, float(os.getenv("MIN_HOLD_S", "2")))
-# Precio de apertura/cierre en papel como el executor: libro de 20 niveles (asks para comprar, bids
-# para vender), medio ponderado de la cantidad; sin libro, mejor ask/bid; sin eso, el precio en vivo.
-BOOK_FILL = os.getenv("BOOK_FILL", "true").lower() in ("1", "true", "yes")
-# TP por precio: antes de cerrar se confirma con el libro que la salida llega al TP; si no, no cierra.
-TP_BOOK_CHECK = os.getenv("TP_BOOK_CHECK", "true").lower() in ("1", "true", "yes")
-BOOK_DEPTH = 20
-BOOK_MAX_AGE_S = float(os.getenv("BOOK_MAX_AGE_S", "1.5"))     # libro reutilizable (los 3 bots de ratio)
-BOOK_TIMEOUT_S = float(os.getenv("BOOK_TIMEOUT_S", "2"))
-# El libro se toma por WebSocket (sin REST). Desde 2026-04 el libro va por /public; se prueban en orden.
-BOOK_WS_URLS = [u.strip().rstrip("/") for u in os.getenv(
-    "BOOK_WS_URLS", "wss://fstream.binance.com/public/ws,wss://fstream.binance.com/market/ws,"
-                    "wss://fstream.binance.com/ws").split(",") if u.strip()]
 # TP por RSI + VWAP ±kσ (UTC) de los bots de ratio, con velas 1m: REST una vez y WebSocket después.
 IND_RSI_PERIOD = int(os.getenv("IND_RSI_PERIOD", "14"))
 IND_RSI_LEVEL = float(os.getenv("IND_RSI_LEVEL", "13"))       # SHORT: RSI < 13 · LONG: RSI > 87
@@ -610,29 +588,6 @@ def net_pnl_usd(price: float, entry: float, qty: float, direction: str, fee_pct:
     if price <= 0:
         return 0.0
     return pnl_usd(price, entry, qty, direction) - fees_usd(entry, price, qty, fee_pct)
-
-
-def walk_book(levels, qty: float) -> Optional[float]:
-    """Precio medio ponderado de una orden de mercado de `qty` contra `levels` [(precio, cantidad)]
-    ordenados del mejor al peor (asks para comprar, bids para vender), como el executor: lo que
-    pase de los niveles recibidos se valora al peor precio visto. None si no hay niveles válidos."""
-    left, cost, last = qty, 0.0, 0.0
-    for row in levels or ():
-        try:
-            px, q = float(row[0]), float(row[1])
-        except (TypeError, ValueError, IndexError):
-            continue
-        if px <= 0 or q <= 0:
-            continue
-        if qty <= 0:
-            return px
-        take = min(left, q)
-        cost, left, last = cost + take * px, left - take, px
-        if left <= 1e-12:
-            break
-    if last <= 0 or qty <= 0:
-        return None
-    return round((cost + max(left, 0.0) * last) / qty, 10)
 
 
 # ── Indicadores progresivos (velas 1m): RSI de Wilder y VWAP diario UTC con bandas σ ──
@@ -956,66 +911,6 @@ def _num(v) -> float:
         return 0.0
 
 
-def parse_executor_fills(state: dict) -> Tuple[Dict[int, float], Dict[int, Tuple[float, float]],
-                                                List[Tuple[str, str, float, float]]]:
-    """Del /api/state del executor saca, por trade_id del bot:
-      entradas: precio medio real de la orden de apertura (tranches[].fill_price);
-      cierres:  (close_price, closed_ts) de la posición del executor que contenía ese trade_id.
-    El executor agrupa en una posición los lotes de todos los bots en el mismo par y dirección:
-    la entrada es por lote, el cierre solo existe cuando la posición entera se cierra.
-    Además, la lista de cierres (par, dirección, precio, segundo) para emparejar por hora."""
-    entries: Dict[int, float] = {}
-    closes: Dict[int, Tuple[float, float]] = {}
-    closed: List[Tuple[str, str, float, float]] = []
-    for key in ("open_trades", "closed_trades"):
-        for t in state.get(key) or []:
-            if not isinstance(t, dict):
-                continue
-            ids = set()
-            for tr in t.get("tranches") or []:
-                if not isinstance(tr, dict):
-                    continue
-                tid = int(_num(tr.get("trade_id")))
-                if tid <= 0:
-                    continue
-                ids.add(tid)
-                px = _num(tr.get("fill_price"))
-                if px > 0 and tr.get("price_real", True) is not False:
-                    entries[tid] = px
-            if key != "closed_trades":
-                continue
-            for pid in list(t.get("paper_ids") or []) + list((t.get("lots") or {}).keys()):
-                tid = int(_num(pid))
-                if tid > 0:
-                    ids.add(tid)
-            cpx = _num(t.get("close_price"))
-            if cpx <= 0:
-                continue
-            cts = _num(t.get("closed_ts"))
-            if cts > 0:
-                closed.append((str(t.get("symbol") or "").upper(), str(t.get("direction") or "").upper(), cpx, cts))
-            for tid in ids:
-                if tid not in closes or cts >= closes[tid][1]:
-                    closes[tid] = (cpx, cts)
-    return entries, closes, closed
-
-
-def match_executor_close(tid: int, symbol: str, direction: str, since: float,
-                         closes: Dict[int, Tuple[float, float]],
-                         closed: List[Tuple[str, str, float, float]]) -> Optional[Tuple[float, float]]:
-    """(precio, segundo) del cierre real de `tid`: por trade_id, o si no está, el cierre del mismo par
-    y dirección más cercano al segundo en que el bot lo mandó (como mucho EXECUTOR_CLOSE_MATCH_S)."""
-    c = closes.get(tid)
-    if c and (not c[1] or c[1] >= since - EXECUTOR_CLOSE_MATCH_S - 3):
-        return c
-    best = None
-    for sym, d, px, ts in closed:
-        if sym == symbol and d == direction and abs(ts - since) <= EXECUTOR_CLOSE_MATCH_S:
-            if best is None or abs(ts - since) < abs(best[1] - since):
-                best = (px, ts)
-    return best
-
-
 def executor_open_lots(state: dict) -> List[dict]:
     """Lotes abiertos del bot en el executor: uno por tranche con trade_id de una posición abierta
     (las "adoptadas" sin tranche no son del bot). qty = la del bot (bot_qty) si la hay."""
@@ -1043,121 +938,6 @@ def executor_open_lots(state: dict) -> List[dict]:
                         "ts": _num(tr.get("ts")) or _num(tr.get("fill_ms")) / 1000.0 or _num(t.get("opened_ts")),
                         "strategy": str(tr.get("strategy") or t.get("strategy") or t.get("bot") or "")})
     return out
-
-
-class ExecutorFills:
-    """Pide al executor los precios reales de entrada y de cierre. Un hilo propio, dormido mientras
-    no haya nada pendiente: así no gasta ancho de banda. Cada consulta resuelve todos los pendientes.
-    cb(precio) se llama UNA vez: con el precio del executor, o con 0.0 si no llegó a tiempo."""
-
-    def __init__(self, bridge: ExecutorBridge, logger=print) -> None:
-        self.bridge = bridge
-        self.logger = logger
-        self._pending: Dict[Tuple[str, int], dict] = {}
-        self._cv = threading.Condition()
-        self._thread: Optional[threading.Thread] = None
-        self.fetches = 0
-        self.fetch_errors = 0
-        self.bytes_in = 0
-        self.entries_fixed = 0
-        self.closes_fixed = 0
-        self.timeouts = 0
-        self.last_error = ""
-        self.last_fetch_ts = 0.0
-
-    def watch(self, kind: str, trade_id: int, cb, wait_s: float, since: float = 0.0,
-              symbol: str = "", direction: str = "") -> None:
-        """kind: "entry" | "close". since: segundo (s Unix) en que el bot mandó el cierre.
-        cb(precio, segundo): segundo = hora real del cierre en el executor (0 si no la hay)."""
-        now = time.time()
-        with self._cv:
-            self._pending[(kind, int(trade_id))] = {
-                "cb": cb, "due": now + EXECUTOR_FILL_FIRST_S, "deadline": now + wait_s, "since": since,
-                "symbol": symbol.upper(), "direction": direction.upper()}
-            if self._thread is None:
-                self._thread = threading.Thread(target=self._run, daemon=True, name="executor-fills")
-                self._thread.start()
-            self._cv.notify()
-
-    def pending(self) -> int:
-        with self._cv:
-            return len(self._pending)
-
-    def _log(self, msg: str) -> None:
-        try:
-            self.logger(msg)
-        except Exception:
-            pass
-
-    def _run(self) -> None:
-        conns: Dict[Tuple[str, str], http.client.HTTPConnection] = {}
-        while True:
-            with self._cv:
-                while not self._pending:
-                    for c in conns.values():        # sin pendientes: nada abierto
-                        c.close()
-                    conns.clear()
-                    self._cv.wait()
-                wait = min(min(i["due"], i["deadline"]) for i in self._pending.values()) - time.time()
-                if wait > 0:
-                    self._cv.wait(wait)
-                    continue
-            self._poll(conns)
-
-    def _poll(self, conns: dict) -> None:
-        now = time.time()
-        entries: Dict[int, float] = {}
-        closes: Dict[int, Tuple[float, float]] = {}
-        closed: List[Tuple[str, str, float, float]] = []
-        with self._cv:
-            asking = any(i["due"] <= now for i in self._pending.values())
-        if asking and self.bridge.target.url:
-            try:
-                doc, wire = self.bridge.fetch_state(conns)
-                self.fetches += 1
-                self.bytes_in += wire
-                self.last_fetch_ts = time.time()
-                entries, closes, closed = parse_executor_fills(doc)
-            except Exception as exc:
-                self.fetch_errors += 1
-                self.last_error = str(exc)
-                for c in conns.values():
-                    c.close()
-                conns.clear()
-        done: List[Tuple[str, int, dict, float, float]] = []
-        now = time.time()
-        with self._cv:
-            for (kind, tid), item in list(self._pending.items()):
-                px, ts = 0.0, 0.0
-                if kind == "entry":
-                    px = entries.get(tid, 0.0)
-                else:
-                    c = match_executor_close(tid, item["symbol"], item["direction"], item["since"], closes, closed)
-                    if c:
-                        px, ts = c
-                if px > 0 or now >= item["deadline"]:
-                    done.append((kind, tid, item, px, ts))
-                    del self._pending[(kind, tid)]
-                elif item["due"] <= now:
-                    item["due"] = now + EXECUTOR_FILL_EVERY_S
-        for kind, tid, item, px, ts in done:
-            if px > 0:
-                if kind == "entry":
-                    self.entries_fixed += 1
-                else:
-                    self.closes_fixed += 1
-            else:
-                self.timeouts += 1
-            try:
-                item["cb"](px, ts)
-            except Exception as exc:
-                self._log(f"[executor] error aplicando el precio de {kind} #{tid}: {exc!r}")
-
-    def stats(self) -> dict:
-        return {"enabled": EXECUTOR_FILLS, "pending": self.pending(), "fetches": self.fetches,
-                "errors": self.fetch_errors, "bytes": self.bytes_in, "entries": self.entries_fixed,
-                "closes": self.closes_fixed, "timeouts": self.timeouts, "last_error": self.last_error,
-                "last_fetch": _utc(self.last_fetch_ts, "%H:%M:%S") if self.last_fetch_ts else ""}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1204,9 +984,15 @@ class Position:
     rev_tp_usd:    float = 0.0  # objetivo de la venganza en USD (neto) y su stop en USD
     rev_sl_usd:    float = 0.0
     ex_tp:         float = 0.0      # TP puesto en Binance por el executor (0 = ninguno)
-    signal_price:  float = 0.0      # precio de la señal (entry_price es el del libro)
-    entry_src:     str = ""         # de dónde salió entry_price: libro | mejor ask/bid | precio
-    tp_rejects:    int = 0          # veces que el precio tocó el TP pero el libro no llegaba (no cerró)
+    # ── Venganza contraria ya puesta en Binance (entrada STOP_MARKET en el SL de esta posición) ──
+    rev_stop_id:   int = 0          # trade_id de esa venganza (0 = ninguna puesta)
+    rev_stop_px:   float = 0.0      # nivel de disparo (= SL de esta posición)
+    rev_stop_qty:  float = 0.0
+    rev_stop_tp:   float = 0.0      # TP y SL de la venganza (precio)
+    rev_stop_sl:   float = 0.0
+    signal_price:  float = 0.0      # precio de la señal (entry_price es el precio en vivo)
+    entry_src:     str = ""         # de dónde salió entry_price: precio en vivo | señal | executor
+    tp_rejects:    int = 0          # cierres por TP cancelados porque el PnL neto salía negativo
     # ── Solo bot de funding ──
     funding_rate:  float = 0.0      # tasa de funding (%) vista al entrar
     funding_ts:    float = 0.0      # momento del cobro (s Unix, hora de Binance); 0 = no es de funding
@@ -1493,7 +1279,6 @@ class KlineBot:
         self.started_at = time.time()
 
         self._pos_syms: frozenset = frozenset()     # copia para el hilo del WS (sin lock)
-        self._book_ws_ok = ""                       # última URL que dio el libro por WebSocket
         # Símbolos con precio pedido antes de una entrada → cuántos lo piden (ratio, funding, exploración
         # horaria). Con un contador, soltar el de uno no da de baja el precio que otro sigue esperando.
         self._price_hold: Dict[str, int] = {}
@@ -1513,7 +1298,6 @@ class KlineBot:
         self.executor = ExecutorBridge(settings.get("executor_url", EXECUTOR_URL),
                                        settings.get("executor_secret", EXECUTOR_SECRET),
                                        logger=self.log)
-        self.fills = ExecutorFills(self.executor, logger=self.log)   # precios reales del executor
         self.executor_changed_ts = float(settings.get("executor_changed_ts") or 0.0)
         # Parámetros de cada bot, editables en caliente desde la web. Los
         # ajustes de la versión de un solo bot (claves sueltas) pasan al de cierre.
@@ -1662,13 +1446,7 @@ class KlineBot:
         except (TypeError, ValueError):
             self.min_hold_s = MIN_HOLD_S
         self._hold_wakes: Dict[str, object] = {}       # símbolo → revisión programada al cumplir la demora
-        # Libro de órdenes (REST, 20 niveles) para los precios en papel: símbolo → (ts, bids, asks, origen).
-        self._books: Dict[str, Tuple[float, list, list, str]] = {}
-        self._book_inflight: Dict[str, object] = {}
-        self._tp_checking: set = set()                  # TPs por precio esperando el libro
-        self._tp_reject_log: Dict[int, float] = {}
-        self.book_fetches = 0
-        self.book_errors = 0
+        self._tp_reject_log: Dict[int, float] = {}      # TP sin ganancia neta: último aviso en el log
         # TP por RSI + VWAP ±kσ (UTC) de los bots de ratio: parámetros comunes, encendido por bot.
         self.ind_cfg = self._load_ind_cfg(settings.get("indicators"))
         self._ind: Dict[str, CandleIndicators] = {}   # símbolo → indicadores al día (vela a vela)
@@ -1926,7 +1704,7 @@ class KlineBot:
         return {"inverted": self.inverted, "fee_pct": self.fee_pct, "klines_enabled": self.klines_enabled,
                 "profit_target_usd": self.profit_target_usd, "max_open": self.max_open,
                 "executor_paused": self.executor_paused, "watch_live_price": self.watch_live,
-                "fast_prices": self.fast_prices, "min_hold_s": self.min_hold_s, "book_fill": BOOK_FILL,
+                "fast_prices": self.fast_prices, "min_hold_s": self.min_hold_s,
                 "send_tp": self.send_tp}
 
     def open_count(self) -> int:
@@ -1981,7 +1759,7 @@ class KlineBot:
         left = [len(targets) + 1]
 
         def one_done() -> None:
-            # La sesión se reinicia cuando TODOS los cierres están contabilizados (al precio del libro).
+            # La sesión se reinicia cuando TODOS los cierres están contabilizados (al precio en vivo).
             left[0] -= 1
             if left[0] > 0:
                 return
@@ -2110,7 +1888,7 @@ class KlineBot:
         ic = self.ind_cfg
         self.log(f"TP RSI/VWAP: {', '.join(ind_on) or 'apagado en los tres bots'} | RSI({ic['rsi_period']}) "
                  f"< {ic['rsi_level']:g} / > {100 - ic['rsi_level']:g} · VWAP ±{ic['vwap_k']:g}σ UTC | "
-                 f"demora mínima {self.min_hold_s:g} s | precios en papel: {'libro 20 niveles' if BOOK_FILL else 'señal'}")
+                 f"demora mínima {self.min_hold_s:g} s | entrada y salida con el precio en vivo")
 
         if self.klines_enabled:
             self._start_klines()
@@ -2462,8 +2240,7 @@ class KlineBot:
             self.log(f"[{eng.label}] señal {direction} {symbol} ({body:+.2f}%) saltada: {why}")
             return skip(f"saltada: {why}")
 
-        # Sale ya al executor con el precio en vivo; la entrada en papel se corrige con el libro.
-        px, src = self._fill_from_book(symbol, direction == LONG, qty, price)
+        px, src = self._fill_price(symbol, price)
         self._open_kline(eng, symbol, direction, candle, body, age, qty, price, px, src, inverted, t0, skip)
 
     def _open_kline(self, eng: Engine, symbol: str, direction: str, candle: Candle, body: float, age: float,
@@ -2504,7 +2281,6 @@ class KlineBot:
                 **self._open_tp(pos),
             }, t0)
         eng._decide_ms.append(decide_ms)
-        self._refine_entry(eng, pos)
 
     # ── Salidas: ticks de precio (hilo del WS de precios) ─────────────────────
 
@@ -2543,8 +2319,9 @@ class KlineBot:
         return pc.get_price(symbol, max_age_s=PRICE_MAX_AGE_S)
 
     def _check_take_profit(self, symbol: str) -> None:
-        """Revisa la salida (TP/SL por precio) de TODAS las posiciones abiertas del
-        símbolo, de todos los bots."""
+        """Revisa la salida (TP/SL por precio) de TODAS las posiciones abiertas del símbolo, de
+        todos los bots, con el precio en vivo. Si toca, cierra ya con ese precio: sin libro ni
+        consultas al executor, para no perder el nivel en un movimiento rápido."""
         price = self._price(symbol)
         if not price:
             return
@@ -2573,66 +2350,45 @@ class KlineBot:
             self._wake_after_hold(symbol, wait)
         if hits and self.store.can_act():
             for tid, reason in hits:
-                if reason == "TP" and BOOK_FILL and TP_BOOK_CHECK:
-                    self._close_tp_checked(tid, price)
-                else:
-                    self._close(tid, price, reason)
+                self._close(tid, price, reason)
 
-    def _close_tp_checked(self, trade_id: int, trigger: float) -> None:
-        """TP por precio confirmado con el libro: en un mechazo el último precio puede tocar el TP
-        sin que haya bids/asks a ese nivel. Antes de enviar el cierre se valora la salida con el
-        libro (bids si cierra un LONG, asks si cierra un SHORT); si no llega al TP (igual o mejor),
-        el cierre se rechaza y la posición sigue abierta hasta que el TP se cumpla de verdad."""
-        with self.lock:
-            _eng, pos = self._find(trade_id)
-            if pos is None or trade_id in self._closing or trade_id in self._tp_checking:
-                return
-            self._tp_checking.add(trade_id)
-            sym, direction, qty, tp = pos.symbol, pos.direction, pos.qty, pos.tp_price
-
-        def decide(px: float, src: str) -> None:
-            self._tp_checking.discard(trade_id)
-            _e, p = self._find(trade_id)
-            if p is None:
-                return
-            if exit_hit(px, tp, direction):
-                self._close(trade_id, px, "TP")
-                return
-            p.tp_rejects += 1
-            now = time.time()
-            if now - self._tp_reject_log.get(trade_id, 0.0) >= 30:
-                self._tp_reject_log[trade_id] = now
-                got = favorable_move_pct(px, p.entry_price, direction)
-                want = favorable_move_pct(tp, p.entry_price, direction)
-                self.log(f"[TP] #{trade_id} {sym} {direction}: el precio tocó el TP ({trigger:g}) pero el libro "
-                         f"da {px:g}{f' ({src})' if src else ''} = {got:+.2f}% < TP {want:+.2f}%: cierre rechazado, "
-                         f"sigue abierta (rechazos: {p.tp_rejects})")
-
-        try:
-            self._with_fill(sym, direction == SHORT, qty, trigger, decide)
-        except Exception:
-            self._tp_checking.discard(trade_id)
-            raise
+    def _tp_without_profit(self, pos: Position, price: float, reason: str) -> bool:
+        """Un cierre por TP (precio, ratio o RSI/VWAP) que a `price` saldría con PnL neto negativo
+        (fees incluidas) no es un TP: se cancela y la posición sigue abierta. Con el lock tomado."""
+        if reason not in TP_REASONS:
+            return False
+        pnl = self._net_pnl(pos, price)
+        if pnl >= 0:
+            return False
+        pos.tp_rejects += 1
+        now = time.time()
+        if now - self._tp_reject_log.get(pos.trade_id, 0.0) >= 30:
+            self._tp_reject_log[pos.trade_id] = now
+            self.log(f"[TP] #{pos.trade_id} {pos.symbol} {pos.direction} ({reason}): a {price:g} el PnL neto sería "
+                     f"{pnl:+.4f} USDT (entrada {pos.entry_price:g}): cierre cancelado, sigue abierta "
+                     f"(cancelados: {pos.tp_rejects})")
+        return True
 
     def _close(self, trade_id: int, price: float, reason: str, on_done=None) -> bool:
-        """Cierra `trade_id`: la orden sale ya al executor (con `price`, el del disparo) y el cierre
-        en papel se valora con el libro en ese instante, como lo hace el executor (_with_fill)."""
+        """Cierra `trade_id` con `price` (el precio en vivo del disparo): la orden sale ya al
+        executor y el cierre en papel se contabiliza en el acto con ese mismo precio."""
         with self.lock:
             eng, pos = self._find(trade_id)
             if pos is None or trade_id in self._closing:
+                return False
+            if self._tp_without_profit(pos, price, reason):
                 return False
             self._closing.add(trade_id)
             pos = eng.positions.pop(trade_id, None)
             if pos is None:
                 self._closing.discard(trade_id)
                 return False
-            pos.update(price)
             symbol = pos.symbol
             # El executor suma en UNA posición las de todos los bots en el mismo par y
             # dirección: si queda otra enviada, se cierra solo la cantidad de esta.
             shared = pos.sent and any(p.sent and p.symbol == symbol and p.direction == pos.direction
                                       for e in self.engines.values() for p in e.positions.values())
-        sent_at = time.time()                   # el segundo del cierre: el de la orden, no el del registro
+        sent_at = time.time()                   # el segundo del cierre: el de la orden
         try:
             self._refresh_pos_syms()
             if pos.sent:                        # simulada: el executor nunca la abrió
@@ -2653,59 +2409,17 @@ class KlineBot:
             with self.lock:
                 self._closing.discard(trade_id)
             raise
-        # Cerrar un LONG es vender (bids); cerrar un SHORT, comprar (asks).
-        revenged = False
-        if self._may_revenge(eng, pos, reason):
-            # La venganza no espera la foto del libro (abrir un WebSocket nuevo tarda segundos): la
-            # pérdida se estima ya con el libro reciente, el precio en vivo o el disparo, y sale al
-            # executor ahora. El cierre en papel se corrige después con el libro.
-            est, _src = self._fill_from_book(symbol, pos.direction == SHORT, pos.qty, price)
-            est_pnl = net_pnl_usd(est, pos.entry_price, pos.qty, pos.direction, self.fee_pct)
-            if est_pnl < 0:
-                revenged = True
-                self._open_revenge(eng, pos, est, -est_pnl, reason)
-        self._with_fill(symbol, pos.direction == SHORT, pos.qty, price,
-                        lambda px, src: self._close_with_executor(eng, pos, px, src, price, reason, on_done,
-                                                                  revenged, sent_at))
+        self._finish_close(eng, pos, price, "precio en vivo", reason, on_done, sent_at)
         return True
-
-    def _on_bot_loop(self, fn, *args) -> None:
-        """Corre fn(*args) en el loop del bot si existe (las respuestas del executor llegan por otro hilo)."""
-        loop = self.loop
-        if loop is not None and loop.is_running() and not self._on_loop():
-            loop.call_soon_threadsafe(fn, *args)
-        else:
-            fn(*args)
-
-    def _close_with_executor(self, eng: Engine, pos: Position, book_px: float, book_src: str,
-                             trigger: float, reason: str, on_done, revenged: bool, sent_at: float) -> None:
-        """El cierre se contabiliza con el precio REAL que dio el executor; si no lo da en
-        EXECUTOR_CLOSE_WAIT_S (p. ej. cierre parcial de un par compartido), con el del libro."""
-        if not (EXECUTOR_FILLS and pos.sent and EXECUTOR_CLOSE_WAIT_S > 0 and self.executor.target.url):
-            return self._finish_close(eng, pos, book_px, book_src, trigger, reason, on_done, revenged, sent_at)
-
-        def got(px: float, ts: float) -> None:
-            if px > 0:
-                self._on_bot_loop(self._finish_close, eng, pos, px, "executor", trigger, reason, on_done,
-                                  revenged, ts or sent_at)
-            else:
-                self._on_bot_loop(self._finish_close, eng, pos, book_px,
-                                  f"{book_src or 'disparo'} (executor sin precio)", trigger, reason,
-                                  on_done, revenged, sent_at)
-
-        self.fills.watch("close", pos.trade_id, got, EXECUTOR_CLOSE_WAIT_S, since=sent_at,
-                         symbol=pos.symbol, direction=pos.direction)
 
     def _may_revenge(self, eng: Engine, pos: Position, reason: str) -> bool:
         """Este cierre puede abrir una venganza (si termina en pérdida)."""
         return (eng.name == ENGINE_RATIO_REV and not pos.revenge and bool(self.rev_cfg.get("revenge"))
                 and reason not in REVENGE_SKIP_REASONS)
 
-    def _finish_close(self, eng: Engine, pos: Position, price: float, src: str,
-                      trigger: float, reason: str, on_done=None, revenged: bool = False,
-                      closed_at: float = 0.0) -> None:
-        """Contabiliza el cierre en papel al precio del libro y, si toca (y no salió ya al
-        cerrar), abre la venganza."""
+    def _finish_close(self, eng: Engine, pos: Position, price: float, src: str, reason: str,
+                      on_done=None, closed_at: float = 0.0) -> None:
+        """Contabiliza el cierre en papel al precio en vivo y, si cerró en pérdida, abre la venganza."""
         try:
             with self.lock:
                 pos.update(price)
@@ -2713,14 +2427,12 @@ class KlineBot:
                 fees = fees_usd(pos.entry_price, price, pos.qty, self.fee_pct)
                 funding = self._funding_paid(pos)
                 pnl = gross - fees + funding                # neto: fees de entrada y salida (+ funding cobrado)
-                # Hora del cierre: la del executor o la de la orden, no la de este registro (el libro o
-                # la respuesta del executor pueden tardar unos segundos en llegar).
                 now = closed_at or time.time()
                 rec = {
                     **asdict(pos),
                     "close_price": price,
                     "close_src": src,
-                    "trigger_price": trigger,
+                    "trigger_price": price,
                     "closed_at_ts": now,
                     "duration_s": now - pos.opened_ts,
                     "move_pct": favorable_move_pct(price, pos.entry_price, pos.direction),
@@ -2742,13 +2454,16 @@ class KlineBot:
                 # Misma sección crítica que contabiliza el cierre: el guardado lleva ambas cosas.
                 self.store.append_trade(rec)
             self.store.mark_dirty(True)
-            px_note = f" ({src}; disparo {trigger:g})" if src and price != trigger else ""
             self.log(f"[{eng.label}] CIERRA {pos.direction} {pos.symbol} ({reason}) | entrada {pos.entry_price:g} → "
-                     f"{price:g}{px_note} ({rec['move_pct']:+.2f}%) | PnL neto {pnl:+.4f} USDT (fees {fees:.4f}"
+                     f"{price:g} ({rec['move_pct']:+.2f}%) | PnL neto {pnl:+.4f} USDT (fees {fees:.4f}"
                      f"{f' · funding {funding:+.4f}' if pos.funding_ts else ''}) | "
                      f"{rec['duration_s']:.1f} s | trade #{pos.trade_id}")
-            if pnl < 0 and not revenged and self._may_revenge(eng, pos, reason):
-                self._open_revenge(eng, pos, price, -pnl, reason)
+            if pos.rev_stop_id and reason == "SL":
+                self._adopt_rev_stop(eng, pos, price, max(-pnl, 0.0), reason)   # ya entró en Binance
+            else:
+                self._cancel_rev_stop(pos)          # cerró sin llegar al SL: la venganza puesta sobra
+                if pnl < 0 and self._may_revenge(eng, pos, reason):
+                    self._open_revenge(eng, pos, price, -pnl, reason)
         finally:
             with self.lock:
                 self._closing.discard(pos.trade_id)
@@ -2756,153 +2471,18 @@ class KlineBot:
             if on_done is not None:
                 on_done()
 
-    # ── Precio de ejecución en papel: libro de órdenes, como el executor ──────
-
     def _on_loop(self) -> bool:
         try:
             return self.loop is not None and asyncio.get_running_loop() is self.loop
         except RuntimeError:
             return False
 
-    def _book_fresh(self, sym: str) -> bool:
-        b = self._books.get(sym)
-        return b is not None and time.time() - b[0] <= BOOK_MAX_AGE_S
-
-    async def _ws_depth(self, sym: str) -> Optional[Tuple[list, list]]:
-        """Foto del libro de 20 niveles por WebSocket (<par>@depth20@100ms: se conecta, toma el
-        primer mensaje y se cierra). No usa REST ni consume peso de la IP en Binance."""
-        stream = f"{sym.lower()}@depth20@100ms"
-        last_exc: Optional[Exception] = None
-        # Primero la URL que funcionó la última vez: las que no dan libro cuestan BOOK_TIMEOUT_S cada una.
-        urls = sorted(BOOK_WS_URLS, key=lambda u: u != self._book_ws_ok)
-        for base in urls:
-            try:
-                agen = _ws_messages(f"{base}/{stream}")
-                try:
-                    msg = await asyncio.wait_for(agen.__anext__(), BOOK_TIMEOUT_S)
-                finally:
-                    await agen.aclose()
-                d = json.loads(msg)
-                d = d.get("data", d) if isinstance(d, dict) else {}
-                bids, asks = d.get("b") or d.get("bids") or [], d.get("a") or d.get("asks") or []
-                if bids or asks:
-                    self._book_ws_ok = base
-                    return bids, asks
-            except Exception as exc:
-                last_exc = exc
-        raise RuntimeError(f"sin libro por WebSocket: {last_exc!r}")
-
-    async def _load_book(self, sym: str) -> None:
-        self.book_fetches += 1
-        try:
-            bids, asks = await self._ws_depth(sym)
-            self._books[sym] = (time.time(), bids, asks, "libro")
-        except Exception as exc:
-            self.book_errors += 1
-            self.last_error = f"libro {sym}: {exc}"
-
-    def _fetch_book(self, sym: str) -> None:
-        """Versión bloqueante (fuera del loop del bot: pruebas, hilos)."""
-        asyncio.run(self._load_book(sym))
-
-    def _fill_from_book(self, sym: str, buy: bool, qty: float, fallback: float) -> Tuple[float, str]:
-        """Precio de una orden de mercado de `qty`: el libro reciente (asks si compra, bids si
-        vende); si no hay, el precio en vivo; si tampoco, `fallback` (precio de la señal)."""
-        b = self._books.get(sym)
-        if b is not None and time.time() - b[0] <= BOOK_MAX_AGE_S:
-            px = walk_book(b[2] if buy else b[1], qty)
-            if px:
-                return px, b[3]
+    def _fill_price(self, sym: str, fallback: float) -> Tuple[float, str]:
+        """Precio en papel de una apertura: el precio en vivo; si no hay, `fallback` (el de la señal)."""
         live = self._price(sym)
         if live:
             return live, "precio en vivo"
         return fallback, "señal"
-
-    def _with_fill(self, sym: str, buy: bool, qty: float, fallback: float, cont) -> None:
-        """cont(precio, origen) con el precio de ejecución en papel. Si hay que pedir el libro y
-        estamos en el loop del bot, se pide en segundo plano y cont corre al volver (no bloquea)."""
-        if not BOOK_FILL:
-            return cont(fallback, "")
-        if self._book_fresh(sym):
-            return cont(*self._fill_from_book(sym, buy, qty, fallback))
-        if not self._on_loop():
-            self._fetch_book(sym)
-            return cont(*self._fill_from_book(sym, buy, qty, fallback))
-
-        def done(_fut) -> None:
-            try:
-                cont(*self._fill_from_book(sym, buy, qty, fallback))
-            except Exception as exc:
-                self.last_error = f"{sym}: {exc!r}"
-                self.log(f"[libro] error tras pedir el libro de {sym}: {exc!r}")
-
-        fut = self._book_inflight.get(sym)              # una sola foto por par aunque cierren varias
-        if fut is None:
-            fut = asyncio.ensure_future(self._load_book(sym))
-            self._book_inflight[sym] = fut
-            fut.add_done_callback(lambda _f: self._book_inflight.pop(sym, None))
-        fut.add_done_callback(done)
-
-    def _refine_entry(self, eng: Engine, pos: Position) -> None:
-        """La orden ya salió al executor con el precio en vivo; en papel se pide el libro en
-        segundo plano y se corrige la entrada cuando llega (el TP/SL puesto no cambia)."""
-        self._watch_executor_entry(eng, pos)
-        if not BOOK_FILL or pos.entry_src in ("libro", "executor"):
-            return
-
-        def fix(px: float, src: str) -> None:
-            if src != "libro" or not px:
-                return
-            with self.lock:
-                if eng.positions.get(pos.trade_id) is not pos or pos.entry_src == "executor":
-                    return                              # ya cerró, o ya tiene el precio real
-                old = pos.entry_price
-                pos.entry_price, pos.notional, pos.entry_src = px, pos.qty * px, src
-            self.store.mark_dirty(True)
-            if px != old:
-                self.log(f"[libro] #{pos.trade_id} {pos.symbol} {pos.direction}: entrada en papel "
-                         f"{old:g} → {px:g} (libro)")
-
-        self._with_fill(pos.symbol, pos.direction == LONG, pos.qty, pos.entry_price, fix)
-
-    def _watch_executor_entry(self, eng: Engine, pos: Position) -> None:
-        """Pide al executor el precio real de la apertura y, cuando llega, corrige la entrada y
-        recalcula el TP/SL desde ella (y mueve el TP puesto en Binance si cambió)."""
-        if not (EXECUTOR_FILLS and pos.sent and pos.entry_src != "executor" and self.executor.target.url):
-            return
-
-        def got(px: float, _ts: float) -> None:
-            if px > 0:
-                self._on_bot_loop(self._apply_executor_entry, eng, pos, px)
-
-        self.fills.watch("entry", pos.trade_id, got, EXECUTOR_FILL_WAIT_S)
-
-    def _apply_executor_entry(self, eng: Engine, pos: Position, px: float) -> None:
-        with self.lock:
-            if eng.positions.get(pos.trade_id) is not pos and pos.trade_id not in self._closing:
-                return
-            old = pos.entry_price
-            pos.entry_price, pos.notional, pos.entry_src = px, pos.qty * px, "executor"
-            moved = False
-            if pos.trade_id not in self._closing and not pos.revenge and old > 0 and px != old:
-                if eng.name in RATIO_ENGINES:
-                    pos.tp_price, pos.sl_price = self._ratio_exit_prices(px, pos.direction, eng.name)
-                    moved = True
-                elif eng.name in KLINE_ENGINES:
-                    pos.tp_price = exit_price(px, pos.direction, eng.tp_pct, pos.inverted)
-                    moved = True
-            # Las excursiones se medían desde la entrada en papel: se rehacen desde la real.
-            if pos.last_price > 0:
-                pos.mfe_pct = pos.mae_pct = pos.mfe_usd = pos.mae_usd = 0.0
-                pos.update(pos.last_price)
-        self.store.mark_dirty(True)
-        if px != old:
-            self.log(f"[executor] #{pos.trade_id} {pos.symbol} {pos.direction}: entrada real {old:g} → {px:g}"
-                     + (f" | TP {pos.tp_price:g}" + (f" · SL {pos.sl_price:g}" if pos.sl_price else "")
-                        if moved else ""))
-        if moved:
-            self._sync_executor_tp(pos)
-            self._on_price_event(pos.symbol, "entrada real")
 
     # ── Demora mínima antes de cerrar ─────────────────────────────────────────
 
@@ -3006,10 +2586,22 @@ class KlineBot:
         cfg = self._exit_cfg(name)
         return tp_sl_prices(entry, direction, cfg["tp_pct"], cfg["sl_pct"])
 
+    def _exchange_tp(self, pos: Position) -> float:
+        """TP que se pone en Binance: el de la posición, pero nunca por debajo del punto en que el
+        PnL neto (fees de entrada y salida) es 0. Así Binance no cierra el lote en un nivel que el
+        bot rechazaría como TP en negativo (_tp_without_profit)."""
+        tp = pos.tp_price
+        if tp <= 0 or pos.entry_price <= 0:
+            return tp
+        f = self.fee_pct / 100.0
+        if pos.direction == LONG:
+            return max(tp, pos.entry_price * (1 + f) / (1 - f))
+        return min(tp, pos.entry_price * (1 - f) / (1 + f))
+
     def _open_tp(self, pos: Position) -> dict:
         """Campo "tp" de la apertura. El executor pone un TP POR trade_id, con la cantidad de
         esa posición (su lote), aunque haya otros bots en el mismo par y dirección."""
-        tp = 0.0 if pos.inverted else pos.tp_price          # invertida: tp_price es su SL
+        tp = 0.0 if pos.inverted else self._exchange_tp(pos)   # invertida: tp_price es su SL
         if tp > 0 and self.send_tp:
             pos.ex_tp = tp
             return {"tp": tp}
@@ -3020,7 +2612,7 @@ class KlineBot:
         Binance (open_tp de ese trade_id) o lo quita (close_tp) si ya no tiene TP por precio."""
         if not pos.sent:
             return
-        tp = 0.0 if pos.inverted or not self.send_tp else pos.tp_price
+        tp = 0.0 if pos.inverted or not self.send_tp else self._exchange_tp(pos)
         if tp == pos.ex_tp:
             return
         base = {"trade_id": pos.trade_id, "symbol": pos.symbol, "direction": pos.direction, "strategy": pos.strategy}
@@ -3055,6 +2647,7 @@ class KlineBot:
                         changed.append(p)
         for p in changed:
             self._sync_executor_tp(p)
+            self._sync_rev_stop(p)
         for sym in syms:
             self._on_price_event(sym, "config")
 
@@ -3091,6 +2684,11 @@ class KlineBot:
         self.rev_cfg = new
         if new["tp_pct"] != old["tp_pct"] or new["sl_pct"] != old["sl_pct"]:
             self._apply_ratio_exits((ENGINE_RATIO_REV,))
+        else:                                   # venganza activa, dirección, ×N o %: se rehace la puesta
+            with self.lock:
+                open_rev = [p for p in self.engines[ENGINE_RATIO_REV].positions.values() if not p.revenge]
+            for p in open_rev:
+                self._sync_rev_stop(p)
         self._save_settings()
         self.store.mark_dirty(True)
         self.log(f"[config] {ENGINE_LABELS[ENGINE_RATIO_REV]}: {self._rev_desc()}")
@@ -3128,10 +2726,105 @@ class KlineBot:
             f.get("minNotional", 5.0), MAX_NOTIONAL_OVER)
         if qty <= 0:
             return note(f"venganza saltada: {why}")
-        # Sale YA al executor: sin esperar una foto nueva del libro. En papel entra con el libro
-        # si está reciente; si no, con el precio en vivo, y se corrige cuando llega el libro.
-        px, src = self._fill_from_book(sym, side == LONG, qty, ref)
+        px, src = self._fill_price(sym, ref)
         self._open_revenge_at(eng, lost, side, qty, ref, px, src, price, loss, reason, note)
+
+    def _revenge_levels(self, side: str, px: float, qty: float, loss: float) -> Tuple[float, float, float, float]:
+        """(TP, SL, TP en USD, SL en USD) de una venganza de `qty` que entra a `px` tras perder `loss` USD:
+        TP = rev_recover_pct % de la pérdida y SL = rev_sl_pct % de (pérdida × N), netos de fees."""
+        c = self.rev_cfg
+        tp_usd = loss * c["rev_recover_pct"] / 100.0
+        sl_usd = loss * c["rev_mult"] * c["rev_sl_pct"] / 100.0
+        fees = 2 * qty * px * self.fee_pct / 100.0            # entrada + salida (aprox.)
+        tp_move = (tp_usd + fees) / qty
+        sl_move = max(sl_usd - fees, sl_usd * 0.1) / qty
+        if side == LONG:
+            return px + tp_move, max(px - sl_move, 0.0), tp_usd, sl_usd
+        return max(px - tp_move, 0.0), px + sl_move, tp_usd, sl_usd
+
+    def _rev_stop_plan(self, pos: Position) -> Optional[dict]:
+        """La venganza contraria que se deja puesta en Binance al abrir: una entrada STOP_MARKET en el SL de
+        `pos`, con la pérdida que tendría `pos` al cerrar ahí. None si no toca (o no se puede)."""
+        c = self.rev_cfg
+        if (pos.strategy != ENGINE_RATIO_REV or pos.revenge or not pos.sent or not c["revenge"]
+                or c["rev_dir"] != "opposite" or pos.sl_price <= 0 or not self.executor.target.url):
+            return None
+        trig = pos.sl_price
+        loss = -net_pnl_usd(trig, pos.entry_price, pos.qty, pos.direction, self.fee_pct)
+        if loss <= 0:
+            return None
+        side = SHORT if pos.direction == LONG else LONG
+        f = self.filters.get(pos.symbol, {})
+        qty, _eff, _why = size_order(pos.notional * c["rev_mult"], trig, f.get("stepSize", 0.001),
+                                     f.get("minQty", 0.0), f.get("minNotional", 5.0), MAX_NOTIONAL_OVER)
+        if qty <= 0:
+            return None
+        tp, sl, tp_usd, sl_usd = self._revenge_levels(side, trig, qty, loss)
+        return {"side": side, "trigger": trig, "qty": qty, "tp": tp, "sl": sl, "tp_usd": tp_usd,
+                "sl_usd": sl_usd, "loss": loss}
+
+    def _sync_rev_stop(self, pos: Position) -> None:
+        """Pone, mueve o quita en Binance la venganza contraria de `pos` según su SL y la config vigente."""
+        plan = self._rev_stop_plan(pos)
+        if plan is None:
+            self._cancel_rev_stop(pos)
+            return
+        levels = (plan["trigger"], plan["qty"], plan["tp"], plan["sl"])
+        if pos.rev_stop_id and levels == (pos.rev_stop_px, pos.rev_stop_qty, pos.rev_stop_tp, pos.rev_stop_sl):
+            return
+        if not pos.rev_stop_id:
+            pos.rev_stop_id = self._next_trade_id()
+        pos.rev_stop_px, pos.rev_stop_qty, pos.rev_stop_tp, pos.rev_stop_sl = levels
+        self.store.mark_dirty(True)
+        side = plan["side"]
+        self.executor.send({
+            "action": "open_stop", "trade_id": pos.rev_stop_id, "symbol": pos.symbol, "direction": side,
+            "trigger_price": plan["trigger"], "quantity": plan["qty"],
+            "notional": round(plan["qty"] * plan["trigger"], 4), "tp": plan["tp"], "sl": plan["sl"],
+            "level": round(-plan["loss"], 4), "strategy": ENGINE_RATIO_REV,
+        })
+        self.log(f"[{ENGINE_LABELS[ENGINE_RATIO_REV]}] venganza puesta en Binance para #{pos.trade_id}: STOP {side} "
+                 f"{pos.symbol} a {plan['trigger']:g} qty={plan['qty']:g} (×{self.rev_cfg['rev_mult']:g}) | TP "
+                 f"{plan['tp']:g} (+{plan['tp_usd']:.4f} USD) · SL {plan['sl']:g} | trade #{pos.rev_stop_id}")
+
+    def _cancel_rev_stop(self, pos: Position) -> None:
+        if not pos.rev_stop_id:
+            return
+        self.executor.send({"action": "cancel_stop", "trade_id": pos.rev_stop_id, "symbol": pos.symbol,
+                            "direction": SHORT if pos.direction == LONG else LONG, "strategy": ENGINE_RATIO_REV})
+        pos.rev_stop_id = 0
+        pos.rev_stop_px = pos.rev_stop_qty = pos.rev_stop_tp = pos.rev_stop_sl = 0.0
+        self.store.mark_dirty(True)
+
+    def _adopt_rev_stop(self, eng: Engine, lost: Position, price: float, loss: float, reason: str) -> None:
+        """`lost` cerró en su SL: la venganza contraria ya entró en Binance con su TP y SL (la puso el executor
+        al dispararse). Aquí solo se registra en papel, sin mandar otra apertura."""
+        side = SHORT if lost.direction == LONG else LONG
+        c = self.rev_cfg
+        now = time.time()
+        qty = lost.rev_stop_qty
+        pos = Position(
+            trade_id=lost.rev_stop_id, symbol=lost.symbol, direction=side, entry_price=price, qty=qty,
+            notional=qty * price, tp_price=lost.rev_stop_tp, sl_price=lost.rev_stop_sl, signal_pct=-loss,
+            candle_open=lost.entry_price, candle_close=price, candle_time=int(now * 1000), last_price=price,
+            strategy=eng.name, inverted=False, sent=True, revenge=True, rev_parent=lost.trade_id,
+            rev_tp_usd=loss * c["rev_recover_pct"] / 100.0, rev_sl_usd=loss * c["rev_mult"] * c["rev_sl_pct"] / 100.0,
+            ex_tp=lost.rev_stop_tp, signal_price=lost.rev_stop_px, entry_src="stop en Binance",
+        )
+        with self.lock:
+            eng.positions[pos.trade_id] = pos
+            eng.opened_count += 1
+            self.revenge_count += 1
+            eng.signals.appendleft({
+                "ts": now, "time": _utc(now, "%H:%M:%S"), "symbol": lost.symbol, "direction": side,
+                "body_pct": -loss, "open": lost.entry_price, "close": price, "candle": f"#{lost.trade_id}",
+                "candle_age_s": 0.0, "action": f"venganza abierta #{pos.trade_id} (stop en Binance)",
+            })
+        self._refresh_pos_syms()
+        self.store.mark_dirty(True)
+        self.log(f"[{eng.label}] VENGANZA {side} {lost.symbol} tras #{lost.trade_id} ({reason}, {-loss:+.4f} USDT): "
+                 f"entró en Binance con el stop a {lost.rev_stop_px:g} | px={price:g} qty={qty:g} | "
+                 f"TP {pos.tp_price:g} · SL {pos.sl_price:g} | trade #{pos.trade_id}")
 
     def _open_revenge_at(self, eng: Engine, lost: Position, side: str, qty: float, ref: float, px: float,
                          src: str, price: float, loss: float, reason: str, note) -> None:
@@ -3139,15 +2832,7 @@ class KlineBot:
         sym = lost.symbol
         now = time.time()
         eff = qty * px
-        tp_usd = loss * c["rev_recover_pct"] / 100.0
-        sl_usd = loss * c["rev_mult"] * c["rev_sl_pct"] / 100.0
-        fees = 2 * eff * self.fee_pct / 100.0                 # entrada + salida (aprox.)
-        tp_move = (tp_usd + fees) / qty
-        sl_move = max(sl_usd - fees, sl_usd * 0.1) / qty
-        if side == LONG:
-            tp_px, sl_px = px + tp_move, max(px - sl_move, 0.0)
-        else:
-            tp_px, sl_px = max(px - tp_move, 0.0), px + sl_move
+        tp_px, sl_px, tp_usd, sl_usd = self._revenge_levels(side, px, qty, loss)
         pos = Position(
             trade_id=self._next_trade_id(), symbol=sym, direction=side,
             entry_price=px, qty=qty, notional=eff, tp_price=tp_px, sl_price=sl_px,
@@ -3173,7 +2858,6 @@ class KlineBot:
                 "price": ref, "quantity": qty, "notional": round(eff, 4),
                 "level": round(-loss, 4), "strategy": eng.name, **self._open_tp(pos),
             }, time.perf_counter())
-        self._refine_entry(eng, pos)
 
     async def _refresh_tickers(self) -> None:
         """Exploración de todo el mercado por WebSocket (TICKER_SCAN_S segundos): 24 h de cada
@@ -3625,8 +3309,7 @@ class KlineBot:
             try:
                 if hold:
                     self._hold_price((sym,))
-                    # Precio en vivo y libro a la vez: los 3 bots abren con el mismo libro, sin esperar REST.
-                    await asyncio.gather(self._prefetch_price(sym), self._prefetch_book(sym))
+                    await self._prefetch_price(sym)         # los 3 bots abren con el mismo precio en vivo
                 fresh[sym] = self._on_ratio_points(sym, pts)
             except Exception as exc:
                 self.ratio_last_error = f"{sym}: {exc!r}"
@@ -3679,10 +3362,6 @@ class KlineBot:
         if pc is None or self._price(sym):
             return
         await asyncio.to_thread(pc.wait_for_price, sym, 5.0, PRICE_MAX_AGE_S)
-
-    async def _prefetch_book(self, sym: str) -> None:
-        if BOOK_FILL and not self._book_fresh(sym):
-            await self._load_book(sym)
 
     def _ratio_check_tp(self, sym: str, pts: List[Tuple[int, float]]) -> None:
         """TP por ratio: el ratio recupera el % que se movió (en los bots que lo tienen activo)."""
@@ -4152,13 +3831,12 @@ class KlineBot:
         if qty <= 0:
             self.log(f"[{eng.label}] señal {side} {sym} saltada: {why}")
             return skip(f"saltada: {why}")
-        # Sale ya al executor con el precio en vivo; la entrada en papel se corrige con el libro.
-        px, src = self._fill_from_book(sym, side == LONG, qty, price)
+        px, src = self._fill_price(sym, price)
         self._ratio_open_at(eng, sym, side, prev, last, chg, pct24, qty, price, px, src, skip)
 
     def _ratio_open_at(self, eng: Engine, sym: str, side: str, prev: Tuple[int, float], last: Tuple[int, float],
                        chg: float, pct24: float, qty: float, signal_px: float, price: float, src: str, skip) -> None:
-        """Abre la posición del bot de ratio con la entrada en papel `price` (libro)."""
+        """Abre la posición del bot de ratio con la entrada en papel `price` (precio en vivo)."""
         with self.lock:
             if any(p.symbol == sym and p.direction == side and not p.revenge for p in eng.positions.values()):
                 return skip("ya hay una abierta en este par y dirección")
@@ -4193,7 +3871,7 @@ class KlineBot:
                 "price": signal_px, "quantity": qty, "notional": round(eff, 4),
                 "level": round(chg, 4), "strategy": eng.name, **self._open_tp(pos),
             }, time.perf_counter())
-        self._refine_entry(eng, pos)
+            self._sync_rev_stop(pos)            # venganza contraria: ya puesta en Binance
 
     def _ratio_snapshot(self, all_rows: bool = True) -> dict:
         eng = self.engines[ENGINE_RATIO]
@@ -4235,7 +3913,6 @@ class KlineBot:
             "polls": self.ratio_polls, "errors": self.ratio_errors, "last_error": self.ratio_last_error,
             "rest_blocked_s": max(0.0, self._rest_block_until - now),
             "filters": len(self.filters), "ind": self.ind_snapshot(),
-            "book": {"on": BOOK_FILL, "fetches": self.book_fetches, "errors": self.book_errors},
             "routes": self.rest_routes_snapshot(),
         }
 
@@ -4263,7 +3940,7 @@ class KlineBot:
     # Una foto por WebSocket (!markPrice@arr, todos los pares) unos segundos antes de cada hora en
     # punto. Los pares con |funding| ≥ umbral y cobro en esa hora se abren en el lado que cobra
     # FUNDING_OPEN_BEFORE_S antes del cobro (al executor YA, con el precio en vivo; la entrada en
-    # papel se corrige después con el libro) y se cierran FUNDING_CLOSE_AFTER_S después.
+    # papel es ese mismo precio) y se cierran FUNDING_CLOSE_AFTER_S después.
 
     # Abrir con menos antelación que FUNDING_MIN_LEAD_S no entra nunca (_funding_open la descarta por tardía):
     # el mínimo de open_before_s queda por encima para que la web no acepte un valor que apaga el bot en silencio.
@@ -5184,7 +4861,6 @@ class KlineBot:
                  f"funding {rate:+.4f}% → cobra ~{gain:+.4f} USDT a las {_utc(ts, '%H:%M:%S')} UTC "
                  f"({left:.2f} s antes) | px={price:g} ({src}) qty={qty:g} ({eff:.2f} USDT) | trade #{pos.trade_id}")
         self._funding_schedule_close(pos)
-        self._refine_entry(eng, pos)          # en papel: la entrada se corrige con el libro cuando llegue
         return pos
 
     def _funding_schedule_close(self, pos: Position) -> None:
@@ -5195,7 +4871,7 @@ class KlineBot:
         loop.call_later(max(delay, 0.0), self._funding_close, pos.trade_id)
 
     def _funding_close(self, trade_id: int) -> None:
-        """Cierra tras el cobro, al precio en vivo (la orden sale ya; el libro, en paralelo)."""
+        """Cierra tras el cobro, al precio en vivo."""
         _eng, pos = self._find(trade_id)
         if pos is None:
             return
@@ -5549,7 +5225,6 @@ class KlineBot:
                 "last_ok": _utc(self.executor.last_ok_ts, "%H:%M:%S") if self.executor.last_ok_ts else "",
                 "http_ms": round(self.executor.last_http_ms, 1),
                 "total_ms": round(self.executor.last_total_ms, 1),
-                "fills": self.fills.stats(),
             },
             "klines": {
                 "enabled": self.klines_enabled, "running": self.kline_stream is not None,
@@ -6974,7 +6649,7 @@ function render(d) {
   q('fdCurScan').textContent = `(ahora ${fdc.scan_before_s} s)`;
   q('fdNote').innerHTML = `Antes de cada cobro (horas en punto UTC) escucha el funding de <b>todos</b> los símbolos operables en futuros ${fdc.scan_before_s} s antes (WebSocket, hasta tenerlos todos, máx. 60 s; REST solo de respaldo, como mucho 1 vez por hora). Los que cumplen quedan suscritos en vivo hasta abrir (si el funding baja del umbral, no se abre); el resto se suelta hasta el próximo cobro. ${fd.src && fd.src.want ? 'Último escaneo: ' + fd.src.have + '/' + fd.src.want + ' operables en ' + fd.src.wait_s + ' s. ' : ''}`
     + `Si un par tiene funding ≥ +${fdc.min_pct}% abre <b>SHORT</b> (los LONG le pagan); si es ≤ −${fdc.min_pct}%, <b>LONG</b>. Entra ${fdc.open_before_s} s antes del cobro, `
-    + `manda la orden al executor al instante con el precio en vivo (la entrada en papel se corrige después con el libro) y cierra ${fdc.close_after_s} s después. El PnL suma el funding cobrado. `
+    + `manda la orden al executor al instante con el precio en vivo y cierra ${fdc.close_after_s} s después. El PnL suma el funding cobrado. `
     + `Próximo cobro ${esc(fd.next || '—')} UTC (en <b data-cd="${fd.next_ts || 0}" data-off="0" data-done="cobrando">${cdFmt(fd.next_in_s || 0)}</b>) · última consulta ${esc(fd.last_scan || '—')}${fd.scan_ms ? ' (' + fd.scan_ms + ' ms)' : ''}${fd.src && fd.src.total ? ': ' + fd.src.total + ' pares (WebSocket ' + fd.src.ws + ' · REST ' + fd.src.rest + ')' : ''} · `
     + `${fd.over || 0} par(es) ≥ umbral · reloj Binance ${fd.clock_off_ms >= 0 ? '+' : ''}${fd.clock_off_ms || 0} ms${fd.clock_age_s == null ? ' <span class="neg">(sin sincronizar)</span>' : ' (medido hace ' + dur(fd.clock_age_s) + ', latencia ' + (fd.clock_rtt_ms || 0) + ' ms)'}${fd.clock_diff_ms != null ? ' · vs proveedores ' + (fd.clock_diff_ms >= 0 ? '+' : '') + fd.clock_diff_ms + ' ms ' + (fd.clock_agree ? '✓' : '<span class=\"neg\">⚠ difieren</span>') : (fd.clock_age_s != null ? ' · sin proveedores externos' : '')}${fd.watch && fd.watch.ts ? ' · exploración horaria: ' + fd.watch.scanned + ' pares en ' + fd.watch.elapsed_s + ' s, ' + fd.watch.n + ' ≥ umbral' : ''}${fd.loop_lag_ms > 500 ? ` · <span class="neg">loop con retraso ${fd.loop_lag_ms} ms</span>` : ''}${fd.last_error ? ` · <span class="neg">${esc(fd.last_error)}</span>` : ''}`;
   if (view === 'bots') q('fdTbl').innerHTML = (fd.rows || []).map(z => {
@@ -7146,9 +6821,6 @@ function render(d) {
   q('exLat').textContent = x.last_ok
     ? `Última señal (${x.last_ok}): HTTP al executor ${x.http_ms} ms · total desde el mensaje de Binance ${x.total_ms} ms`
     : 'Latencia: aún no hay señales enviadas';
-  const fl = x.fills;
-  if (fl && fl.enabled) q('exLat').textContent += ` · precios reales del executor: ${fl.entries} entradas y ${fl.closes} cierres`
-    + ` (${fl.fetches} consultas, ${bytes(fl.bytes)}${fl.timeouts ? `, ${fl.timeouts} sin precio a tiempo` : ''}${fl.errors ? `, ${fl.errors} errores` : ''})`;
   const nt = d.net;
   if (nt) {
     q('netSum').textContent = `entrada ${bytes(nt.rx_per_hour)}/h · web ${bytes(nt.web_per_hour)}/h`;
