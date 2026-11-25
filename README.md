@@ -39,6 +39,31 @@ curl -X POST https://<bot>/api/ratio -H 'Content-Type: application/json' \
 
 `0` apaga el TP o el SL; el SL se puede mandar como `5` o `-5`. Los niveles nuevos se aplican también a las posiciones abiertas de ese bot (se recalculan desde su precio de entrada) y se guardan en `SETTINGS_FILE`. El cierre sale con motivo `TP`, `SL`, `TP_RATIO` o `TP_RSI_VWAP`.
 
+### Filtro por zonas de ratio_entry (bots *Ratio TP/SL* y *Ratio + venganza*)
+
+Cada uno de estos dos bots tiene su propio filtro, que se enciende, se apaga y se ajusta **en caliente** desde la web (*Bots → Bot ratio TP/SL* y *Bots → Bot ratio + venganza → Filtro por zonas de ratio_entry*). Al abrir cada señal **nueva** mira el ratio que la disparó (`ratio_entry`):
+
+| Zona | Condición (por defecto) | Qué abre |
+| --- | --- | --- |
+| **INVERTIR** | `ratio_entry ≤ 1.3` (`limite_invertir`) | La dirección **contraria** a la señal, con el TP y el SL **intercambiados**: TP = \|SL\| del bot y SL = TP del bot (con TP 10 % / SL 5 %: TP 5 %, SL 10 %). Sin SL configurado la invertida queda sin TP; sin TP, sin SL. |
+| **NORMAL** | `1.3 < ratio_entry ≤ 2.0` (`limite_normal`) | Como siempre. |
+| **ALTA** | `ratio_entry > 2.0` | `zona_alta_modo`: `normal` (por defecto, como siempre) o `no_operar` (no abre). |
+
+- **TP por ratio en las invertidas** (`tp_ratio_en_invertidas`, activo por defecto): la condición se evalúa con la dirección **original** de la señal, así que la invertida se cierra en el mismo momento en que la original habría cerrado por TP por ratio. Ese cierre sale con motivo `RATIO_INV` y no se frena aunque la invertida vaya en pérdida (no es un TP). Apagado, la invertida solo sale por precio (y no gasta REST de ratio).
+- Las posiciones abiertas **no cambian de dirección** al tocar el filtro. Si se cambian el TP/SL del bot, a las invertidas abiertas les llega **intercambiado** (el TP nuevo pasa a ser su SL y viceversa).
+- «Cerrar todas», el objetivo global y los cierres manuales funcionan igual para todas.
+- Los bloqueos LONG/SHORT se aplican a la dirección que se abre de verdad.
+- Con `filtro_ratio_activo = false` el bot funciona exactamente como antes.
+- El CSV de trades lleva `zona_ratio`, `direccion_senal` (antes de invertir), `direction` (la abierta), `tp_pct_aplicado`, `sl_pct_aplicado` e `inverted`.
+
+```bash
+curl -X POST https://<bot>/api/ratio_zones -H 'Content-Type: application/json' \
+     -d '{"engine": "ratio", "filtro_ratio_activo": true, "limite_invertir": 1.3, "limite_normal": 2.0,
+          "zona_alta_modo": "normal", "tp_ratio_en_invertidas": true}'
+```
+
+Valores iniciales por variable de entorno: `RATIO_ZONE_FILTER`, `RATIO_ZONE_INVERT_MAX`, `RATIO_ZONE_NORMAL_MAX`, `RATIO_ZONE_HIGH_MODE`, `RATIO_ZONE_TP_RATIO_INV`.
+
 ### TP por RSI + VWAP ±σ (los tres bots de ratio)
 
 Una salida más, que se enciende y apaga **por bot** y en caliente (*Bots → Bots de ratio → TP por RSI + VWAP*; apagada por defecto):
