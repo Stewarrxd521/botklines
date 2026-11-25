@@ -126,6 +126,8 @@ def _bot_sin_red(tmp_path, monkeypatch):
     bot.filters = {"AUSDT": {"stepSize": 1, "minQty": 0, "minNotional": 5}}
     bot.fee_pct = 0.0
     bot.min_hold_s = 0.0                       # las pruebas de la demora la ponen a mano
+    for z in bot.zone_cfg.values():            # filtro de zonas apagado: sus pruebas lo encienden a mano
+        z["filtro_ratio_activo"] = False
 
     def sin_red(*a, **k):
         raise RuntimeError("sin red en las pruebas")

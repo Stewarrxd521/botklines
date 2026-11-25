@@ -213,6 +213,20 @@ REVENGE_RECOVER_PCT = float(os.getenv("REVENGE_RECOVER_PCT", "64"))   # TP = est
 REVENGE_SL_PCT      = float(os.getenv("REVENGE_SL_PCT", "150"))       # SL = este % de (pérdida × N) en USD
 REVENGE_DIR         = os.getenv("REVENGE_DIR", "opposite")            # opposite | same (respecto a la perdedora)
 REVENGE_SKIP_REASONS = ("OBJETIVO", "CERRAR_TODAS")                   # cierres que no disparan venganza
+# Filtro por zonas de ratio_entry (bots "ratio" y "ratio_rev", cada uno con su copia editable en la web):
+#   ratio_entry ≤ limite_invertir → INVERTIR (dirección contraria, TP y SL intercambiados)
+#   limite_invertir < ratio_entry ≤ limite_normal → NORMAL · ratio_entry > limite_normal → ALTA (normal | no_operar)
+RATIO_ZONE_FILTER   = os.getenv("RATIO_ZONE_FILTER", "true").lower() in ("1", "true", "yes")
+RATIO_ZONE_INVERT_MAX = float(os.getenv("RATIO_ZONE_INVERT_MAX", "1.3"))
+RATIO_ZONE_NORMAL_MAX = float(os.getenv("RATIO_ZONE_NORMAL_MAX", "2.0"))
+RATIO_ZONE_HIGH_MODE  = os.getenv("RATIO_ZONE_HIGH_MODE", "normal")      # normal | no_operar
+RATIO_ZONE_TP_RATIO_INV = os.getenv("RATIO_ZONE_TP_RATIO_INV", "true").lower() in ("1", "true", "yes")
+ZONE_ENGINES = ("ratio", "ratio_rev")                                     # bots con el filtro de zonas
+ZONE_INVERT, ZONE_NORMAL, ZONE_HIGH = "INVERTIR", "NORMAL", "ALTA"
+ZONE_HIGH_MODES = ("normal", "no_operar")
+# Salida por ratio de una invertida: se cierra cuando la ORIGINAL habría cerrado por TP por ratio (puede ser
+# en pérdida para la invertida, así que no cuenta como TP ni lo frena _tp_without_profit).
+RATIO_INV_REASON = "RATIO_INV"
 # Cierres "por TP": si a ese precio el PnL neto sale negativo, el cierre se cancela (_tp_without_profit).
 TP_REASONS = ("TP", "TP_RATIO", "TP_RSI_VWAP")
 # Venganza ya puesta en Binance: entra como stop LÍMITE con este tope (%) peor que el disparo, nunca a mercado.
@@ -547,6 +561,57 @@ def price_exit(price: float, direction: str, tp_price: float, sl_price: float) -
     if exit_hit(price, tp_price, direction):
         return "TP"
     return None
+
+
+def opposite_side(direction: str) -> str:
+    return SHORT if direction == LONG else LONG
+
+
+def ratio_zone(ratio_entry: float, invert_max: float = RATIO_ZONE_INVERT_MAX,
+               normal_max: float = RATIO_ZONE_NORMAL_MAX) -> str:
+    """Zona del ratio de entrada. Los límites son inclusivos: = invert_max → INVERTIR, = normal_max → NORMAL."""
+    if ratio_entry <= invert_max:
+        return ZONE_INVERT
+    if ratio_entry <= normal_max:
+        return ZONE_NORMAL
+    return ZONE_HIGH
+
+
+def zone_plan(side: str, ratio_entry: float, tp_pct: float, sl_pct: float, cfg: Optional[dict]) -> Optional[dict]:
+    """Cómo abrir una señal según el filtro de zonas `cfg` (None o apagado = como siempre).
+    Devuelve {zona, direction, tp_pct, sl_pct, inverted} o None si la zona ALTA está en "no_operar".
+    En la zona INVERTIR la dirección es la contraria y el TP y el SL se intercambian: TP = |SL| y SL = TP
+    (sin SL configurado → la invertida queda sin TP; sin TP → sin SL)."""
+    tp_pct, sl_pct = abs(tp_pct), abs(sl_pct)
+    if not cfg or not cfg.get("filtro_ratio_activo"):
+        return {"zona": "", "direction": side, "tp_pct": tp_pct, "sl_pct": sl_pct, "inverted": False}
+    zona = ratio_zone(ratio_entry, cfg["limite_invertir"], cfg["limite_normal"])
+    if zona == ZONE_INVERT:
+        return {"zona": zona, "direction": opposite_side(side), "tp_pct": sl_pct, "sl_pct": tp_pct, "inverted": True}
+    if zona == ZONE_HIGH and cfg.get("zona_alta_modo") == "no_operar":
+        return None
+    return {"zona": zona, "direction": side, "tp_pct": tp_pct, "sl_pct": sl_pct, "inverted": False}
+
+
+def load_zone_cfg(raw) -> dict:
+    """Filtro de zonas de un bot desde los ajustes guardados (valores inválidos → por defecto)."""
+    raw = raw if isinstance(raw, dict) else {}
+
+    def num(key, default):
+        try:
+            v = float(raw.get(key, default))
+            return v if v > 0 else default
+        except (TypeError, ValueError):
+            return default
+    cfg = {"filtro_ratio_activo": bool(raw.get("filtro_ratio_activo", RATIO_ZONE_FILTER)),
+           "limite_invertir": num("limite_invertir", RATIO_ZONE_INVERT_MAX),
+           "limite_normal": num("limite_normal", RATIO_ZONE_NORMAL_MAX),
+           "zona_alta_modo": raw.get("zona_alta_modo") if raw.get("zona_alta_modo") in ZONE_HIGH_MODES else
+                             (RATIO_ZONE_HIGH_MODE if RATIO_ZONE_HIGH_MODE in ZONE_HIGH_MODES else "normal"),
+           "tp_ratio_en_invertidas": bool(raw.get("tp_ratio_en_invertidas", RATIO_ZONE_TP_RATIO_INV))}
+    if cfg["limite_invertir"] >= cfg["limite_normal"]:
+        cfg["limite_invertir"], cfg["limite_normal"] = RATIO_ZONE_INVERT_MAX, RATIO_ZONE_NORMAL_MAX
+    return cfg
 
 
 def funding_side(rate: float) -> Optional[str]:
@@ -982,7 +1047,7 @@ class Position:
     low_price:   float = 0.0
     strategy:    str = "close"  # bot que la abrió: close | live
     candle_age_s: float = 0.0   # segundos de vela transcurridos al entrar (bot en vivo)
-    inverted:    bool = False   # abierta en modo invertido: tp_price es un STOP LOSS
+    inverted:    bool = False   # velas: modo invertido (tp_price es un STOP LOSS). Ratio: zona INVERTIR (dirección contraria a la señal)
     sent:        bool = True    # se mandó al executor (False = simulada, envíos pausados)
     # ── Solo bot de ratio: la salida es por ratio, no por precio ──
     ratio_trigger: float = 0.0  # ratio ANTES de la caída/subida: al recuperarlo se cierra (TP)
@@ -991,6 +1056,10 @@ class Position:
     ratio_ts:      int = 0      # timestamp (ms) del punto de ratio que disparó
     ratio_target:  float = 0.0  # ratio de salida (TP): recupera el mismo % que cayó/subió
     sl_price:      float = 0.0  # stop loss por precio (bot de ratio). 0 = sin SL
+    zona_ratio:    str = ""     # filtro de zonas: INVERTIR | NORMAL | ALTA ("" = filtro apagado)
+    direccion_senal: str = ""   # dirección de la señal antes de invertir ("" = la misma que direction)
+    tp_pct_aplicado: float = 0.0  # % de TP y SL efectivamente usados (en las invertidas, intercambiados)
+    sl_pct_aplicado: float = 0.0
     revenge:       bool = False # trade de venganza (sale solo por TP/SL en USD; si pierde no encadena otro)
     rev_parent:    int = 0      # trade_id de la operación perdedora que la disparó
     rev_tp_usd:    float = 0.0  # objetivo de la venganza en USD (neto) y su stop en USD
@@ -1358,6 +1427,9 @@ class KlineBot:
                         "rev_dir":         rv.get("rev_dir") if rv.get("rev_dir") in ("opposite", "same") else
                                            (REVENGE_DIR if REVENGE_DIR in ("opposite", "same") else "opposite")}
         self.revenge_count = 0
+        # Filtro por zonas de ratio_entry: uno por bot (ratio y ratio_rev), editable en caliente.
+        zs = settings.get("ratio_zones") if isinstance(settings.get("ratio_zones"), dict) else {}
+        self.zone_cfg = {n: load_zone_cfg(zs.get(n)) for n in ZONE_ENGINES}
         # Bot de funding alto: su motor y sus parámetros (editables en caliente desde la web).
         self.engines[ENGINE_FUNDING] = Engine(ENGINE_FUNDING, saved.get(ENGINE_FUNDING)
                                               or {"paused": not FUNDING_ENABLED}, 1.0, 1.0)
@@ -1578,6 +1650,7 @@ class KlineBot:
                 "inverted": self.inverted, "fee_pct": self.fee_pct,
                 "profit_target_usd": self.profit_target_usd, "max_open": self.max_open,
                 "executor_paused": self.executor_paused, "ratio": self.ratio_cfg, "ratio_rev": self.rev_cfg,
+                "ratio_zones": self.zone_cfg,
                 "klines_enabled": self.klines_enabled, "watch_live_price": self.watch_live,
                 "fast_prices": self.fast_prices, "min_hold_s": self.min_hold_s, "indicators": self.ind_cfg,
                 "funding": self.funding_cfg, "send_tp": self.send_tp}
@@ -1875,6 +1948,8 @@ class KlineBot:
                  f"{' · TP por ratio (recupera el % que se movió)' if rc['ratio_exit'] else ''}")
         self.log(f"{ENGINE_LABELS[ENGINE_RATIO_TP]} | sale solo por el TP del ratio")
         self.log(f"{ENGINE_LABELS[ENGINE_RATIO_REV]} | {self._rev_desc()}")
+        for n in ZONE_ENGINES:
+            self.log(f"{ENGINE_LABELS[n]} | filtro de zonas de ratio_entry {self._zone_desc(n)}")
         self.log(f"{ENGINE_LABELS[ENGINE_FUNDING]} | {self._funding_desc()}"
                  f"{' | PAUSADO' if self.engines[ENGINE_FUNDING].paused else ''}")
         self.log(f"Red: 24 h por {f'WebSocket, exploración de {TICKER_SCAN_S:g} s cada 5 min' if TICKER_MODE != 'ws' else 'WebSocket continuo'} · "
@@ -2610,6 +2685,66 @@ class KlineBot:
         cfg = self._exit_cfg(name)
         return tp_sl_prices(entry, direction, cfg["tp_pct"], cfg["sl_pct"])
 
+    def _pos_exit_pcts(self, p: Position, name: str) -> Tuple[float, float]:
+        """% de TP y SL vigentes para una abierta de un bot de ratio: los del bot, intercambiados
+        si se abrió invertida por el filtro de zonas (el TP nuevo pasa a ser su SL y viceversa)."""
+        cfg = self._exit_cfg(name)
+        tp, sl = abs(cfg["tp_pct"]), abs(cfg["sl_pct"])
+        return (sl, tp) if p.inverted else (tp, sl)
+
+    def _ratio_tp_by_ratio(self, p: Position) -> bool:
+        """¿Esta abierta de ratio sale por TP por ratio? (el bot lo tiene activo y, si es invertida,
+        su filtro de zonas lo permite en las invertidas)."""
+        if p.revenge or not self._exit_cfg(p.strategy)["ratio_exit"]:
+            return False
+        if p.inverted:
+            zc = self.zone_cfg.get(p.strategy)
+            return bool(zc and zc["tp_ratio_en_invertidas"])
+        return True
+
+    def set_zone_config(self, engine: str, filtro_ratio_activo: Optional[bool] = None,
+                        limite_invertir: Optional[float] = None, limite_normal: Optional[float] = None,
+                        zona_alta_modo: Optional[str] = None,
+                        tp_ratio_en_invertidas: Optional[bool] = None) -> dict:
+        """En caliente: filtro de zonas de ratio_entry de un bot (ratio o ratio_rev). Solo cambia las
+        señales NUEVAS; las abiertas mantienen su dirección (tp_ratio_en_invertidas sí les aplica)."""
+        if engine not in ZONE_ENGINES:
+            raise ValueError(f"el filtro de zonas solo existe en: {', '.join(ZONE_ENGINES)}")
+        old = self.zone_cfg[engine]
+        new = dict(old)
+        if filtro_ratio_activo is not None:
+            new["filtro_ratio_activo"] = bool(filtro_ratio_activo)
+        if tp_ratio_en_invertidas is not None:
+            new["tp_ratio_en_invertidas"] = bool(tp_ratio_en_invertidas)
+        for key, v in (("limite_invertir", limite_invertir), ("limite_normal", limite_normal)):
+            if v is not None:
+                v = float(v)
+                if not 0 < v <= 1000:
+                    raise ValueError(f"{key} debe estar entre 0 y 1000")
+                new[key] = v
+        if zona_alta_modo is not None:
+            if zona_alta_modo not in ZONE_HIGH_MODES:
+                raise ValueError("zona_alta_modo debe ser normal o no_operar")
+            new["zona_alta_modo"] = zona_alta_modo
+        if new["limite_invertir"] >= new["limite_normal"]:
+            raise ValueError("limite_invertir debe ser menor que limite_normal")
+        if new == old:
+            return dict(old)
+        self.zone_cfg[engine] = new
+        self._save_settings()
+        self.store.mark_dirty(True)
+        self.log(f"[config] {ENGINE_LABELS[engine]}: filtro de zonas {self._zone_desc(engine)}")
+        return dict(new)
+
+    def _zone_desc(self, engine: str) -> str:
+        z = self.zone_cfg[engine]
+        if not z["filtro_ratio_activo"]:
+            return "APAGADO"
+        return (f"ON | ratio ≤ {z['limite_invertir']:g} invierte (TP/SL intercambiados, TP por ratio "
+                f"{'con la dirección original' if z['tp_ratio_en_invertidas'] else 'apagado'}) | "
+                f"≤ {z['limite_normal']:g} normal | > {z['limite_normal']:g} "
+                f"{'no opera' if z['zona_alta_modo'] == 'no_operar' else 'normal'}")
+
     def _exchange_tp(self, pos: Position) -> float:
         """TP que se pone en Binance: el de la posición, pero nunca por debajo del punto en que el
         PnL neto (fees de entrada y salida) es 0. Así Binance no cierra el lote en un nivel que el
@@ -2622,10 +2757,16 @@ class KlineBot:
             return max(tp, pos.entry_price * (1 + f) / (1 - f))
         return min(tp, pos.entry_price * (1 - f) / (1 + f))
 
+    @staticmethod
+    def _tp_is_sl(pos: Position) -> bool:
+        """Velas en modo invertido: tp_price es un stop loss. En los bots de ratio una invertida
+        (zona INVERTIR) tiene su TP y su SL normales en tp_price/sl_price."""
+        return pos.inverted and pos.strategy not in RATIO_ENGINES
+
     def _open_tp(self, pos: Position) -> dict:
         """Campo "tp" de la apertura. El executor pone un TP POR trade_id, con la cantidad de
         esa posición (su lote), aunque haya otros bots en el mismo par y dirección."""
-        tp = 0.0 if pos.inverted else self._exchange_tp(pos)   # invertida: tp_price es su SL
+        tp = 0.0 if self._tp_is_sl(pos) else self._exchange_tp(pos)   # velas invertidas: tp_price es su SL
         if tp > 0 and self.send_tp:
             pos.ex_tp = tp
             return {"tp": tp}
@@ -2636,7 +2777,7 @@ class KlineBot:
         Binance (open_tp de ese trade_id) o lo quita (close_tp) si ya no tiene TP por precio."""
         if not pos.sent:
             return
-        tp = 0.0 if pos.inverted or not self.send_tp else self._exchange_tp(pos)
+        tp = 0.0 if self._tp_is_sl(pos) or not self.send_tp else self._exchange_tp(pos)
         if tp == pos.ex_tp:
             return
         base = {"trade_id": pos.trade_id, "symbol": pos.symbol, "direction": pos.direction, "strategy": pos.strategy}
@@ -2666,7 +2807,9 @@ class KlineBot:
             for name in names:
                 for p in self.engines[name].positions.values():
                     if not p.revenge:
-                        p.tp_price, p.sl_price = self._ratio_exit_prices(p.entry_price, p.direction, name)
+                        tp_pct, sl_pct = self._pos_exit_pcts(p, name)
+                        p.tp_price, p.sl_price = tp_sl_prices(p.entry_price, p.direction, tp_pct, sl_pct)
+                        p.tp_pct_aplicado, p.sl_pct_aplicado = tp_pct, sl_pct
                         syms.add(p.symbol)
                         changed.append(p)
         for p in changed:
@@ -3109,9 +3252,9 @@ class KlineBot:
     def _ratio_symbols(self) -> List[str]:
         """Vigilados + abiertas que esperan el TP por ratio. Las venganzas y los bots con la
         salida por ratio apagada cierran por precio: no gastan REST."""
-        names = [n for n in RATIO_ENGINES if self._exit_cfg(n)["ratio_exit"]]
         with self.lock:
-            open_syms = {p.symbol for n in names for p in self.engines[n].positions.values() if not p.revenge}
+            open_syms = {p.symbol for n in RATIO_ENGINES for p in self.engines[n].positions.values()
+                         if self._ratio_tp_by_ratio(p)}
         return list(dict.fromkeys(list(self.watch) + sorted(open_syms)))
 
     def _rest_routes(self) -> List[str]:
@@ -3397,10 +3540,9 @@ class KlineBot:
 
     def _ratio_check_tp(self, sym: str, pts: List[Tuple[int, float]]) -> None:
         """TP por ratio: el ratio recupera el % que se movió (en los bots que lo tienen activo)."""
-        names = [n for n in RATIO_ENGINES if self._exit_cfg(n)["ratio_exit"]]
         with self.lock:
-            targets = [p for n in names for p in self.engines[n].positions.values()
-                       if p.symbol == sym and not p.revenge and (p.ratio_target or p.ratio_trigger) > 0]
+            targets = [p for n in RATIO_ENGINES for p in self.engines[n].positions.values()
+                       if p.symbol == sym and (p.ratio_target or p.ratio_trigger) > 0 and self._ratio_tp_by_ratio(p)]
         if not targets or not self.store.can_act():
             return
         for p in targets:
@@ -3408,15 +3550,18 @@ class KlineBot:
             if not after:
                 continue
             goal = p.ratio_target or p.ratio_trigger
-            if p.direction == SHORT:
+            # Invertida: la condición es la de la señal ORIGINAL (cierra cuando la original habría cerrado).
+            side = (p.direccion_senal or opposite_side(p.direction)) if p.inverted else p.direction
+            if side == SHORT:
                 hit, best = max(after) >= goal, max(after)
             else:
                 hit, best = min(after) <= goal, min(after)
             if not hit:
                 continue
-            self.log(f"[ratio] TP {p.direction} {sym} ({ENGINE_LABELS[p.strategy]}): ratio {best:g} alcanzó el objetivo "
-                     f"{goal:g} (entrada {p.ratio_entry:g}, recupera {abs(p.ratio_change_pct):.1f}%)")
-            self._close_after_hold(p.trade_id, "TP_RATIO")
+            inv = f" [invertida; señal {side}]" if p.inverted else ""
+            self.log(f"[ratio] TP {p.direction} {sym} ({ENGINE_LABELS[p.strategy]}){inv}: ratio {best:g} alcanzó el "
+                     f"objetivo {goal:g} (entrada {p.ratio_entry:g}, recupera {abs(p.ratio_change_pct):.1f}%)")
+            self._close_after_hold(p.trade_id, RATIO_INV_REASON if p.inverted else "TP_RATIO")
 
     # ── TP por RSI + VWAP ±kσ (velas 1m: REST una vez, luego WebSocket) ──────
 
@@ -3832,13 +3977,20 @@ class KlineBot:
                     chg: float, pct24: float, age_s: float, price: Optional[float]) -> None:
         eng.signal_count += 1
 
+        sig_side = side                                      # la señal se anota con su dirección original
+
         def skip(action: str) -> None:
-            self._record_ratio_signal(eng, sym, side, prev, last, chg, action)
+            self._record_ratio_signal(eng, sym, sig_side, prev, last, chg, action)
 
         if age_s > RATIO_MAX_AGE_S:
             return skip(f"ignorada: dato de ratio de hace {age_s:.0f}s")
         if eng.paused:
             return skip("pausado")
+        xc = self._exit_cfg(eng.name)
+        plan = zone_plan(side, last[1], xc["tp_pct"], xc["sl_pct"], self.zone_cfg.get(eng.name))
+        if plan is None:
+            return skip(f"no_operar: zona ALTA (ratio {last[1]:g} > {self.zone_cfg[eng.name]['limite_normal']:g})")
+        signal_side, side = side, plan["direction"]          # dirección que se abre de verdad
         if eng.blocked.get(side):
             return skip(f"bloqueada: {side} desactivados")
         if self.max_open > 0 and self.open_count() >= self.max_open:
@@ -3864,36 +4016,47 @@ class KlineBot:
             self.log(f"[{eng.label}] señal {side} {sym} saltada: {why}")
             return skip(f"saltada: {why}")
         px, src = self._fill_price(sym, price)
-        self._ratio_open_at(eng, sym, side, prev, last, chg, pct24, qty, price, px, src, skip)
+        self._ratio_open_at(eng, sym, signal_side, prev, last, chg, pct24, qty, price, px, src, skip, plan)
 
-    def _ratio_open_at(self, eng: Engine, sym: str, side: str, prev: Tuple[int, float], last: Tuple[int, float],
-                       chg: float, pct24: float, qty: float, signal_px: float, price: float, src: str, skip) -> None:
-        """Abre la posición del bot de ratio con la entrada en papel `price` (precio en vivo)."""
+    def _ratio_open_at(self, eng: Engine, sym: str, signal_side: str, prev: Tuple[int, float],
+                       last: Tuple[int, float], chg: float, pct24: float, qty: float, signal_px: float,
+                       price: float, src: str, skip, plan: Optional[dict] = None) -> None:
+        """Abre la posición del bot de ratio con la entrada en papel `price` (precio en vivo).
+        `plan` (zone_plan) dice la dirección real y los % de TP/SL; sin plan, la de la señal."""
+        if plan is None:
+            xc = self._exit_cfg(eng.name)
+            plan = zone_plan(signal_side, last[1], xc["tp_pct"], xc["sl_pct"], None)
+        side = plan["direction"]
         with self.lock:
             if any(p.symbol == sym and p.direction == side and not p.revenge for p in eng.positions.values()):
                 return skip("ya hay una abierta en este par y dirección")
         eff = qty * price
-        # TP: el ratio recupera el mismo % que cayó (SHORT) / subió (LONG), desde el ratio de entrada.
-        target = last[1] * (1 + abs(chg) / 100.0) if side == SHORT else last[1] * (1 - abs(chg) / 100.0)
-        tp_px, sl_px = self._ratio_exit_prices(price, side, eng.name)
+        # TP por ratio: el ratio recupera el mismo % que cayó (señal SHORT) / subió (señal LONG), desde el
+        # ratio de entrada. Siempre con la dirección de la SEÑAL (también en las invertidas).
+        target = last[1] * (1 + abs(chg) / 100.0) if signal_side == SHORT else last[1] * (1 - abs(chg) / 100.0)
+        tp_px, sl_px = tp_sl_prices(price, side, plan["tp_pct"], plan["sl_pct"])
         pos = Position(
             trade_id=self._next_trade_id(), symbol=sym, direction=side,
             entry_price=price, qty=qty, notional=eff, tp_price=tp_px, sl_price=sl_px,
             signal_pct=chg, candle_open=prev[1], candle_close=last[1], candle_time=last[0],
-            last_price=price, strategy=eng.name, inverted=False, sent=not self.executor_paused,
+            last_price=price, strategy=eng.name, inverted=plan["inverted"], sent=not self.executor_paused,
             ratio_trigger=prev[1], ratio_entry=last[1], ratio_change_pct=chg, ratio_ts=last[0],
             ratio_target=target, signal_price=signal_px, entry_src=src,
+            zona_ratio=plan["zona"], direccion_senal=signal_side,
+            tp_pct_aplicado=plan["tp_pct"], sl_pct_aplicado=plan["sl_pct"],
         )
         with self.lock:
             eng.positions[pos.trade_id] = pos
             eng.opened_count += 1
         self._refresh_pos_syms()                            # suscribe el precio en vivo del par
         self.store.mark_dirty(True)
-        skip(f"abierta #{pos.trade_id}")
-        by_ratio = (f" · TP ratio {'≥' if side == SHORT else '≤'} {target:g}"
-                    if self._exit_cfg(eng.name)["ratio_exit"] else "")
+        zona = f" [{pos.zona_ratio}{f': {side}' if pos.inverted else ''}]" if pos.zona_ratio else ""
+        skip(f"abierta #{pos.trade_id}{zona}")
+        by_ratio = (f" · TP ratio {'≥' if signal_side == SHORT else '≤'} {target:g}"
+                    if self._ratio_tp_by_ratio(pos) else "")
         by_ind = " · TP RSI/VWAP" if self.ind_cfg["enabled"].get(eng.name) else ""
-        self.log(f"[{eng.label}] ABRE {side} {sym}{'' if pos.sent else ' [SIMULADA: envíos al executor pausados]'} | "
+        inv = f" (INVERTIDA: señal {signal_side}, ratio {last[1]:g})" if pos.inverted else ""
+        self.log(f"[{eng.label}] ABRE {side} {sym}{inv}{'' if pos.sent else ' [SIMULADA: envíos al executor pausados]'} | "
                  f"ratio {prev[1]:g}→{last[1]:g} ({chg:+.1f}%) | 24 h {pct24:+.1f}% | px={price:g}"
                  f"{f' ({src})' if src else ''} qty={qty:g} ({eff:.2f} USDT) | "
                  f"TP {tp_px or '—'} · SL {sl_px or '—'}{by_ratio}{by_ind} | trade #{pos.trade_id}")
@@ -3932,6 +4095,7 @@ class KlineBot:
         rows.sort(key=lambda r: abs(r["pct24"] or 0), reverse=True)
         return {
             "cfg": cfg, "rev": dict(self.rev_cfg), "revenge_count": self.revenge_count,
+            "zones": {n: dict(z) for n, z in self.zone_cfg.items()},
             "rows": rows, "watch_count": len(self.watch),
             "long_enabled": not eng.blocked[LONG], "short_enabled": not eng.blocked[SHORT],
             "ticker_connected": self.ticker_connected, "ticker_symbols": len(self._tick),
@@ -5145,9 +5309,10 @@ class KlineBot:
     _POS_FIELDS = ("trade_id", "symbol", "direction", "entry_price", "notional", "tp_price", "sl_price",
                    "signal_pct", "candle_age_s", "inverted", "sent", "mfe_pct", "mae_pct", "mfe_usd",
                    "mae_usd", "ratio_trigger", "ratio_entry", "ratio_change_pct", "ratio_target", "revenge",
-                   "rev_parent", "rev_tp_usd", "rev_sl_usd", "funding_rate", "funding_ts")
+                   "zona_ratio", "direccion_senal", "rev_parent", "rev_tp_usd", "rev_sl_usd", "funding_rate", "funding_ts")
     _CLOSED_FIELDS = ("symbol", "direction", "entry_price", "close_price", "move_pct", "pnl", "fees",
-                      "mfe_pct", "mae_pct", "duration_s", "reason", "sent", "revenge", "funding_usd")
+                      "mfe_pct", "mae_pct", "duration_s", "reason", "sent", "revenge", "funding_usd",
+                      "zona_ratio", "direccion_senal", "inverted")
     _SIGNAL_FIELDS = ("time", "symbol", "direction", "candle", "open", "close", "body_pct",
                       "candle_age_s", "action")
     WEB_CLOSED_ROWS = 100
@@ -5543,6 +5708,38 @@ def api_ratio_get():
     return _no_store(jsonify({"ok": True, **bot._ratio_snapshot()}))
 
 
+@app.post("/api/ratio_zones")
+def api_ratio_zones_set():
+    """Filtro de zonas de ratio_entry de un bot, en caliente. Body JSON: {"engine": "ratio"|"ratio_rev",
+    "filtro_ratio_activo": true, "limite_invertir": 1.3, "limite_normal": 2.0,
+    "zona_alta_modo": "normal"|"no_operar", "tp_ratio_en_invertidas": true} (todo opcional salvo engine)."""
+    busy = _guard()
+    if busy:
+        return busy
+    data = request.get_json(silent=True) or {}
+    engine = data.get("engine") or ENGINE_RATIO
+    vals = {}
+    for key in ("limite_invertir", "limite_normal"):
+        if data.get(key) in (None, ""):
+            continue
+        try:
+            vals[key] = float(data[key])
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": f"{key} inválido"}), 400
+    for key in ("filtro_ratio_activo", "tp_ratio_en_invertidas"):
+        if key in data:
+            vals[key] = _flag(data[key])
+    if data.get("zona_alta_modo"):
+        vals["zona_alta_modo"] = str(data["zona_alta_modo"])
+    if not vals:
+        return jsonify({"ok": False, "error": "Nada que cambiar"}), 400
+    try:
+        cfg = bot.set_zone_config(engine, **vals)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, "engine": engine, **cfg})
+
+
 @app.post("/api/ratio")
 def api_ratio_set():
     """Ajusta el bot de ratio en caliente. Body JSON (todo opcional): {"watch_min_pct": 20,
@@ -5778,6 +5975,7 @@ TRADE_CSV_COLS = [
     "time_to_mae_s", "high_price", "low_price", "sl_price", "ratio_target", "ratio_trigger", "ratio_entry", "ratio_change_pct",
     "revenge", "rev_parent", "rev_tp_usd", "rev_sl_usd", "signal_price", "entry_src", "trigger_price", "close_src",
     "funding_rate", "funding_ts", "funding_usd",
+    "zona_ratio", "direccion_senal", "tp_pct_aplicado", "sl_pct_aplicado",
 ]
 
 
@@ -6198,6 +6396,22 @@ HTML = r"""<!doctype html>
           </div>
           <div class="box"><h4>Direcciones y estado</h4><div class="row c" id="rb_ratio"></div></div>
         </div>
+        <div class="box" style="margin-top:12px">
+          <h4>Filtro por zonas de ratio_entry <span class="st" id="zSt_ratio">—</span></h4>
+          <div class="row c">
+            <button type="button" class="switch" data-act="zoneToggle" data-zeng="ratio" id="zOn_ratio" aria-label="Activar o desactivar el filtro de zonas"><i></i></button>
+            <button type="button" class="small" data-act="zoneTpInv" data-zeng="ratio" id="zTpInv_ratio">—</button>
+          </div>
+          <form id="zForm_ratio" data-zone="ratio" style="margin-top:10px">
+            <label class="f">Invertir si ratio_entry ≤ <span id="zCurInv_ratio"></span>
+              <input name="limite_invertir" type="number" step="0.01" min="0.01" max="1000" placeholder="ej. 1.3"></label>
+            <label class="f">Normal si ratio_entry ≤ <span id="zCurNor_ratio"></span>
+              <input name="limite_normal" type="number" step="0.01" min="0.01" max="1000" placeholder="ej. 2.0"></label>
+            <button type="submit">Guardar</button>
+          </form>
+          <div class="row c" style="margin-top:10px"><span class="muted" style="font-size:12px">Zona alta (ratio &gt; límite normal):</span> <span class="seg" id="zHigh_ratio"></span></div>
+          <div class="note" id="zNote_ratio"></div>
+        </div>
       </div>
     </details>
 
@@ -6245,6 +6459,22 @@ HTML = r"""<!doctype html>
             <div class="note" id="revNote"></div>
             <div id="revMsg" class="muted msg"></div>
           </div>
+        </div>
+        <div class="box" style="margin-top:12px">
+          <h4>Filtro por zonas de ratio_entry <span class="st" id="zSt_ratio_rev">—</span></h4>
+          <div class="row c">
+            <button type="button" class="switch" data-act="zoneToggle" data-zeng="ratio_rev" id="zOn_ratio_rev" aria-label="Activar o desactivar el filtro de zonas"><i></i></button>
+            <button type="button" class="small" data-act="zoneTpInv" data-zeng="ratio_rev" id="zTpInv_ratio_rev">—</button>
+          </div>
+          <form id="zForm_ratio_rev" data-zone="ratio_rev" style="margin-top:10px">
+            <label class="f">Invertir si ratio_entry ≤ <span id="zCurInv_ratio_rev"></span>
+              <input name="limite_invertir" type="number" step="0.01" min="0.01" max="1000" placeholder="ej. 1.3"></label>
+            <label class="f">Normal si ratio_entry ≤ <span id="zCurNor_ratio_rev"></span>
+              <input name="limite_normal" type="number" step="0.01" min="0.01" max="1000" placeholder="ej. 2.0"></label>
+            <button type="submit">Guardar</button>
+          </form>
+          <div class="row c" style="margin-top:10px"><span class="muted" style="font-size:12px">Zona alta (ratio &gt; límite normal):</span> <span class="seg" id="zHigh_ratio_rev"></span></div>
+          <div class="note" id="zNote_ratio_rev"></div>
         </div>
       </div>
     </details>
@@ -6529,9 +6759,9 @@ function tradeCard(p, d, compact) {
             : p._eng === 'funding' ? `funding ${pct(p.funding_rate || 0)} · cobro ${hms(p.funding_ts)} UTC`
             : isR ? `ratio ${num(p.ratio_trigger, 4)}→${num(p.ratio_entry, 4)} ${pct(p.ratio_change_pct || 0)}`
                   : `vela ${pct(p.signal_pct)}${p._eng === 'live' ? ` a los ${Math.round(p.candle_age_s || 0)}s` : ''}`;
-  const ratioExit = isR && !p.revenge && xc.ratio_exit ? `<span>TP ratio<b>${p.direction === 'SHORT' ? '≥' : '≤'} ${num(p.ratio_target || p.ratio_trigger, 4)}</b></span>` : '';
+  const ratioExit = isR && !p.revenge && xc.ratio_exit && (!p.inverted || ((d.ratio || {}).zones || {})[p._eng]?.tp_ratio_en_invertidas) ? `<span>TP ratio<b>${(p.direccion_senal || p.direction) === 'SHORT' ? '≥' : '≤'} ${num(p.ratio_target || p.ratio_trigger, 4)}</b></span>` : '';
   return `<div class="trade ${p.pnl >= 0 ? 'win' : 'loss'}">
-    <div class="h"><span class="sym">${esc(p.symbol)}</span>${tag(p.direction)}${p.revenge ? '<span class="tag REV">VENGANZA</span>' : ''}${p.sent === false ? '<span class="st off">SIMULADA</span>' : ''}
+    <div class="h"><span class="sym">${esc(p.symbol)}</span>${tag(p.direction)}${p.revenge ? '<span class="tag REV">VENGANZA</span>' : ''}${isR && p.inverted ? `<span class="tag REV" title="zona ${esc(p.zona_ratio)}: señal ${esc(p.direccion_senal)}">INVERTIDA</span>` : ''}${p.sent === false ? '<span class="st off">SIMULADA</span>' : ''}
       <span class="bl">${esc(SHORT_LABEL[p._eng])} · #${p.trade_id}</span></div>
     <div class="pnl"><b>${usd(p.pnl)}</b><span>${pct(p.move_pct)}</span><span class="muted" style="margin-left:auto;font-size:12px">${esc(p.opened)} · ${dur(p.age_s)}</span></div>
     ${rangeBar(p)}
@@ -6542,6 +6772,36 @@ function tradeCard(p, d, compact) {
     <div class="f"><span>${compact ? sig : `${num(p.notional, 2)} USDT · ${p.sent === false ? 'simulada' : 'enviada al executor'}`}</span><button type="button" class="small ghost" data-close="${p.trade_id}" data-label="${esc(p.direction)} ${esc(p.symbol)} #${p.trade_id}">Cerrar</button></div>
   </div>`;
 }
+
+// Filtro por zonas de ratio_entry (bots ratio y ratio_rev).
+function renderZone(n, z, xc) {
+  const on = !!z.filtro_ratio_activo, sw = q('zOn_' + n);
+  if (!sw) return;
+  sw.dataset.on = on ? '1' : ''; sw.classList.toggle('on', on);
+  q('zSt_' + n).className = 'st ' + (on ? 'on' : 'off'); q('zSt_' + n).textContent = on ? 'ON' : 'OFF';
+  const bt = q('zTpInv_' + n);
+  bt.dataset.on = z.tp_ratio_en_invertidas ? '1' : '';
+  bt.textContent = z.tp_ratio_en_invertidas ? 'TP por ratio en invertidas: activo · desactivar' : 'TP por ratio en invertidas: apagado · activar';
+  bt.className = 'small ' + (z.tp_ratio_en_invertidas ? 'ok' : 'ghost');
+  q('zCurInv_' + n).textContent = `(ahora ${z.limite_invertir})`;
+  q('zCurNor_' + n).textContent = `(ahora ${z.limite_normal})`;
+  q('zHigh_' + n).innerHTML = seg([[n + ':normal', 'Normal'], [n + ':no_operar', 'No operar']], n + ':' + z.zona_alta_modo, 'zhigh');
+  const tp = xc.tp_pct > 0 ? '+' + xc.tp_pct + '%' : 'off', sl = xc.sl_pct > 0 ? '−' + xc.sl_pct + '%' : 'off';
+  q('zNote_' + n).innerHTML = !on ? 'Apagado: todas las señales se abren en su dirección, como siempre.'
+    : `Al abrir cada señal NUEVA: ratio_entry ≤ <b>${z.limite_invertir}</b> → <b>invertida</b> (dirección contraria, TP ${xc.sl_pct > 0 ? '+' + xc.sl_pct + '%' : 'off'} · SL ${xc.tp_pct > 0 ? '−' + xc.tp_pct + '%' : 'off'}, TP y SL intercambiados${z.tp_ratio_en_invertidas ? '; TP por ratio con la dirección original de la señal' : '; sin TP por ratio'}). `
+    + `Hasta <b>${z.limite_normal}</b> → normal (TP ${tp} · SL ${sl}). Por encima → ${z.zona_alta_modo === 'no_operar' ? '<b>no se abre</b>' : 'normal'}. Las abiertas no cambian de dirección; un cambio de TP/SL les llega intercambiado a las invertidas.`;
+}
+async function zonePost(n, body, okMsg) {
+  q('rtMsg').textContent = 'Guardando…';
+  try {
+    const r = await post('/api/ratio_zones', {engine: n, ...body});
+    q('rtMsg').innerHTML = r.ok ? `<span class="pos">Guardado.</span> ${okMsg(r)}` : `<span class="neg">${esc(r.error)}</span>`;
+    if (!r.ok) alert(r.error);
+    return r.ok;
+  } catch (e) { q('rtMsg').innerHTML = `<span class="neg">${esc(e)}</span>`; }
+  finally { refresh(); }
+}
+const zoneMsg = r => `Filtro de zonas (${esc(SHORT_LABEL[r.engine] || r.engine)}) ${r.filtro_ratio_activo ? 'ON' : 'OFF'} · invertir ≤ ${r.limite_invertir} · normal ≤ ${r.limite_normal} · zona alta ${r.zona_alta_modo === 'no_operar' ? 'no opera' : 'normal'} · TP por ratio en invertidas ${r.tp_ratio_en_invertidas ? 'ON' : 'OFF'}`;
 
 // ── Render ──
 function render(d) {
@@ -6636,10 +6896,10 @@ function render(d) {
     const isR = RATIO.includes(row._eng);
     const isF = row._eng === 'funding';
     const exits = isF ? `<span class="muted">sale al cobro +${((d.funding || {}).cfg || {}).close_after_s} s</span>` : isR ? [row.tp_price > 0 ? `<span class="pos">TP</span> ${num(row.tp_price, 8)}` : '', row.sl_price > 0 ? `<span class="neg">SL</span> ${num(row.sl_price, 8)}` : '',
-                         !row.revenge && exitOf(d, row._eng).ratio_exit ? `<span class="muted">ratio ${row.direction === 'SHORT' ? '≥' : '≤'}</span> ${num(row.ratio_target || row.ratio_trigger, 4)}${rn[row.symbol] && rn[row.symbol].last != null ? ` <span class="muted">(ahora ${num(rn[row.symbol].last, 4)})</span>` : ''}` : ''].filter(Boolean).join(' · ')
+                         !row.revenge && exitOf(d, row._eng).ratio_exit && (!row.inverted || ((d.ratio || {}).zones || {})[row._eng]?.tp_ratio_en_invertidas) ? `<span class="muted">ratio ${(row.direccion_senal || row.direction) === 'SHORT' ? '≥' : '≤'}</span> ${num(row.ratio_target || row.ratio_trigger, 4)}${rn[row.symbol] && rn[row.symbol].last != null ? ` <span class="muted">(ahora ${num(rn[row.symbol].last, 4)})</span>` : ''}` : ''].filter(Boolean).join(' · ')
                       : `<span class="muted">${row.inverted ? 'SL' : 'TP'}</span> ${num(row.tp_price, 8)}`;
     return `<tr><td><b>${esc(row.symbol)}</b> <span class="muted">#${row.trade_id}</span>${row.sent === false ? ' <span class="st off">SIMULADA</span>' : ''}</td>
-      <td>${esc(SHORT_LABEL[row._eng])}</td><td>${tag(row.direction)}${row.revenge ? ' <span class="tag REV">VENGANZA</span>' : ''}</td>
+      <td>${esc(SHORT_LABEL[row._eng])}</td><td>${tag(row.direction)}${row.revenge ? ' <span class="tag REV">VENGANZA</span>' : ''}${isR && row.inverted ? ` <span class="tag REV" title="señal ${esc(row.direccion_senal)}">INVERTIDA</span>` : ''}</td>
       <td>${row.revenge ? `venganza de #${row.rev_parent}` : isF ? `funding ${pct(row.funding_rate || 0)} · ${hms(row.funding_ts)}` : isR ? `${num(row.ratio_trigger, 4)}→${num(row.ratio_entry, 4)} ${pct(row.ratio_change_pct || 0)}` : pct(row.signal_pct)}</td>
       <td>${num(row.entry_price, 8)}</td><td>${num(row.price, 8)}</td><td>${pct(row.move_pct)}</td><td>${exits || '—'}</td>
       <td>${num(row.notional, 2)}</td><td>${usd(row.pnl)}</td>
@@ -6722,6 +6982,7 @@ function render(d) {
   q('rtCurMax').textContent = `(ahora ${rc.drop_max_pct}%)`;
   q('rtCurTp').textContent = `(ahora ${rc.tp_pct > 0 ? '+' + rc.tp_pct + '%' : 'apagado'})`;
   q('rtCurSl').textContent = `(ahora ${rc.sl_pct > 0 ? '−' + rc.sl_pct + '%' : 'apagado'})`;
+  for (const zn of ['ratio', 'ratio_rev']) renderZone(zn, (r.zones || {})[zn] || {}, zn === 'ratio' ? rc : rv);
   const be = q('rtBtnExit');
   be.dataset.on = rc.ratio_exit ? '1' : '';
   be.textContent = rc.ratio_exit ? 'TP por ratio activo · desactivar' : 'TP por ratio desactivado · activar';
@@ -6945,6 +7206,13 @@ const ACTIONS = {
   indUse(b) { glb({[b.dataset.key]: !b.dataset.on}, '/api/indicators', 'rtMsg', indText); },
   ratioExit(b) { ratioPost({ratio_exit: !b.dataset.on}, r => `TP por ratio ${r.ratio_exit ? 'activado' : 'desactivado'}`); },
   revRatioExit(b) { revPost({ratio_exit: !b.dataset.on}, r => `TP por ratio ${r.ratio_exit ? 'activado' : 'desactivado'} en el bot ratio + venganza`, 'rtMsg'); },
+  zoneToggle(b) {
+    const on = !b.dataset.on;
+    if (confirm(on ? '¿Activar el filtro de zonas? Las señales NUEVAS con ratio bajo se abrirán invertidas (TP y SL intercambiados). Las abiertas no cambian.'
+                   : '¿Apagar el filtro de zonas? Las señales nuevas se abren en su dirección, como antes. Las abiertas no cambian.'))
+      zonePost(b.dataset.zeng, {filtro_ratio_activo: on}, zoneMsg);
+  },
+  zoneTpInv(b) { zonePost(b.dataset.zeng, {tp_ratio_en_invertidas: !b.dataset.on}, zoneMsg); },
   revToggle(b) {
     const on = !b.dataset.on;
     if (on || confirm('¿Desactivar la venganza? Las venganzas ya abiertas siguen hasta su TP/SL.')) revPost({revenge: on}, r => `Venganza ${r.revenge ? 'activada' : 'desactivada'}`);
@@ -6974,6 +7242,7 @@ document.addEventListener('click', async ev => {
   if (ds.revMult) return revPost({rev_mult: +ds.revMult}, revMsg);
   if (ds.revSl) return revPost({rev_sl_pct: +ds.revSl}, revMsg);
   if (ds.revDir) return revPost({rev_dir: ds.revDir}, revMsg);
+  if (ds.zhigh) { const [zn, mode] = ds.zhigh.split(':'); return zonePost(zn, {zona_alta_modo: mode}, zoneMsg); }
   if (ds.pause) {
     const b = last && last.engines[ds.pause]; if (!b) return;
     const paused = !b.config.paused;
@@ -7007,6 +7276,11 @@ document.addEventListener('submit', async ev => {
   refresh();
 });
 
+for (const zn of ['ratio', 'ratio_rev']) q('zForm_' + zn).addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const f = ev.target;
+  if (await zonePost(zn, {limite_invertir: f.limite_invertir.value, limite_normal: f.limite_normal.value}, zoneMsg)) f.reset();
+});
 q('rtForm').addEventListener('submit', async ev => {
   ev.preventDefault();
   if (await ratioPost({watch_min_pct: q('rtWatch').value, drop_min_pct: q('rtMin').value, drop_max_pct: q('rtMax').value},
